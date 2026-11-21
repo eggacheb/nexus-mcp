@@ -20,6 +20,7 @@
 - 测试：`npm run test`（vitest，测试只走 MCP 客户端入口）；Rust 侧单独跑 `npm run test:rs`
 - 自检：`npm run smoke`（起服务、列出工具、调一次 `read`）
 - 本地 CI：`npm run check`（build + vitest + cargo test + smoke，提交前必须全部通过）
+- 提交钩子：`git config core.hooksPath scripts/hooks`（克隆后执行一次；pre-commit 拦构建产物进暂存区）
 
 ## 不能碰
 

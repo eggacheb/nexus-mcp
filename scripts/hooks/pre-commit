@@ -1,0 +1,14 @@
+#!/bin/sh
+# 拦下不该进版本库的构建产物。
+# 安装（每台机器一次）：git config core.hooksPath scripts/hooks
+# 移除误加的产物：git restore --staged <路径>
+
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+blocked=$(printf '%s\n' "$staged" | grep -E '(^|/)target/' || true)
+
+if [ -n "$blocked" ]; then
+  echo "pre-commit: 以下暂存文件是构建产物，不许进版本库：" >&2
+  printf '%s\n' "$blocked" | sed 's/^/  - /' >&2
+  echo "用 git restore --staged 移除后再提交；产物目录以 .gitignore 为准。" >&2
+  exit 1
+fi
