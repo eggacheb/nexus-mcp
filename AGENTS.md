@@ -1,0 +1,43 @@
+# nexus-mcp
+
+给云端 AI（Gemini 自定义 MCP、ChatGPT 连接器）用的本地 MCP 服务，暴露 8 个工具：
+`read` / `write` / `edit` / `bash` / `glob` / `grep` / `job_start` / `job_output`。
+
+目标读者是模型，不是人：工具描述要短、参数要少、返回要能直接读懂。
+
+## 目录
+
+- `src/` — TypeScript 侧：MCP 协议、工具定义、HTTP 传输、面板
+- `scripts/` — 自检与本地 CI
+- `crates/` — Rust 执行器（尚未落地，负责命令执行、文件读写、补丁应用）
+
+## 命令
+
+原样抄自 `package.json`，改动前先看那里：
+
+- 类型检查：`npm run typecheck`
+- 编译：`npm run build`
+- 自检：`npm run smoke`（起服务、列出工具、调一次 `read`）
+- 本地 CI：`npm run check`（typecheck + build + smoke，提交前必须全部通过）
+
+## 不能碰
+
+- **不要启用 GitHub Actions**。CI 全部在本地跑。推送 workflow 文件有账号风险，这条不要绕过。
+- **`bash` 工具默认走 Git Bash**（`C:\Program Files\Git\bin\bash.exe`）。PowerShell 只在配置里显式指定时使用，且必须是 PowerShell 7，5.1 的编码问题别去碰。
+
+## 约定
+
+- 工具输出与子进程一律强制 UTF-8：Git Bash 设 `LANG=zh_CN.UTF-8`、`LC_ALL=C.UTF-8`、`MSYS_NO_PATHCONV=1`；pwsh 7 设 `[Console]::OutputEncoding`。
+- 路径一律相对沙箱根目录解析，越界直接报错，不做「尽力而为」的修补。
+- 工具描述写给人看，不带治理元数据，不出现 `providerId`、`rpcMethod`、`safetyClassification` 这类字段。
+- 新增工具先写失败的测试再写实现，不从实现反推测试。
+
+## Agent skills
+
+### Issue tracker
+
+Issues 与 spec 以 markdown 文件存放在 `.scratch/`。详见 `docs/agents/issue-tracker.md`。
+
+### Domain docs
+
+单上下文：根目录 `GLOSSARY.md` + `docs/adr/`。详见 `docs/agents/domain.md`。
