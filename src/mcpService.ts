@@ -1,9 +1,10 @@
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import http from "node:http";
-import type { IncomingMessage, ServerResponse } from "node:http";
+import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { AppConfig } from "./config.js";
+import { log } from "./log.js";
 import { createServer } from "./server.js";
 
 const MCP_PATH = "/mcp";
@@ -19,15 +20,13 @@ interface Session {
   closed: boolean;
 }
 
-export interface HttpServerHandle {
-  port: number;
-  url: string;
-  close(): Promise<void>;
-}
-
-/** 日志只走 stderr，且只记录方法与状态；令牌、Authorization 头一律不进日志 */
-function log(message: string): void {
-  console.error(`[nexus-mcp] ${message}`);
+export interface McpService {
+  start(): Promise<void>;
+  stop(): Promise<void>;
+  isRunning(): boolean;
+  port(): number;
+  url(): string;
+  sessionCount(): number;
 }
 
 function isLoopback(address: string | undefined): boolean {
@@ -48,6 +47,7 @@ interface AuthFailure {
   message: string;
 }
 
+/** 日志只记录方法与状态；令牌、Authorization 头一律不进日志 */
 function checkAuth(req: IncomingMessage, config: AppConfig): AuthFailure | null {
   const remote = req.socket.remoteAddress;
 
@@ -167,17 +167,21 @@ function createSession(config: AppConfig, sessions: Map<string, Session>): Sessi
   return session;
 }
 
-export async function startHttpServer(
-  config: AppConfig,
-  port: number = config.port,
-): Promise<HttpServerHandle> {
+export function createMcpService(config: AppConfig): McpService {
   const sessions = new Map<string, Session>();
+  let listener: Server | undefined;
+  let actualPort = config.port;
+  let ready = false;
+
+  function url(): string {
+    return `http://${LISTEN_HOST}:${actualPort}${MCP_PATH}`;
+  }
 
   async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const url = new URL(req.url ?? "/", "http://localhost");
-    if (url.pathname !== MCP_PATH) {
+    const requestUrl = new URL(req.url ?? "/", "http://localhost");
+    if (requestUrl.pathname !== MCP_PATH) {
       sendJson(res, 404, {
-        error: `MCP 端点只有 ${MCP_PATH}，当前请求的是 ${url.pathname}`,
+        error: `MCP 端点只有 ${MCP_PATH}，当前请求的是 ${requestUrl.pathname}`,
       });
       return;
     }
@@ -252,48 +256,67 @@ export async function startHttpServer(
     await existing.transport.handleRequest(req, res);
   }
 
-  const server = http.createServer((req, res) => {
-    route(req, res).catch((error: unknown) => {
-      const message = error instanceof Error ? error.message : String(error);
-      log(`请求处理失败: ${message}`);
-      if (res.headersSent) {
-        res.end();
-        return;
-      }
-      sendRpcError(res, 500, -32603, `服务内部错误: ${message}`);
+  async function start(): Promise<void> {
+    if (listener) return;
+
+    const server = http.createServer((req, res) => {
+      route(req, res).catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        log(`请求处理失败: ${message}`);
+        if (res.headersSent) {
+          res.end();
+          return;
+        }
+        sendRpcError(res, 500, -32603, `服务内部错误: ${message}`);
+      });
     });
-  });
 
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(port, LISTEN_HOST, () => {
-      server.off("error", reject);
-      resolve();
+    await new Promise<void>((resolve, reject) => {
+      const onError = (error: Error) => reject(error);
+      server.once("error", onError);
+      server.listen(config.port, LISTEN_HOST, () => {
+        server.off("error", onError);
+        resolve();
+      });
     });
-  });
 
-  const address = server.address();
-  const actualPort = typeof address === "object" && address ? address.port : port;
-  const url = `http://${LISTEN_HOST}:${actualPort}${MCP_PATH}`;
+    listener = server;
+    const address = server.address();
+    actualPort = typeof address === "object" && address ? address.port : config.port;
+    ready = true;
+    log(
+      config.token
+        ? `MCP 端点已就绪: ${url()}（已启用 Bearer 校验）`
+        : `MCP 端点已就绪: ${url()}（未配置令牌，只接受本机连接）`,
+    );
+  }
 
-  log(
-    config.token
-      ? `HTTP 已就绪: ${url}（已启用 Bearer 校验）`
-      : `HTTP 已就绪: ${url}（未配置令牌，只接受本机连接）`,
-  );
+  async function stop(): Promise<void> {
+    const current = listener;
+    listener = undefined;
+    ready = false;
+
+    if (current) {
+      await new Promise<void>((resolve) => {
+        current.close(() => resolve());
+        current.closeAllConnections();
+      });
+    }
+
+    for (const session of [...sessions.values()]) {
+      await releaseSession(session, sessions);
+    }
+    sessions.clear();
+
+    if (current) log("MCP 端点已停止");
+  }
 
   return {
-    port: actualPort,
+    start,
+    stop,
+    isRunning: () => ready,
+    port: () => actualPort,
     url,
-    async close() {
-      await new Promise<void>((resolve) => {
-        server.close(() => resolve());
-        server.closeAllConnections();
-      });
-      for (const session of [...sessions.values()]) {
-        await releaseSession(session, sessions);
-      }
-      sessions.clear();
-    },
+    sessionCount: () => sessions.size,
   };
 }

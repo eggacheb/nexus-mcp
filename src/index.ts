@@ -1,6 +1,8 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { loadConfig } from "./config.js";
-import { startHttpServer } from "./http.js";
+import { log } from "./log.js";
+import { createMcpService } from "./mcpService.js";
+import { startPanel } from "./panel.js";
 import { createServer } from "./server.js";
 
 const config = loadConfig();
@@ -14,14 +16,20 @@ if (useStdio) {
   // stdio 模式下 stdout 属于协议通道，日志一律走 stderr
   console.error(`[nexus-mcp] stdio 已就绪，根目录: ${config.root}`);
 } else {
-  const handle = await startHttpServer(config);
+  const service = createMcpService(config);
+  await service.start();
+
+  const panel = await startPanel(config, service);
+
   let stopping = false;
   const shutdown = async () => {
     if (stopping) return;
     stopping = true;
-    await handle.close();
+    await panel.close();
+    await service.stop();
     process.exit(0);
   };
+  log(`面板入口: ${panel.url}`);
   process.on("SIGINT", () => void shutdown());
   process.on("SIGTERM", () => void shutdown());
 }

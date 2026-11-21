@@ -1,15 +1,11 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { spawn } from "node:child_process";
-import type { ChildProcess } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import os from "node:os";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { projectRoot, startServer } from "./support/server.js";
+import type { RunningServer } from "./support/server.js";
 
-const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const TOKEN = "test-token-6f3c1a";
 
 const ALL_TOOLS = [
@@ -22,92 +18,6 @@ const ALL_TOOLS = [
   "read",
   "write",
 ];
-
-interface RunningServer {
-  port: number;
-  url: URL;
-  stderrText(): string;
-  stop(): Promise<void>;
-}
-
-function freePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const probe = net.createServer();
-    probe.once("error", reject);
-    probe.listen(0, "127.0.0.1", () => {
-      const address = probe.address();
-      const port = typeof address === "object" && address ? address.port : 0;
-      probe.close(() => resolve(port));
-    });
-  });
-}
-
-function waitForPort(port: number, timeoutMs = 15_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  return new Promise((resolve, reject) => {
-    const attempt = () => {
-      const socket = net.connect({ port, host: "127.0.0.1" });
-      socket.once("connect", () => {
-        socket.destroy();
-        resolve();
-      });
-      socket.once("error", () => {
-        socket.destroy();
-        if (Date.now() > deadline) {
-          reject(new Error(`服务在 ${timeoutMs}ms 内没有监听 ${port}`));
-          return;
-        }
-        setTimeout(attempt, 50);
-      });
-    };
-    attempt();
-  });
-}
-
-async function startServer(token: string): Promise<RunningServer> {
-  const port = await freePort();
-  const configDir = mkdtempSync(path.join(os.tmpdir(), "nexus-mcp-http-"));
-  const configPath = path.join(configDir, "config.json");
-  writeFileSync(
-    configPath,
-    JSON.stringify({ root: projectRoot, transport: "http", port, token }, null, 2),
-    "utf8",
-  );
-
-  const child: ChildProcess = spawn(process.execPath, [path.join(projectRoot, "dist", "index.js")], {
-    cwd: projectRoot,
-    env: { ...process.env, NEXUS_MCP_CONFIG: configPath },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-
-  let stderr = "";
-  child.stderr?.setEncoding("utf8");
-  child.stderr?.on("data", (chunk: string) => {
-    stderr += chunk;
-  });
-
-  try {
-    await waitForPort(port);
-  } catch (error) {
-    child.kill();
-    rmSync(configDir, { recursive: true, force: true });
-    throw new Error(`${(error as Error).message}\n服务输出:\n${stderr}`);
-  }
-
-  return {
-    port,
-    url: new URL(`http://127.0.0.1:${port}/mcp`),
-    stderrText: () => stderr,
-    async stop() {
-      child.kill();
-      rmSync(configDir, { recursive: true, force: true });
-      await new Promise<void>((resolve) => {
-        child.once("exit", () => resolve());
-        setTimeout(resolve, 3000);
-      });
-    },
-  };
-}
 
 function authInit(token: string): { requestInit: { headers: Record<string, string> } } {
   return { requestInit: { headers: { Authorization: `Bearer ${token}` } } };
@@ -170,7 +80,7 @@ describe("HTTP 传输（配置了令牌）", () => {
   let server: RunningServer;
 
   beforeAll(async () => {
-    server = await startServer(TOKEN);
+    server = await startServer({ token: TOKEN });
   }, 30_000);
 
   afterAll(async () => {
@@ -180,7 +90,7 @@ describe("HTTP 传输（配置了令牌）", () => {
   it(
     "官方客户端经 HTTP 初始化后可以列出 8 个工具并调用",
     async () => {
-      const { client, transport } = await connectClient(server.url, authInit(TOKEN));
+      const { client, transport } = await connectClient(server.mcpUrl, authInit(TOKEN));
 
       const { tools } = await client.listTools();
       expect(tools.map((tool) => tool.name).sort()).toEqual(ALL_TOOLS);
@@ -202,7 +112,7 @@ describe("HTTP 传输（配置了令牌）", () => {
   it(
     "缺少 Authorization 头返回 401，并说明缺什么",
     async () => {
-      const error = await connectError(server.url);
+      const error = await connectError(server.mcpUrl);
       expect(error.code).toBe(401);
       expect(error.message).toContain("Authorization");
       expect(error.message).toContain("Bearer");
@@ -213,7 +123,7 @@ describe("HTTP 传输（配置了令牌）", () => {
   it(
     "令牌不正确返回 401",
     async () => {
-      const error = await connectError(server.url, authInit("wrong-token"));
+      const error = await connectError(server.mcpUrl, authInit("wrong-token"));
       expect(error.code).toBe(401);
       expect(error.message).toContain("令牌不正确");
     },
@@ -223,7 +133,7 @@ describe("HTTP 传输（配置了令牌）", () => {
   it(
     "正确令牌放行，令牌不出现在服务日志里",
     async () => {
-      const { client, transport } = await connectClient(server.url, authInit(TOKEN));
+      const { client, transport } = await connectClient(server.mcpUrl, authInit(TOKEN));
       const { tools } = await client.listTools();
       expect(tools.length).toBe(8);
       await transport.terminateSession();
@@ -241,8 +151,8 @@ describe("HTTP 传输（配置了令牌）", () => {
   it(
     "两个客户端各自初始化，会话 id 不同且工具调用互不影响",
     async () => {
-      const first = await connectClient(server.url, authInit(TOKEN));
-      const second = await connectClient(server.url, authInit(TOKEN));
+      const first = await connectClient(server.mcpUrl, authInit(TOKEN));
+      const second = await connectClient(server.mcpUrl, authInit(TOKEN));
 
       expect(first.transport.sessionId).toBeTruthy();
       expect(second.transport.sessionId).toBeTruthy();
@@ -281,14 +191,14 @@ describe("HTTP 传输（配置了令牌）", () => {
   it(
     "会话结束后释放，旧会话 id 不能继续使用",
     async () => {
-      const { client, transport } = await connectClient(server.url, authInit(TOKEN));
+      const { client, transport } = await connectClient(server.mcpUrl, authInit(TOKEN));
       const sessionId = transport.sessionId;
       expect(sessionId).toBeTruthy();
 
       await transport.terminateSession();
       await client.close();
 
-      const error = await staleSessionError(server.url, sessionId);
+      const error = await staleSessionError(server.mcpUrl, sessionId);
       expect(error.code).toBe(404);
       expect(error.message).toContain("会话");
     },
@@ -300,14 +210,14 @@ describe("HTTP 传输（配置了令牌）", () => {
     async () => {
       const sessionIds: string[] = [];
       for (let round = 0; round < 5; round += 1) {
-        const { client, transport } = await connectClient(server.url, authInit(TOKEN));
+        const { client, transport } = await connectClient(server.mcpUrl, authInit(TOKEN));
         sessionIds.push(transport.sessionId ?? "");
         await transport.terminateSession();
         await client.close();
       }
       expect(new Set(sessionIds).size).toBe(5);
 
-      const { client, transport } = await connectClient(server.url, authInit(TOKEN));
+      const { client, transport } = await connectClient(server.mcpUrl, authInit(TOKEN));
       const { tools } = await client.listTools();
       expect(tools.map((tool) => tool.name).sort()).toEqual(ALL_TOOLS);
       await transport.terminateSession();
@@ -315,7 +225,7 @@ describe("HTTP 传输（配置了令牌）", () => {
 
       const staleId = sessionIds[0];
       expect(staleId).toBeTruthy();
-      const error = await staleSessionError(server.url, staleId as string);
+      const error = await staleSessionError(server.mcpUrl, staleId as string);
       expect(error.code).toBe(404);
       expect(error.message).toContain("会话");
     },
@@ -327,7 +237,7 @@ describe("HTTP 传输（没有配置令牌）", () => {
   let server: RunningServer;
 
   beforeAll(async () => {
-    server = await startServer("");
+    server = await startServer();
   }, 30_000);
 
   afterAll(async () => {
@@ -337,7 +247,7 @@ describe("HTTP 传输（没有配置令牌）", () => {
   it(
     "本机客户端不需要令牌就能连上",
     async () => {
-      const { client, transport } = await connectClient(server.url);
+      const { client, transport } = await connectClient(server.mcpUrl);
       const { tools } = await client.listTools();
       expect(tools.map((tool) => tool.name).sort()).toEqual(ALL_TOOLS);
       await transport.terminateSession();
