@@ -56,7 +56,7 @@ async function callGrep(client: Client, args: Record<string, unknown>): Promise<
 
 /** 路径列表是输出的第一段（尾注用空行隔开） */
 function pathLines(result: ToolResult): string[] {
-  const [body] = textOf(result).split("\n\n");
+  const [body = ""] = textOf(result).split("\n\n");
   return body.split("\n").filter((line) => line.includes("/"));
 }
 

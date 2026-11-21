@@ -23,8 +23,8 @@ function authInit(token: string): { requestInit: { headers: Record<string, strin
   return { requestInit: { headers: { Authorization: `Bearer ${token}` } } };
 }
 
-function textOf(result: { content?: unknown }): string {
-  const parts = (result.content as Array<{ type: string; text?: string }> | undefined) ?? [];
+function textOf(result: unknown): string {
+  const parts = ((result as { content?: unknown }).content as Array<{ type: string; text?: string }> | undefined) ?? [];
   return parts.map((part) => part.text ?? "").join("\n");
 }
 
@@ -196,7 +196,7 @@ describe("HTTP 传输（配置了令牌）", () => {
     "会话结束后释放，旧会话 id 不能继续使用",
     async () => {
       const { client, transport } = await connectClient(server.mcpUrl, authInit(TOKEN));
-      const sessionId = transport.sessionId;
+      const sessionId = transport.sessionId as string;
       expect(sessionId).toBeTruthy();
 
       await transport.terminateSession();

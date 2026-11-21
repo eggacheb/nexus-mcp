@@ -4,7 +4,7 @@
 
 **Blocked by:** 01
 
-**Status:** done（2026-11-21，npm run check 全绿：vitest 107 条 + cargo 108 条 + smoke；双面审查已过，修正项见「审查结论」；Gemini 实测验收归属票 10）
+**Status:** done（2026-11-21，npm run check 全绿：vitest 104 条 + cargo 108 条 + smoke；双面审查已过，修正项见「审查结论」；Gemini 实测验收归属票 10）
 
 **审查结论**：已采纳并修正——限速标识改 `clientIp()`（仅 loopback 直连时信任 `CF-Connecting-IP`，隧道场景分得出真实来源，外部直连伪造的头不采信）；`code_challenge` 补 RFC 7636 §4.2 形状校验（43-128 个非保留字符，畸形值在授权端点即拒）；`/mcp` 401 的 `WWW-Authenticate` 补 `error="invalid_token"`（RFC 6750）；删 `mcpService` 的 `tokenEquals` 改用 `oauth.ts` 导出的 `safeEqual`（消常量时比较重复）；`checkAuth` 的 oauth 参数改必选；OAuth 请求体上限收拢为 `MAX_OAUTH_BODY_BYTES`。未采纳（判断题）：测试助手 `pkce()`/`register()` 下沉 `tests/support`（provider 级与进程级测试的 base URL 语义不同，强行统一反而绕）；客户端容量 200 淘汰最旧保留（参考实现同款护栏，淘汰连带该客户端未过期令牌失效属预期）。
 

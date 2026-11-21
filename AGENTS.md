@@ -35,8 +35,9 @@
 - 新增工具先写失败的测试再写实现，不从实现反推测试。
 - cargo 测试里真实 spawn 子进程的用例要在模块内串行（形状照 `jobs_tests.rs` 的 SPAWN_LOCK），否则并行负载会挤爆既有的时序断言。
 - 票做完在 Comments 注明每条验收清单对应哪个测试用例；没有断言的验收线不算过。
-- 跑 vitest / cargo test / `npm run check` 这类长命令用 `& scripts/run-logged.ps1 { <命令> }`：输出落 %TEMP% 日志，只回显结尾与退出码。
+- 跑 vitest / cargo test / `npm run check` 这类长命令用 `& scripts/run-logged.ps1 { <命令> }`：输出落 %TEMP% 日志，只回显结尾、汇总行与退出码。
 - vitest 固定走 vmThreads 池（`package.json` 的 test 脚本带 `--pool=vmThreads`）：Node 24.12 上默认池把 runner chunk 装载成两份，`describe()` 直接崩。VM 上下文里 `fetch` 等原生 API 抛的异常来自主 realm，`toBeInstanceOf(Error)` 这类跨 realm 断言会假阴性——断言错误形状（message 内容），别断言构造器。
+- 走 HTTP 的测试（`tests/support/server.ts` 的 `startServer`）spawn 的是真实的 `dist/index.js`：改完 src 先 `npm run build` 再跑 vitest，否则测的是旧产物；直接 import src 的 provider 级测试不受影响。
 
 ## 复用 codex 代码的规则
 

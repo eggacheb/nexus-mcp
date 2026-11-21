@@ -27,5 +27,14 @@ if (-not $Log) {
 $code = $LASTEXITCODE
 
 Write-Output "log: $Log"
+# 从日志抓关键汇总行（vitest / cargo / tsc 的结论与失败标记）；
+# Tail 片段被 ANSI 空行或缓冲问题吃掉时，这里仍能给出结论
+$summary = Select-String -Path $Log -Pattern 'Test Files|Tests |test result:|error TS\d+|Failed Tests|FAIL ' |
+  ForEach-Object { $_.Line.TrimEnd() } |
+  Select-Object -First 20
+if ($summary) {
+  Write-Output "summary:"
+  $summary | ForEach-Object { Write-Output $_ }
+}
 Get-Content $Log -Tail $Tail
 Write-Output "exit=$code"

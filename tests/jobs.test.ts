@@ -77,7 +77,7 @@ async function waitFor(
 function statusOf(text: string): string {
   const match = text.match(/^status: (\S+)$/m);
   if (!match) throw new Error(`job_output 响应缺少 status 行: ${text}`);
-  return match[1];
+  return match[1] ?? "";
 }
 
 /** job_output 文本里的 exit_code 行；运行中不存在 */
@@ -212,7 +212,7 @@ describe("job_start / job_output 工具", () => {
       expect(firstBody).not.toContain("chunk-2");
 
       // 等第二段产生后从 offset1 增量读：拿到 chunk-2，不再重复 chunk-1
-      let second: ToolResult;
+      let second!: ToolResult;
       await waitFor(async () => {
         second = await callTool(session.client, "job_output", { job_id: jobId, offset: offset1 });
         expect(second.isError).toBeFalsy();
@@ -224,7 +224,7 @@ describe("job_start / job_output 工具", () => {
       const offset2 = nextOffsetOf(textOf(second));
 
       // 第三段同理
-      let third: ToolResult;
+      let third!: ToolResult;
       await waitFor(async () => {
         third = await callTool(session.client, "job_output", { job_id: jobId, offset: offset2 });
         expect(third.isError).toBeFalsy();
