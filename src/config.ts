@@ -21,7 +21,9 @@ export interface AppConfig {
 
 const DEFAULTS: Omit<AppConfig, "root"> = {
   transport: "http",
-  port: 8790,
+  // 与已有的 cloudflared 隧道配置保持一致（nexus.maliy.top → 127.0.0.1:8787），
+  // 这样接管时隧道配置不需要改动。
+  port: 8787,
   token: "",
   shell: "auto",
   maxOutputBytes: 64 * 1024,

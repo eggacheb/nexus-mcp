@@ -67,6 +67,7 @@ Gemini 网页版（`gemini.google.com` → 设置 → 关联应用 → 自定义
 ### 传输与鉴权
 
 - 同时支持 stdio（本机客户端、测试）与 streamable HTTP（云端 AI）。
+- HTTP 模式默认监听 `8787`，与本机已有的 cloudflared 隧道配置（`nexus.maliy.top` → `127.0.0.1:8787`）一致，接管时隧道配置不需要改动。
 - HTTP 模式用 Bearer 令牌校验，令牌为空时仅允许 loopback 访问。
 - OAuth 2.1 授权服务复用 Nexus 桥接层已有的实现思路：RFC 9728/8414 元数据、动态客户端注册、PKCE S256、refresh token 轮换、令牌哈希后落盘。授权页要求输入本地令牌才能批准。
 - 会话按 `Mcp-Session-Id` 隔离，一个会话对应一个独立的 server 实例，会话关闭时释放关联的后台任务引用。
