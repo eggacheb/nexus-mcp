@@ -179,8 +179,8 @@ const PAGE = `<!doctype html>
       oauthLink.setAttribute("aria-disabled", "true");
     }
     document.getElementById("oauth-hint").textContent = s.oauth.available
-      ? "已启用"
-      : "OAuth 尚未接入，云端先用 Bearer 令牌";
+      ? "已启用 · 客户端发起跳转后，批准需输入 config.json 的 token"
+      : "未启用（config.json 的 token 为空），云端先用 Bearer 令牌";
     if (document.activeElement !== rootInput) rootInput.value = s.root;
     document.getElementById("control-hint").textContent = "面板端口 " + s.panelPort;
   }
@@ -322,7 +322,7 @@ export async function startPanel(config: AppConfig, service: McpService): Promis
       executor: await executorStatus(),
       tunnel: await probeTunnel(config),
       root: config.root,
-      oauth: { url: "/oauth/authorize", available: false },
+      oauth: service.oauthInfo(),
       panelPort,
     };
   }

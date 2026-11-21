@@ -1,11 +1,14 @@
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import http from "node:http";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
+import path from "node:path";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { AppConfig } from "./config.js";
+import { configFilePath } from "./config.js";
 import { readBody, sendJson } from "./httpHelpers.js";
 import { log, redactText } from "./log.js";
+import { OAuthProvider, safeEqual } from "./oauth.js";
 import { createServer } from "./server.js";
 
 const MCP_PATH = "/mcp";
@@ -39,6 +42,8 @@ export interface McpService {
   port(): number;
   url(): string;
   sessionCount(): number;
+  /** OAuth 授权入口状态，面板直接展示 */
+  oauthInfo(): { available: boolean; url: string };
 }
 
 function isLoopback(address: string | undefined): boolean {
@@ -47,20 +52,15 @@ function isLoopback(address: string | undefined): boolean {
   return address === "127.0.0.1" || address.startsWith("127.") || address.startsWith("::ffff:127.");
 }
 
-function tokenEquals(given: string, expected: string): boolean {
-  const left = Buffer.from(given, "utf8");
-  const right = Buffer.from(expected, "utf8");
-  if (left.length !== right.length) return false;
-  return timingSafeEqual(left, right);
-}
-
 interface AuthFailure {
   status: number;
   message: string;
+  /** 令牌无效时带给 WWW-Authenticate 的 OAuth 错误码（RFC 6750） */
+  oauthError?: string;
 }
 
 /** 日志只记录方法与状态；令牌、Authorization 头一律不进日志 */
-function checkAuth(req: IncomingMessage, config: AppConfig): AuthFailure | null {
+function checkAuth(req: IncomingMessage, config: AppConfig, oauth: OAuthProvider): AuthFailure | null {
   const remote = req.socket.remoteAddress;
 
   if (!config.token) {
@@ -81,10 +81,18 @@ function checkAuth(req: IncomingMessage, config: AppConfig): AuthFailure | null 
   if (!scheme || scheme.toLowerCase() !== "bearer" || !value) {
     return { status: 401, message: "Authorization 头格式不对，需要写成 Bearer <令牌>。" };
   }
-  if (!tokenEquals(value, config.token)) {
-    return { status: 401, message: "Bearer 令牌不正确。" };
+  if (safeEqual(value, config.token)) {
+    return null;
   }
-  return null;
+  // 静态令牌不匹配时再试 OAuth 访问令牌，两条鉴权路并存
+  if (oauth.validateAccessToken(value)) {
+    return null;
+  }
+  return {
+    status: 401,
+    message: "令牌不正确：既不是静态 Bearer 令牌，也不是有效的 OAuth 访问令牌。",
+    oauthError: "invalid_token",
+  };
 }
 
 function sendRpcError(
@@ -157,6 +165,24 @@ export function createMcpService(config: AppConfig): McpService {
   let ready = false;
   let sweeper: NodeJS.Timeout | undefined;
 
+  /** 对外公布的 base：配了隧道用隧道地址，否则本机地址；OAuth 元数据与授权入口都从这里拼 */
+  function publicBaseUrl(): string {
+    const tunnel = config.tunnelUrl?.trim();
+    if (tunnel) {
+      const withProto = /^https?:\/\//i.test(tunnel) ? tunnel : `https://${tunnel}`;
+      return withProto.replace(/\/+$/, "");
+    }
+    return `http://127.0.0.1:${actualPort}`;
+  }
+
+  // OAuth 数据与 config.json 放同一目录，分发时一个目录全带走
+  const oauthStorePath = path.join(path.dirname(configFilePath()), "oauth-store.json");
+  const oauth = new OAuthProvider({
+    approvalSecret: () => config.token,
+    publicBaseUrl,
+    storePath: oauthStorePath,
+  });
+
   function url(): string {
     return `http://${LISTEN_HOST}:${actualPort}${MCP_PATH}`;
   }
@@ -178,6 +204,12 @@ export function createMcpService(config: AppConfig): McpService {
 
   async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const requestUrl = new URL(req.url ?? "/", "http://localhost");
+
+    // OAuth 元数据 / 注册 / 授权 / 令牌端点先于 MCP 端点处理
+    if (await oauth.handle(req, res, requestUrl.pathname, requestUrl)) {
+      return;
+    }
+
     if (requestUrl.pathname !== MCP_PATH) {
       sendJson(res, 404, {
         error: `MCP 端点只有 ${MCP_PATH}，当前请求的是 ${requestUrl.pathname}`,
@@ -185,11 +217,11 @@ export function createMcpService(config: AppConfig): McpService {
       return;
     }
 
-    const auth = checkAuth(req, config);
+    const auth = checkAuth(req, config, oauth);
     if (auth) {
-      sendRpcError(res, auth.status, RPC_AUTH_FAILED, auth.message, {
-        "WWW-Authenticate": 'Bearer realm="nexus-mcp"',
-      });
+      const headers: Record<string, string> = {};
+      if (auth.status === 401) headers["WWW-Authenticate"] = oauth.wwwAuthenticate(auth.oauthError);
+      sendRpcError(res, auth.status, RPC_AUTH_FAILED, auth.message, headers);
       return;
     }
 
@@ -292,7 +324,7 @@ export function createMcpService(config: AppConfig): McpService {
     sweeper.unref();
     log(
       config.token
-        ? `MCP 端点已就绪: ${url()}（已启用 Bearer 校验）`
+        ? `MCP 端点已就绪: ${url()}（已启用 Bearer 校验与 OAuth 2.1，数据落盘 ${oauthStorePath}）`
         : `MCP 端点已就绪: ${url()}（未配置令牌，只接受本机连接）`,
     );
   }
@@ -328,5 +360,6 @@ export function createMcpService(config: AppConfig): McpService {
     port: () => actualPort,
     url,
     sessionCount: () => sessions.size,
+    oauthInfo: () => ({ available: oauth.oauthEnabled(), url: oauth.authorizeUrl() }),
   };
 }
