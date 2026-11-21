@@ -16,4 +16,4 @@
 - [ ] 同一 `job_start` 连续启动多个任务时 id 不冲突
 - [ ] 任务结束时释放句柄，长时间运行不累积内存
 
-**复用来源：** 只抄 codex `exec-server` 的进程事件模型形状（`ExecProcess`、`ExecProcessEvent`、`ProcessOutputChunk`，见 `docs/research/codex-reusable-parts.md` §2.6），**不要**把 `codex-exec-server` 加进依赖：它 166 个源文件，还要拖 tonic、tungstenite、otel、rama。输出缓冲用票 03 已经搬进来的 `head-tail-buffer`，不要另写一套。
+**复用来源：** 只抄 codex `exec-server` 的进程事件模型形状（`ExecProcess`、`ExecProcessEvent`、`ProcessOutputChunk`，见 `docs/research/codex-reusable-parts.md` §2.6），**不要**把 `codex-exec-server` 加进依赖：它 166 个源文件，还要拖 tonic、tungstenite、otel、rama。输出缓冲用票 03 已经搬进来的 `head-tail-buffer`，不要另写一套。opencode 侧参考：`core/src/tool/plugin/shell.ts` 的「前台超时不杀、转后台并通知模型」语义与后台输出写文件 + tail 截断；`util/src/cross-spawn-spawner.ts:440-497` 的 Windows 树杀（`taskkill /T /F`）与脱离子进程挂 stdio 的关泵时序坑；Rust 侧对照 `process-daemon/src/service/pipe/windows.rs` 的 Job Object（`JOB_OBJECT_KILL_ON_JOB_CLOSE` + `TerminateJobObject`）加固进程树终止，只摘这一个文件、不引入 portable-pty。见 `docs/research/opencode-reusable-parts.md` §1 与 §3。

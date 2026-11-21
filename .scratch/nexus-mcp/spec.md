@@ -98,11 +98,15 @@ Gemini 网页版（`gemini.google.com` → 设置 → 关联应用 → 自定义
 
 ### 复用决策
 
-- 补丁的模糊上下文匹配算法从 codex 的 `apply-patch` 移植（`parser`、`seek_sequence`、`text_file` 三部分逻辑），文件系统后端换成自有 trait。
+- `edit` 主路径从 opencode 的 `core/src/tool/plugin/edit.ts` 移植：三级匹配降级（精确 → Unicode 归一化 → 行级尾空白）+ CRLF 双向保真 + missHint（MIT，剥掉 Effect 壳即可用）。
+- codex 的 `apply-patch`（`parser`、`seek_sequence`、`text_file`）保留为「后续支持 patch 文本」时的备选，文件系统后端换成自有 trait，当前票不引入。
 - 命令白名单与可执行名归一化从 codex 的 `execpolicy-rules` 移植。
 - 输出有界缓冲从 codex 的 `head-tail-buffer` 移植。
 - UTF-8 边界截断从 codex 的 `utils/string` 移植。
+- glob/grep 的 ripgrep 调用组合、二进制发现与下载校验从 opencode 的 `ripgrep.ts` 与 `ripgrep/binary.ts` 移植。
+- 后台任务的「超时转后台 + 完成通知」语义与 Windows 树杀细节参考 opencode 的 `shell.ts`、`cross-spawn-spawner.ts` 与 Rust 侧 `process-daemon` 的 Job Object 实现。
 - 不引入 codex 的沙箱实现（`sandboxing`、`linux-sandbox`、`windows-sandbox-rs`）、`exec-server`、`network-proxy`，原因是依赖链会拖进 7 个 `rama` alpha 版本和整套云服务栈。
+- 不引入 opencode 的 Effect 全家桶（`core`/`server`/`protocol`/`schema`）与 `patchmark`（用途无关），只摘零依赖单文件。
 
 ### 面板
 
@@ -157,6 +161,6 @@ Rust 执行层内部保留单元测试（补丁匹配、路径越界判定、UTF
 
 ## Further Notes
 
-- codex 可复用组件的调研结论在本项目 `docs/research/codex-reusable-parts.md`，移植前先读它，尤其是「哪些不能直接搬」那一节。
+- codex 可复用组件的调研结论在本项目 `docs/research/codex-reusable-parts.md`，移植前先读它，尤其是「哪些不能直接搬」那一节；opencode 侧的对位调研见 `docs/research/opencode-reusable-parts.md`（MIT 无 NOTICE 负担，同样只读参考）。
 - Gemini 网页版必须走 https，本机调试时用 HTTP 直连测试客户端即可；真正接 Gemini 时需要隧道，隧道地址变化会影响已保存的配置，面板上要能重新生成。
 - 工具清单一旦对外发布就当作稳定契约，改名或改参数视为破坏性变更。
