@@ -135,7 +135,9 @@ describe("本地控制面板", () => {
         () => null,
         (error: unknown) => error as Error,
       );
-      expect(refused).toBeInstanceOf(Error);
+      // 注意别用 toBeInstanceOf(Error)：vmThreads 池里 fetch 的异常在主 realm 创建，
+      // 和测试文件的 Error 构造器不同 realm，instanceof 会判否（Node 24.12 + vitest 5.1.1）
+      expect(refused?.message.length ?? 0).toBeGreaterThan(0);
 
       const started = await postJson(server, "/api/service", { action: "start" });
       expect(started.status).toBe(200);

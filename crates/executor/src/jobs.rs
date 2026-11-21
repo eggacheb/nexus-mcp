@@ -30,6 +30,7 @@ fn default_job_max_output_bytes() -> u64 {
     DEFAULT_JOB_MAX_OUTPUT_BYTES
 }
 
+/// policy 是命令闸门配置（config.json 的 commandPolicy），缺省时仅内置危险表生效。
 #[derive(Deserialize)]
 pub struct JobStartRequest {
     pub id: u64,
@@ -37,6 +38,8 @@ pub struct JobStartRequest {
     pub cwd: String,
     pub max_output_bytes: u64,
     pub shell: crate::ShellSpec,
+    #[serde(default)]
+    pub policy: Option<crate::command_policy::CommandPolicySpec>,
 }
 
 #[derive(Deserialize)]
@@ -118,9 +121,18 @@ impl JobRegistry {
         }
     }
 
-    /// 启动后台任务：校验 + spawn + 挂监控线程，立刻返回 job_id，不等待命令。
+    /// 启动后台任务：命令闸门校验 + spawn + 挂监控线程，立刻返回 job_id，不等待命令。
     pub fn start(&mut self, request: &JobStartRequest) -> Value {
         let id = Some(request.id);
+        // 命令闸门：与 bash 同一套判定，拒绝发生在 spawn 之前
+        if let Some(response) = crate::command_policy::gate(
+            request.policy.as_ref(),
+            &request.command,
+            &request.shell.kind,
+            id,
+        ) {
+            return response;
+        }
         let command = match crate::build_shell_command(
             &request.shell.kind,
             &request.shell.program,

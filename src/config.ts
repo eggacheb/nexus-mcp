@@ -4,6 +4,15 @@ import { fileURLToPath } from "node:url";
 
 export type ShellKind = "auto" | "git-bash" | "pwsh" | "powershell";
 
+export interface CommandPolicyConfig {
+  /** 白名单：通配模式（如 "git push *"），非空时启用白名单 */
+  allow: string[];
+  /** 黑名单：通配模式，命中即拒绝 */
+  deny: string[];
+  /** 白名单非空且命令未命中时的处理，默认 deny */
+  onUnmatched: "deny" | "allow";
+}
+
 export interface AppConfig {
   /** 唯一允许访问的根目录，绝对路径 */
   root: string;
@@ -19,11 +28,13 @@ export interface AppConfig {
   maxOutputBytes: number;
   /** 单条命令默认超时 */
   defaultTimeoutMs: number;
+  /** 命令闸门：白/黑名单与未命中策略，原样透传给执行器 */
+  commandPolicy: CommandPolicyConfig;
   /** 隧道公网地址，配了面板才会去探测连通性 */
   tunnelUrl?: string;
 }
 
-const DEFAULTS: Omit<AppConfig, "root" | "panelPort"> = {
+const DEFAULTS: Omit<AppConfig, "root" | "panelPort" | "commandPolicy"> = {
   transport: "http",
   // 与已有的 cloudflared 隧道配置保持一致（nexus.maliy.top → 127.0.0.1:8787），
   // 这样接管时隧道配置不需要改动。
@@ -33,6 +44,31 @@ const DEFAULTS: Omit<AppConfig, "root" | "panelPort"> = {
   maxOutputBytes: 64 * 1024,
   defaultTimeoutMs: 120_000,
 };
+
+/** 命令闸门配置校验：形状不对启动即报错，不带着坏配置起服务 */
+function normalizeCommandPolicy(raw: unknown): CommandPolicyConfig {
+  if (raw === undefined || raw === null) {
+    return { allow: [], deny: [], onUnmatched: "deny" };
+  }
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("config.json 的 commandPolicy 应是对象（{ allow, deny, onUnmatched }）");
+  }
+  const { allow, deny, onUnmatched } = raw as Record<string, unknown>;
+  const stringList = (value: unknown, field: string): string[] => {
+    if (value === undefined) return [];
+    if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+      throw new Error(`config.json 的 commandPolicy.${field} 必须是字符串数组`);
+    }
+    return (value as string[]).map((item) => item.trim()).filter((item) => item !== "");
+  };
+  const unmatched = onUnmatched ?? "deny";
+  if (unmatched !== "deny" && unmatched !== "allow") {
+    throw new Error(
+      `config.json 的 commandPolicy.onUnmatched 只支持 "deny" 或 "allow"，当前值: ${JSON.stringify(onUnmatched)}`,
+    );
+  }
+  return { allow: stringList(allow, "allow"), deny: stringList(deny, "deny"), onUnmatched: unmatched };
+}
 
 export function configFilePath(): string {
   const override = process.env.NEXUS_MCP_CONFIG;
@@ -94,6 +130,7 @@ export function loadConfig(): AppConfig {
     shell,
     maxOutputBytes: raw.maxOutputBytes ?? DEFAULTS.maxOutputBytes,
     defaultTimeoutMs: raw.defaultTimeoutMs ?? DEFAULTS.defaultTimeoutMs,
+    commandPolicy: normalizeCommandPolicy(raw.commandPolicy),
     ...(typeof raw.tunnelUrl === "string" && raw.tunnelUrl.trim()
       ? { tunnelUrl: raw.tunnelUrl.trim() }
       : {}),
@@ -121,6 +158,7 @@ export function saveConfig(config: AppConfig): void {  const file = configFilePa
     shell: config.shell,
     maxOutputBytes: config.maxOutputBytes,
     defaultTimeoutMs: config.defaultTimeoutMs,
+    commandPolicy: config.commandPolicy,
   };
   if (config.tunnelUrl) next.tunnelUrl = config.tunnelUrl;
 

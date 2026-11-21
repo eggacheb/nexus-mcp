@@ -40,6 +40,7 @@ fn start_request(command: &str, max_output_bytes: u64) -> JobStartRequest {
             kind: "git-bash".into(),
             program: git_bash(),
         },
+        policy: None,
     }
 }
 

@@ -1,6 +1,12 @@
 This project includes code derived from OpenAI Codex (https://github.com/openai/codex),
 licensed under the Apache License, Version 2.0. Copyright 2025 OpenAI.
 
+This project includes code derived from OpenCode (https://github.com/anomalyco/opencode),
+licensed under the MIT License. Copyright 2025 SST / OpenCode contributors.
+
 Copied or adapted portions (see file headers for details):
 - crates/executor/src/head_tail_buffer.rs  (from codex-rs/utils/head-tail-buffer)
 - crates/executor/src/string.rs            (take_bytes_at_char_boundary from codex-rs/utils/string)
+- crates/executor/src/command_policy.rs    (wildcard_match from opencode util/wildcard.ts;
+  executable_lookup_key shape, rm/cmd/PowerShell deletion rules from codex-rs/shell-command
+  command_safety; format/diskpart/reg-delete rules written for this project)

@@ -3,6 +3,7 @@
 //! 协议：stdin 收单行 JSON 请求，stdout 回单行 JSON 响应，一行一个请求。
 //! 请求带自增 id（由协议层 TS 侧分配），响应原样带回 id。
 
+mod command_policy;
 mod edit_match;
 mod glob_search;
 mod grep_search;
@@ -45,6 +46,7 @@ pub struct ShellSpec {
 }
 
 /// bash 请求体。op 分发在 handle_request 里完成，这里只管 bash 自己的字段。
+/// policy 是命令闸门配置（config.json 的 commandPolicy），缺省时仅内置危险表生效。
 #[derive(Deserialize)]
 struct BashRequest {
     id: u64,
@@ -53,6 +55,8 @@ struct BashRequest {
     timeout_ms: u64,
     max_output_bytes: usize,
     shell: ShellSpec,
+    #[serde(default)]
+    policy: Option<command_policy::CommandPolicySpec>,
 }
 
 /// read 请求体。path 由协议层解析成根目录内的绝对路径，root 是沙箱根；
@@ -192,6 +196,16 @@ fn build_shell_command(
 fn run_bash(request: &BashRequest) -> Value {
     let max_bytes = request.max_output_bytes.max(1);
     let timeout_ms = request.timeout_ms.clamp(1, MAX_TIMEOUT_MS);
+
+    // 命令闸门：内置危险表 + 白/黑名单，拒绝发生在 spawn 之前
+    if let Some(response) = command_policy::gate(
+        request.policy.as_ref(),
+        &request.command,
+        &request.shell.kind,
+        Some(request.id),
+    ) {
+        return response;
+    }
 
     let mut command = match build_shell_command(
         &request.shell.kind,

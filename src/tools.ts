@@ -169,6 +169,7 @@ export function registerTools(server: McpServer, config: AppConfig): void {
           timeout_ms: timeout,
           max_output_bytes: config.maxOutputBytes,
           shell: resolveShell(config),
+          policy: config.commandPolicy,
         });
         if (!response.ok) return fail(response.error);
         const body = response.output ? `\n\n${response.output}` : "";
@@ -281,6 +282,7 @@ export function registerTools(server: McpServer, config: AppConfig): void {
           cwd: dir,
           max_output_bytes: config.maxOutputBytes,
           shell: resolveShell(config),
+          policy: config.commandPolicy,
         });
         if (!response.ok) return fail(response.error);
         return ok(
