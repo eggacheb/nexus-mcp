@@ -4,7 +4,7 @@
 
 **Blocked by:** 01
 
-**Status:** done（2026-11-21，npm run check 全绿：vitest 115 条 + cargo 108 条 + smoke；隧道已接管公网并实测；第 13 条 Gemini 网页版实测待用户执行，见文末）
+**Status:** done（2026-11-21，npm run check 全绿：vitest 115 条 + cargo 108 条 + smoke；隧道已接管公网；Gemini 网页版实测通过，8 个工具全部出现，见验收第 13 条）
 
 - [x] 面板上一键启动与停止隧道进程，操作结果即时反映在状态灯
 - [x] 面板显示当前公网地址，并提供可达性检测（请求 health 端点）
@@ -18,7 +18,7 @@
 - [x] 处理「没有自愈」：给出守护方案（进程退出后重启），并说明代价是多一个常驻进程
 - [x] 交接笔记里的排障顺序原样保留在文档里，方便下次断线时照着查
 - [x] 记录沙箱限制：本机部分命令（注册计划任务、COM 实例化）需用户手动执行
-- [ ] 实际用 Gemini 网页版连一次（走 OAuth + 隧道全流程），记录成功或失败的具体现象
+- [x] 实际用 Gemini 网页版连一次（走 OAuth + 隧道全流程），记录成功或失败的具体现象
 
 **已拍板的决策**（2026-11-21，小白点头）：
 
@@ -58,7 +58,7 @@
 10. 守护 → `tests/tunnel.test.ts`「守护：异常退出后自动拉回新进程，stop 后不再重启」（restartDelayMs 300ms 注入）；代价按拍板后的实际代价记录（见上「已拍板的决策」3）。
 11. 排障顺序原样保留 → `docs/tunnel.md`「排障顺序」节，四步原文照抄（第 3 条加旧/新系统判定差异的注）。
 12. 沙箱限制 → `docs/tunnel.md`「沙箱限制」节，原文照抄并注明哪些操作不受影响。
-13. Gemini 实测 → **待执行**。前置已全部就绪：公网 `/health` 200、`/mcp` 401 带 `WWW-Authenticate` 指向 `https://nexus.maliy.top/.well-known/oauth-protected-resource`、OAuth 授权入口 `https://nexus.maliy.top/oauth/authorize` 可用。步骤写在 `docs/tunnel.md`「Gemini 实测记录」。
+13. Gemini 实测 → **已通过**（2026-11-21 23:07）：Gemini「应用连接器」添加自定义 MCP（`https://nexus.maliy.top/mcp`）→ 跳转授权页输入 config.json 的 token 批准 → 保存成功，显示 8 个工具（read/write/edit/bash/glob/grep/job_start/job_output），同步时间正常刷新。OAuth 动态注册 + PKCE + 命名隧道全流程走通，现象记录在 `docs/tunnel.md`「Gemini 实测记录」。
 
 **复用来源**：无外部代码搬运；外部进程检测与 taskkill 行为对齐本机已有 `nexus-tunnel.cmd`（实测有效的做法）。
 

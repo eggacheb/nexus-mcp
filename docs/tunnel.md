@@ -129,7 +129,12 @@ curl 默认跟随；Node 24 的 fetch 默认不跟随）。服务入口已开 `N
 
 ## Gemini 实测记录（OAuth + 隧道全流程）
 
-- [ ] 待执行。步骤：浏览器打开 Gemini → 设置 → 应用连接器 → 添加自定义 MCP，
-  地址填 `https://nexus.maliy.top/mcp` → 跳转授权页 → 输入 `config.json` 的 token
-  批准 → 回到 Gemini 确认工具列表出现。
-- 结果：（实测后记录具体现象）
+- [x] 已执行，成功（2026-11-21 23:07，小白操作）。
+
+步骤：浏览器打开 Gemini → 设置 → 应用连接器 → 添加自定义 MCP，地址填
+`https://nexus.maliy.top/mcp` → 跳转授权页 → 输入 `config.json` 的 token
+批准 → 回到 Gemini 确认工具列表出现。
+
+实测结果：连接器保存成功，「Nexus Mcp」显示 8 个工具
+（read / write / edit / bash / glob / grep / job_start / job_output），
+上次同步时间正常刷新。OAuth（动态注册 + PKCE + 隧道）全流程走通。
