@@ -195,7 +195,7 @@
 - **有没有 codex-core / 模型 crate**：**没有**。但 `Cargo.toml:28-75` 拖进 `codex-api`、`codex-config`、`codex-otel`、`codex-http-client`、`codex-network-proxy`、`codex-protocol`、`codex-sandboxing`、`codex-shell-command`、`codex-skills`、`axum`、`prost`、`tokio-tungstenite`、`notify`、`opentelemetry`。
 - **协议形态**：**不是 MCP**。`src/server/transport.rs:55` `DEFAULT_LISTEN_URL = "ws://127.0.0.1:0"`，是自定义 JSON-RPC over WebSocket（也有 stdio 路径，见 `server/transport_tests.rs:19` 的 `run_stdio_connection_with_io`）。
 - **Windows**：可以。`src/lib.rs:45-46` 的 `sandbox_integrity` 明确覆盖 `linux|macos|windows`；只有 `shell_snapshot*` 三个模块是 `#[cfg(unix)]`（`:51-56`）。
-- **建议：只当参考。** `src/` 下 **166 个 .rs 文件**。值得抄的两个点：(a) `ExecutorFileSystem` trait 的形状（这就是我们 read/write/edit 该有的抽象）；(b) `ExecProcessEvent` / `ExecProcessEventReceiver` / `ProcessOutputChunk` 的增量输出模型（就是我们要的 `job_start` + `job_output`）。
+- **建议：只当参考。** `src/` 下 **166 个 .rs 文件**。值得抄的三个点：(a) `ExecutorFileSystem` trait 的形状（这就是我们 read/write/edit 该有的抽象）；(b) `ExecProcessEvent` / `ExecProcessEventReceiver` / `ProcessOutputChunk` 的增量输出模型（就是我们要的 `job_start` + `job_output`）；(c) `Terminate` 的「回执 + 幂等」终止语义（票 12 补记，见下）。
 
 #### `exec-server-protocol`（lib）
 
@@ -210,6 +210,15 @@
 - **crate 名**：`codex-exec-server-cli`，bin 名 `codex-exec-server`（`Cargo.toml:7-9`），`src/main.rs` 只有 15 行。
 - **有没有 codex-core / 模型 crate**：**有** `codex-core`(`:27`)、`codex-model-provider`(`:31`)、`codex-login`(`:30`)、`codex-app-server`(`:22`)、`codex-aws-auth`(`:23`) → **agent 层**。
 - **建议：放弃（自己 build）。** 但注意：`cli/src/main.rs:244-245` 也有 `Subcommand::ExecServer`，所以 `codex exec-server` 子命令存在；且 Release 直接提供 `codex-exec-server-<triple>` 预编译二进制（见 §3）。
+
+#### Terminate/Signal RPC 形状（票 12 补记，2026-11-21）
+
+- **方法名与 wire 形状**：`process/signal`（`exec-server-protocol/src/protocol.rs:30`）与 `process/terminate`（`:31`）；没有统一请求枚举，每方法一对 Params/Response，字段 camelCase：`SignalParams { process_id, signal }`（`:615-620`）→ `SignalResponse {}`（`:622-624`）；`TerminateParams { process_id }`（`:626-630`）→ `TerminateResponse { running: bool }`（`:632-636`）。`ProcessSignal` 只有 `Interrupt` 一个变体（`:609-613`）——软信号能力收缩到最小。
+- **回执语义，不等待退出**：terminate 立即返回，`running=true` 只表示终止请求送达了仍在跑的进程；退出确认走异步通知 `process/exited` → `process/closed`（带 seq 保序；`exec-server/src/local_process.rs:749-776`、`:1133-1198`）。
+- **幂等与错误语义**：对已退出（保留窗口内）或未知 `process_id`，terminate 返回 `Ok(running: false)` 不报错（`local_process.rs:760-762,771,775`）；signal 对已退出/未知进程静默 `Ok({})`（`:734-746`）。这个宽容成立的前提是它是内部清理路径（客户端 `call_for_cleanup`，`exec-server/src/client.rs:973-991`），不是模型可达工具。
+- **Windows 树杀**：spawn 时 `CREATE_SUSPENDED|CREATE_NO_WINDOW` + `AssignProcessToJobObject`，kill 走 `TerminateJobObject`（`utils/pty/src/win/job.rs:270-272`）；assign 失败降级单进程 `TerminateProcess`（`utils/pty/src/pipe.rs:90-106`）。Unix 走进程组 `killpg(SIGKILL)`。Windows 上 signal(Interrupt) 等价于直接 kill（`pipe.rs:56-59`）。
+- **输出收尾**：terminate 会 abort 输出 reader 任务（`utils/pty/src/process.rs:257-273`），未读尾部输出可能丢，但已进保留缓冲的 chunk 仍可经 `process/read` 重放。
+- **对我们的启示**：stdio 单行 JSON 协议没有服务端主动通知，「回执 + 客户端轮询收敛」正好映射成我们的 `job_kill` 回执 + `job_output` 轮询；「幂等 no-op」值得学，但「未知 id 不报错」只适用于内部清理——模型可达的工具调用仍应报明确错误（对齐 job_output 现状）。
 
 ### 2.7 `message-board-mcp` → 现成 MCP server 范式
 
