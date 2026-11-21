@@ -32,9 +32,9 @@ cloudflared（本机进程，面板可启停）
 ## 端口占用的代价（接管前提）
 
 **8787 同时只能有一个服务监听。** 接管前必须先停掉旧 Bridge（旧系统
-`localbridge-desktop.exe`），否则新服务 `npm start` 直接绑定失败。旧系统还挂在
-启动文件夹（`Nexus.lnk` → `F:\Nexus\localbridge-desktop.exe`），确认新服务稳定后
-应删掉该项，避免下次重启抢端口。
+`localbridge-desktop.exe`），否则新服务 `npm start` 直接绑定失败。旧系统的启动文件夹
+自启项（`Nexus.lnk` → `F:\Nexus\localbridge-desktop.exe`）已于 2026-11-21 删除；
+如果哪天 `F:\Nexus` 的旧系统又要跑回来，先记得它会抢 8787。
 
 **不采用「改隧道配置指向其它端口」**：`config.yml` 是一个已经能工作的配置文件，
 改它要动 Cloudflare 侧已验证的链路，而 Gemini 侧连接器记录的就是这个域名——
