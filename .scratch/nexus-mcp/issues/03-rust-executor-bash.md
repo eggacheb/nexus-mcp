@@ -27,3 +27,4 @@
 - HeadTailBuffer 按票要求搬运，做了两处必要适配：const 泛型预算改为运行时值（预算来自 `maxOutputBytes` 配置），新增 head/tail 访问器供渲染时做 UTF-8 边界修整；`NOTICE` 与文件头已注明来源与改动。
 - 测试注入口：`NEXUS_MCP_EXECUTOR`（注入假执行器测崩溃路径，配 `crates/executor/src/bin/crash-helper.rs`）、`NEXUS_GIT_BASH`（测缺 Git Bash 启动报错）。构建接线：`npm run build:executor`，check 顺序为 build + vitest + cargo test + smoke。
 - 补充（票外）：pwsh 7 路径补了端到端用例；`shell 配置校验` 两条用例因服务拒绝启动、无法走 MCP 客户端，直接收集启动进程 stderr，属变通。
+- 后续修复：面板执行器状态灯按注释承诺换成真握手——执行器新增 `ping` op，`probeExecutorHandshake` 临时起进程发 ping（2 秒超时），`executorStatus` 改异步，面板轮询时不再显示「未接入」。

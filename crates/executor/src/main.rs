@@ -28,10 +28,10 @@ struct ShellSpec {
     program: String,
 }
 
+/// bash 请求体。op 分发在 handle_request 里完成，这里只管 bash 自己的字段。
 #[derive(Deserialize)]
 struct Request {
     id: u64,
-    op: String,
     command: String,
     cwd: String,
     timeout_ms: u64,
@@ -39,29 +39,38 @@ struct Request {
     shell: ShellSpec,
 }
 
-fn error_response(id: u64, message: impl Into<String>) -> Value {
+fn error_response(id: Option<u64>, message: impl Into<String>) -> Value {
     json!({ "id": id, "ok": false, "error": message.into() })
 }
 
 /// 处理一行请求，返回要写回的响应。独立成纯函数方便测试。
+/// 先宽松解析拿 id/op：ping 是状态握手，不需要 bash 的完整字段；
+/// bash 再做严格反序列化，字段缺失在响应里给出可读错误。
 fn handle_request(line: &str) -> Value {
-    match serde_json::from_str::<Request>(line) {
-        Ok(request) => match request.op.as_str() {
-            "bash" => run_bash(&request),
-            other => error_response(request.id, format!("未知 op: {other}")),
+    let parsed: Value = match serde_json::from_str(line) {
+        Ok(value) => value,
+        Err(err) => return error_response(None, format!("请求解析失败: {err}")),
+    };
+    let id = parsed.get("id").and_then(Value::as_u64);
+    match parsed.get("op").and_then(Value::as_str) {
+        Some("ping") => json!({ "id": id, "ok": true, "pong": true }),
+        Some("bash") => match serde_json::from_value::<Request>(parsed) {
+            Ok(request) => run_bash(&request),
+            Err(err) => error_response(id, format!("bash 请求字段有误: {err}")),
         },
-        Err(err) => {
-            json!({ "id": Value::Null, "ok": false, "error": format!("请求解析失败: {err}") })
-        }
+        _ => error_response(id, "未知 op 或缺少 op"),
     }
 }
 
 fn run_bash(request: &Request) -> Value {
     if request.command.trim().is_empty() {
-        return error_response(request.id, "command 不能为空");
+        return error_response(Some(request.id), "command 不能为空");
     }
     if !Path::new(&request.cwd).is_dir() {
-        return error_response(request.id, format!("工作目录不存在或不是目录: {}", request.cwd));
+        return error_response(
+            Some(request.id),
+            format!("工作目录不存在或不是目录: {}", request.cwd),
+        );
     }
     let max_bytes = request.max_output_bytes.max(1);
     let timeout_ms = request.timeout_ms.clamp(1, MAX_TIMEOUT_MS);
@@ -79,7 +88,7 @@ fn run_bash(request: &Request) -> Value {
                 request.command
             ),
         ],
-        other => return error_response(request.id, format!("不支持的 shell kind: {other}")),
+        other => return error_response(Some(request.id), format!("不支持的 shell kind: {other}")),
     };
 
     let mut command = Command::new(&request.shell.program);
@@ -99,7 +108,7 @@ fn run_bash(request: &Request) -> Value {
     {
         Ok(child) => child,
         Err(err) => {
-            return error_response(request.id, format!("启动 {} 失败: {err}", request.shell.program));
+            return error_response(Some(request.id), format!("启动 {} 失败: {err}", request.shell.program));
         }
     };
 
@@ -121,12 +130,12 @@ fn run_bash(request: &Request) -> Value {
                 }
                 thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
             }
-            Err(err) => return error_response(request.id, format!("等待子进程失败: {err}")),
+            Err(err) => return error_response(Some(request.id), format!("等待子进程失败: {err}")),
         }
     }
     let status = match child.wait() {
         Ok(status) => status,
-        Err(err) => return error_response(request.id, format!("回收子进程失败: {err}")),
+        Err(err) => return error_response(Some(request.id), format!("回收子进程失败: {err}")),
     };
     for reader in readers {
         let _ = reader.join();

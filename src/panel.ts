@@ -319,7 +319,7 @@ export async function startPanel(config: AppConfig, service: McpService): Promis
         url: service.url(),
         sessions: service.sessionCount(),
       },
-      executor: executorStatus(),
+      executor: await executorStatus(),
       tunnel: await probeTunnel(config),
       root: config.root,
       oauth: { url: "/oauth/authorize", available: false },

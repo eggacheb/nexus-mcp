@@ -1,4 +1,5 @@
 import type { AppConfig } from "./config.js";
+import { probeExecutorHandshake } from "./executor.js";
 
 export type ComponentState = "up" | "down" | "unavailable" | "unconfigured";
 
@@ -8,16 +9,12 @@ export interface ComponentStatus {
   detail?: string;
 }
 
-/**
- * 执行器状态。Rust 执行层还没落地，这里如实报「未接入」，
- * 不做假绿灯。03 票接入后换成真的握手探测。
- */
-export function executorStatus(): ComponentStatus {
-  return {
-    state: "unavailable",
-    label: "未接入",
-    detail: "Rust 执行器尚未落地，读写与命令仍返回 stub",
-  };
+/** 执行器状态：真握手——临时起一个执行器进程发 ping，回得来才算在线，不做假绿灯 */
+export async function executorStatus(): Promise<ComponentStatus> {
+  const probe = await probeExecutorHandshake();
+  return probe.ok
+    ? { state: "up", label: "在线", detail: "ping 往返正常" }
+    : { state: "down", label: "异常", detail: probe.detail };
 }
 
 /** 隧道状态：配置了 tunnelUrl 才去探，探测失败不抛错，只标记离线 */

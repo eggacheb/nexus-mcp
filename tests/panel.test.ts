@@ -92,8 +92,8 @@ describe("本地控制面板", () => {
       expect(status.service.state).toBe("running");
       expect(status.service.port).toBe(server.port);
       expect(status.service.url).toBe(`http://127.0.0.1:${server.port}/mcp`);
-      // 执行器还没落地，必须如实显示不可用
-      expect(status.executor.state).not.toBe("up");
+      // 执行器已接入，状态灯来自真实 ping 握手，应在线
+      expect(status.executor.state).toBe("up");
       // 没配 tunnelUrl，隧道显示未配置
       expect(status.tunnel.state).toBe("unconfigured");
       expect(status.root).toBe(projectRoot);

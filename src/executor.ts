@@ -186,3 +186,55 @@ export function getExecutor(): ExecutorClient {
   shared ??= new ExecutorClient();
   return shared;
 }
+
+export interface ExecutorProbe {
+  ok: boolean;
+  detail?: string;
+}
+
+/** 状态灯用：临时起一个执行器进程发 ping，不动共享实例；2 秒内回不来算异常 */
+export async function probeExecutorHandshake(): Promise<ExecutorProbe> {
+  const binary = executorBinaryPath();
+  if (!existsSync(binary)) {
+    return { ok: false, detail: `执行器不存在: ${binary}。先运行 npm run build 构建执行器。` };
+  }
+  return new Promise((resolve) => {
+    let child: ChildProcess | null = null;
+    let settled = false;
+    let buffer = "";
+    let timer: NodeJS.Timeout | undefined;
+    const finish = (result: ExecutorProbe): void => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      child?.kill();
+      resolve(result);
+    };
+    timer = setTimeout(() => finish({ ok: false, detail: "执行器 2s 内没有响应 ping" }), 2_000);
+    child = spawn(binary, [], { stdio: ["pipe", "pipe", "ignore"], windowsHide: true });
+    child.on("error", (err) => finish({ ok: false, detail: `执行器启动失败: ${err.message}` }));
+    child.on("exit", (code) =>
+      finish({ ok: false, detail: `执行器在响应 ping 前退出（exit ${code ?? "signal"}）` }),
+    );
+    child.stdout?.setEncoding("utf8");
+    child.stdout?.on("data", (chunk: string) => {
+      buffer += chunk;
+      const nl = buffer.indexOf("\n");
+      if (nl < 0) return;
+      const line = buffer.slice(0, nl).trim();
+      if (!line) return;
+      try {
+        const parsed = JSON.parse(line) as { id?: unknown; ok?: unknown; pong?: unknown };
+        if (parsed.id === 1 && parsed.ok === true && parsed.pong === true) {
+          finish({ ok: true });
+        } else {
+          finish({ ok: false, detail: "执行器 ping 响应格式不对" });
+        }
+      } catch {
+        // 非 JSON 行不是本探测关心的内容，忽略
+      }
+    });
+    child.stdin?.on("error", () => {});
+    child.stdin?.write(`${JSON.stringify({ id: 1, op: "ping" })}\n`);
+  });
+}

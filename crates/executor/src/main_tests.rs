@@ -116,6 +116,14 @@ fn oversized_chinese_output_stays_valid_utf8() {
 }
 
 #[test]
+fn ping_replies_pong_with_id() {
+    let response = handle_request(r#"{"id":5,"op":"ping"}"#);
+    assert_eq!(response["id"], json!(5));
+    assert_eq!(response["ok"], json!(true));
+    assert_eq!(response["pong"], json!(true));
+}
+
+#[test]
 fn render_output_fixes_utf8_boundaries_at_cut_points() {
     let mut buffer = HeadTailBuffer::new(8);
     // "中文输出" 共 12 字节（每个汉字 3 字节），预算 8：头部 4 字节切在 "文" 中间，
