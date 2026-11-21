@@ -1,28 +1,27 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { loadConfig } from "./config.js";
-import { registerTools } from "./tools.js";
+import { startHttpServer } from "./http.js";
+import { createServer } from "./server.js";
 
 const config = loadConfig();
 
-const server = new McpServer(
-  { name: "nexus-mcp", version: "0.1.0" },
-  { capabilities: { tools: {} } },
-);
-
-registerTools(server, config);
-
+// --stdio 优先于配置，方便本机客户端与测试固定走 stdio
 const useStdio = process.argv.includes("--stdio") || config.transport === "stdio";
 
-if (!useStdio) {
-  console.error(
-    "HTTP 传输尚未接入，当前只能以 stdio 启动。加 --stdio 参数，或在 config.json 里设 transport=stdio。",
-  );
-  process.exit(1);
+if (useStdio) {
+  const server = createServer(config);
+  await server.connect(new StdioServerTransport());
+  // stdio 模式下 stdout 属于协议通道，日志一律走 stderr
+  console.error(`[nexus-mcp] stdio 已就绪，根目录: ${config.root}`);
+} else {
+  const handle = await startHttpServer(config);
+  let stopping = false;
+  const shutdown = async () => {
+    if (stopping) return;
+    stopping = true;
+    await handle.close();
+    process.exit(0);
+  };
+  process.on("SIGINT", () => void shutdown());
+  process.on("SIGTERM", () => void shutdown());
 }
-
-const transport = new StdioServerTransport();
-await server.connect(transport);
-
-// stdio 模式下 stdout 属于协议通道，日志一律走 stderr
-console.error(`[nexus-mcp] stdio 已就绪，根目录: ${config.root}`);
