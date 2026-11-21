@@ -70,9 +70,37 @@ export interface ExecutorFailure {
   error: string;
 }
 
+export interface GlobSuccess {
+  ok: true;
+  /** 匹配的文件路径（相对沙箱根，正斜杠），按修改时间从新到旧 */
+  paths: string[];
+  /** 全部匹配数（截断前） */
+  total_matches: number;
+  /** 结果超过单次上限被截断 */
+  truncated: boolean;
+}
+
+export interface GrepMatch {
+  /** 文件路径（相对沙箱根，正斜杠） */
+  path: string;
+  /** 1 起的行号 */
+  line: number;
+  /** 匹配行内容（超长行已截断） */
+  text: string;
+}
+
+export interface GrepSuccess {
+  ok: true;
+  matches: GrepMatch[];
+  /** 匹配数超过单次上限被截断 */
+  truncated: boolean;
+}
+
 export type ReadResponse = ReadSuccess | ExecutorFailure;
 export type WriteResponse = WriteSuccess | ExecutorFailure;
 export type EditResponse = EditSuccess | ExecutorFailure;
+export type GlobResponse = GlobSuccess | ExecutorFailure;
+export type GrepResponse = GrepSuccess | ExecutorFailure;
 
 /** 执行器二进制路径；NEXUS_MCP_EXECUTOR 可覆盖（测试用来注入假执行器） */
 export function executorBinaryPath(): string {

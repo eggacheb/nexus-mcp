@@ -3,10 +3,24 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { AppConfig } from "./config.js";
 import { displayPath, resolveInRoot } from "./config.js";
 import { getExecutor, resolveShell } from "./executor.js";
-import type { BashResponse, EditResponse, ReadResponse, WriteResponse } from "./executor.js";
+import type {
+  BashResponse,
+  EditResponse,
+  GlobResponse,
+  GrepResponse,
+  ReadResponse,
+  WriteResponse,
+} from "./executor.js";
 
 /** read 未传 limit 时的默认行数，与工具 schema 的 limit 上限一致 */
 const MAX_READ_LINES = 2000;
+/** glob/grep 单次返回条数上限；工具 schema 没有 limit 参数，上限在协议层固定 */
+const MAX_SEARCH_RESULTS = 100;
+/**
+ * grep 的协议超时：rg 不在 PATH 时执行器会现场下载 pinned 版本（分钟级），
+ * 搜索本身毫秒级，预算全部留给下载兜底。
+ */
+const GREP_TIMEOUT_MS = 300_000;
 
 type TextResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
 
@@ -183,7 +197,24 @@ export function registerTools(server: McpServer, config: AppConfig): void {
     async ({ pattern, path: searchPath }) => {
       try {
         const dir = searchPath ? resolveInRoot(config.root, searchPath) : config.root;
-        return stub("glob", `pattern: ${pattern}  起点: ${displayPath(config.root, dir)}`);
+        const response = await getExecutor().request<GlobResponse>({
+          op: "glob",
+          root: config.root,
+          path: dir,
+          pattern,
+          max_results: MAX_SEARCH_RESULTS,
+        });
+        if (!response.ok) return fail(response.error);
+        if (response.paths.length === 0) {
+          return ok(`没有匹配「${pattern}」的文件（已遵守 .gitignore）。`);
+        }
+        let text = response.paths.join("\n");
+        if (response.truncated) {
+          text += `\n\n共 ${response.total_matches} 个匹配，按修改时间从新到旧显示前 ${response.paths.length} 个，还有更多未显示；用更具体的 pattern 或指定 path 缩小搜索范围。`;
+        } else {
+          text += `\n\n共 ${response.total_matches} 个匹配。`;
+        }
+        return ok(text);
       } catch (err) {
         return fail((err as Error).message);
       }
@@ -205,10 +236,27 @@ export function registerTools(server: McpServer, config: AppConfig): void {
     async ({ pattern, path: searchPath, glob, ignore_case }) => {
       try {
         const dir = searchPath ? resolveInRoot(config.root, searchPath) : config.root;
-        return stub(
-          "grep",
-          `pattern: ${pattern}  起点: ${displayPath(config.root, dir)}  glob=${glob ?? "*"}  忽略大小写=${ignore_case ?? false}`,
-        );
+        const response = await getExecutor().request<GrepResponse>({
+          op: "grep",
+          root: config.root,
+          path: dir,
+          pattern,
+          glob,
+          ignore_case: ignore_case ?? false,
+          max_results: MAX_SEARCH_RESULTS,
+          timeout_ms: GREP_TIMEOUT_MS,
+        });
+        if (!response.ok) return fail(response.error);
+        if (response.matches.length === 0) {
+          return ok(
+            `没有匹配「${pattern}」的内容（已遵守 .gitignore；可尝试 ignore_case 或放宽 pattern）。`,
+          );
+        }
+        let body = response.matches.map((m) => `${m.path}:${m.line}: ${m.text}`).join("\n");
+        if (response.truncated) {
+          body += `\n\n已显示前 ${response.matches.length} 条匹配，还有更多未显示；用 glob 参数限定文件类型、指定 path 缩小搜索范围，或换更精确的 pattern。`;
+        }
+        return ok(body);
       } catch (err) {
         return fail((err as Error).message);
       }

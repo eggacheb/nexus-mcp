@@ -8,7 +8,7 @@
 ## 目录
 
 - `src/` — TypeScript 侧：MCP 协议、工具定义、HTTP 传输、面板、执行器协议客户端（`executor.ts`）
-- `crates/executor/` — Rust 执行器：唯一的命令执行层，stdio 单行 JSON 协议，`bash` 已接入
+- `crates/executor/` — Rust 执行器：唯一的命令执行层，stdio 单行 JSON 协议，`bash`/`glob`/`grep` 已接入（rg 缺失时执行器自动下载 pinned 版本到全局缓存，测试钩子见 `crates/executor/src/ripgrep.rs` 头注释）
 - `scripts/` — 自检与本地 CI
 
 ## 命令

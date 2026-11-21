@@ -4,7 +4,10 @@
 //! 请求带自增 id（由协议层 TS 侧分配），响应原样带回 id。
 
 mod edit_match;
+mod glob_search;
+mod grep_search;
 mod head_tail_buffer;
+mod ripgrep;
 mod string;
 
 use std::fs;
@@ -118,6 +121,14 @@ fn handle_request(line: &str) -> Value {
             Ok(request) => run_edit(&request),
             Err(err) => error_response(id, format!("edit 请求字段有误: {err}")),
         },
+        Some("glob") => match serde_json::from_value::<glob_search::GlobRequest>(parsed) {
+            Ok(request) => glob_search::run_glob(&request),
+            Err(err) => error_response(id, format!("glob 请求字段有误: {err}")),
+        },
+        Some("grep") => match serde_json::from_value::<grep_search::GrepRequest>(parsed) {
+            Ok(request) => grep_search::run_grep(&request),
+            Err(err) => error_response(id, format!("grep 请求字段有误: {err}")),
+        },
         _ => error_response(id, "未知 op 或缺少 op"),
     }
 }
@@ -210,6 +221,7 @@ fn run_bash(request: &BashRequest) -> Value {
 }
 
 /// 路径与根目录的包含关系。
+#[derive(PartialEq)]
 enum Containment {
     /// 目标就是根目录本身
     RootItself,
@@ -337,6 +349,57 @@ fn root_not_writable_error(id: Option<u64>, root: &Path) -> Value {
             display_path(root)
         ),
     )
+}
+
+/// glob/grep 单次返回条目上限的默认值。
+fn default_max_results() -> u64 {
+    100
+}
+
+/// glob/grep 共用：解析搜索起点（根目录或根内子目录），返回
+/// (canonical 根目录, canonical 起点目录)。起点不存在或指向根外时给出可读错误。
+/// 与 read/write 不同，起点允许是目录本身；但越界判定与文件操作同一套规矩。
+fn resolve_search_dir(
+    root_str: &str,
+    path_str: Option<&str>,
+    id: Option<u64>,
+) -> Result<(PathBuf, PathBuf), Value> {
+    let root = resolve_root(root_str, id)?;
+    let Some(input) = path_str.map(str::trim).filter(|input| !input.is_empty()) else {
+        return Ok((root.canonical.clone(), root.canonical));
+    };
+    let target = Path::new(input);
+    if let Err(message) = ensure_lexically_within(&root.lexical, input, target) {
+        return Err(error_response(id, message));
+    }
+    let metadata = match fs::metadata(target) {
+        Ok(meta) => meta,
+        Err(_) => return Err(error_response(id, format!("搜索起点不存在或不是目录: {input}"))),
+    };
+    if !metadata.is_dir() {
+        return Err(error_response(
+            id,
+            format!("搜索起点是文件不是目录，glob/grep 需要目录起点: {input}"),
+        ));
+    }
+    // 真实路径校验：起点若是链接，按解析结果判定，指向根外一律拒绝
+    let canonical = match fs::canonicalize(target) {
+        Ok(path) => path,
+        Err(err) => return Err(error_response(id, format!("路径解析失败: {input} ({err})"))),
+    };
+    if let Containment::Outside = classify(&root.canonical, &canonical) {
+        return Err(error_response(id, escape_error(input, &canonical, &root.canonical)));
+    }
+    Ok((root.canonical, canonical))
+}
+
+/// 结果路径的展示前缀：搜索起点相对沙箱根的路径（正斜杠）；起点就是根时为空串。
+/// 统一以沙箱根为基准，模型可以把返回路径直接喂给 read/write。
+fn display_rel_prefix(root_canonical: &Path, search_dir: &Path) -> String {
+    search_dir
+        .strip_prefix(root_canonical)
+        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default()
 }
 
 /// read 与 edit 共用的「存在性 + 沙箱两道校验」，返回 canonicalize 后的真实路径。

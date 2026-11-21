@@ -214,6 +214,90 @@ fn cleanup(dir: &Path) {
     let _ = fs::remove_dir_all(dir);
 }
 
+/// glob/grep 共用的最小 root：临时目录 + git init（require_git(true) 下
+/// .gitignore 只有在 git 仓库里才生效）。
+fn search_root(name: &str) -> PathBuf {
+    let root = temp_root(name);
+    let status = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(&root)
+        .status()
+        .expect("本测试需要 git");
+    assert!(status.success(), "git init 失败");
+    fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
+    fs::create_dir(root.join("src")).unwrap();
+    fs::write(root.join("src").join("a.txt"), "alpha\n").unwrap();
+    fs::create_dir(root.join("ignored")).unwrap();
+    fs::write(root.join("ignored").join("b.txt"), "beta\n").unwrap();
+    root
+}
+
+#[test]
+fn glob_op_respects_gitignore_and_reports_relpaths() {
+    let root = search_root("glob-ok");
+    let line = json!({
+        "id": 20, "op": "glob", "root": root.to_string_lossy(),
+        "pattern": "**/*.txt", "max_results": 10
+    })
+    .to_string();
+    let response = handle_request(&line);
+    assert_eq!(response["ok"], json!(true), "实际: {response}");
+    let paths: Vec<&str> = response["paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(paths.contains(&"src/a.txt"), "实际: {paths:?}");
+    assert!(!paths.iter().any(|p| p.contains("ignored/")), "实际: {paths:?}");
+    assert_eq!(response["total_matches"], json!(1));
+    assert_eq!(response["truncated"], json!(false));
+    cleanup(&root);
+}
+
+#[test]
+fn glob_op_rejects_escape_and_missing_start() {
+    let root = search_root("glob-escape");
+    let line = json!({
+        "id": 21, "op": "glob", "root": root.to_string_lossy(),
+        "path": root.join("..").join("elsewhere").to_string_lossy(),
+        "pattern": "*.txt", "max_results": 10
+    })
+    .to_string();
+    let response = handle_request(&line);
+    assert_eq!(response["ok"], json!(false));
+    assert!(response["error"].as_str().unwrap().contains("越界"));
+
+    let line = json!({
+        "id": 22, "op": "glob", "root": root.to_string_lossy(),
+        "path": "no-such-dir-xyz", "pattern": "*.txt", "max_results": 10
+    })
+    .to_string();
+    let response = handle_request(&line);
+    assert_eq!(response["ok"], json!(false));
+    assert!(response["error"].as_str().unwrap().contains("目录"));
+    cleanup(&root);
+}
+
+#[test]
+fn grep_op_rejects_invalid_regex_with_ripgrep_stderr() {
+    // rg 在 PATH 上才跑；没有时静默通过（执行器会走下载兜底，测试不能联网）
+    if ripgrep::find_in_path().is_none() {
+        return;
+    }
+    let root = search_root("grep-invalid-regex");
+    let line = json!({
+        "id": 23, "op": "grep", "root": root.to_string_lossy(),
+        "pattern": "([unclosed", "max_results": 10
+    })
+    .to_string();
+    let response = handle_request(&line);
+    assert_eq!(response["ok"], json!(false));
+    let message = response["error"].as_str().unwrap();
+    assert!(message.contains("ripgrep"), "实际: {message}");
+    cleanup(&root);
+}
+
 #[test]
 fn read_op_returns_numbered_lines_matching_real_positions() {
     let root = temp_root("read-numbered");
