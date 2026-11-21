@@ -81,6 +81,14 @@ sh.Run """C:\Program Files (x86)\cloudflared\cloudflared.exe"" --config ""C:\Use
 
 移除自启 = 删除 Startup 里的 `nexus-tunnel.vbs`。
 
+**命令行工具与面板的分工**（守护带来的行为差异，别混用）：
+
+- `nexus-tunnel status`：独立视角（tasklist + curl，不依赖服务活着），排障时先打它。
+- `nexus-tunnel stop`：**只在 nexus-mcp 服务没跑时用**。服务活着时它会触发面板内置
+  守护，10 秒后 cloudflared 自动复活——想真停隧道走面板「停止隧道」按钮。
+- `nexus-tunnel start`：服务挂了、隧道也没了时的手动兜底拉起。
+- 定位：面板跑在服务进程里，服务起不来时这套命令行是唯一入口；平时启停走面板。
+
 **为什么不用 Windows 服务或计划任务**（上一轮两条路都实测不可用，别再走）：
 
 1. `cloudflared service install` —— 2026.11.0 装出来的服务 binPath 只有 exe 路径、
