@@ -144,5 +144,6 @@ curl 默认跟随；Node 24 的 fetch 默认不跟随）。服务入口已开 `N
 批准 → 回到 Gemini 确认工具列表出现。
 
 实测结果：连接器保存成功，「Nexus Mcp」显示 8 个工具
-（read / write / edit / bash / glob / grep / job_start / job_output），
+（read / write / edit / bash / glob / grep / job_start / job_output；
+2026-11-22 票 13 加入 `job_kill` 后为 9 个，连接器重新拉清单即可看到），
 上次同步时间正常刷新。OAuth（动态注册 + PKCE + 隧道）全流程走通。
