@@ -1,0 +1,4 @@
+# hook 脚本必须保持 LF：CRLF 会让 sh 把 `exit 1\r` 当非法命令，
+# git 的 autocrlf=true 在 Windows 上会把文本文件 checkout 成 CRLF，
+# 所以用 eol=lf 钉死 hook 目录（票 08 复盘发现 pre-commit 从装上起就没跑通过）。
+scripts/hooks/** text eol=lf

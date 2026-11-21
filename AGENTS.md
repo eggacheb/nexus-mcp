@@ -20,7 +20,7 @@
 - 测试：`npm run test`（vitest，测试只走 MCP 客户端入口）；Rust 侧单独跑 `npm run test:rs`
 - 自检：`npm run smoke`（起服务、列出工具、调一次 `read`）
 - 本地 CI：`npm run check`（build + vitest + cargo test + smoke，提交前必须全部通过）
-- 提交钩子：`git config core.hooksPath scripts/hooks`（克隆后执行一次；pre-commit 拦构建产物进暂存区）
+- 提交钩子：`git config core.hooksPath scripts/hooks`（克隆后执行一次）。pre-commit 拦构建产物进暂存区 + 快速检查（typecheck + cargo check，约 10 秒）；pre-push 跑全量 `npm run check`（约 3-5 分钟）。环境坏了最早在 pre-push 暴露，别用 `--no-verify` 绕过。
 
 ## 不能碰
 
@@ -36,6 +36,7 @@
 - cargo 测试里真实 spawn 子进程的用例要在模块内串行（形状照 `jobs_tests.rs` 的 SPAWN_LOCK），否则并行负载会挤爆既有的时序断言。
 - 票做完在 Comments 注明每条验收清单对应哪个测试用例；没有断言的验收线不算过。
 - 跑 vitest / cargo test / `npm run check` 这类长命令用 `& scripts/run-logged.ps1 { <命令> }`：输出落 %TEMP% 日志，只回显结尾与退出码。
+- vitest 固定走 vmThreads 池（`package.json` 的 test 脚本带 `--pool=vmThreads`）：Node 24.12 上默认池把 runner chunk 装载成两份，`describe()` 直接崩。VM 上下文里 `fetch` 等原生 API 抛的异常来自主 realm，`toBeInstanceOf(Error)` 这类跨 realm 断言会假阴性——断言错误形状（message 内容），别断言构造器。
 
 ## 复用 codex 代码的规则
 

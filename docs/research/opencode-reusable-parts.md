@@ -94,6 +94,7 @@
 - **util**（`packages/util/package.json`）：包整体重（effect、otel 全家桶、npmcli，`:42-65`），但**单文件零依赖**可摘：`text-boundary.ts`（37 行，UTF-16/UTF-8 边界裁剪，`head/tail/utf8Tail`，`:11-33`）——nexus-mcp 已从 codex 搬了 head-tail-buffer，此文件是 TS 侧对位物，按需取一；`bom.ts`、`execute-output.ts`、`glob.ts` 同理可摘文件不摘包。
 - **路径沙箱/权限**：`core/src/file-access.ts`——词法解析 `resolvePath`（`~` 展开 + `FSUtil.windowsPath` 归一化，`:113-120`）、`authorizeExternal` 外部目录审批边界（`:38-44,97-101`）、权限 resource/save 规则（`:57-78`）。设计思路（「lexical resolve 先行、磁盘不碰、外部目录单独审批」）值得抄，实现绑死 Effect+Permission 服务，**只抄思路**。
 - **protocol**：HTTP API 错误/类型包，无独立价值，放弃。
+- **命令权限/危险命令**（票 08 调研补记，2026-11-21）：`schema/src/permission.ts:56` 是有序规则数组 `[{action, resource, effect}]`，last-match-wins、deny 最先评估；匹配引擎 `core/src/util/wildcard.ts:1-15`，15 行通配转正则——末尾 `" *"` 变 `( .*)?`（裸前缀也命中）、win32 恒加 `i` flag、`\` 归一 `/`，零依赖 MIT，**票 08 已手写移植进执行器**（`crates/executor/src/command_policy.rs`）。危险命令：**没有内置清单**，官方文档明确反对黑名单（`services/site/src/docs/content/permissions.mdx:184`，立场是「窄 allowlist + 解析失败即拒绝」，`rm -rf`/`mkfs`/`diskpart` 只在测试语料出现）——内置危险表得自己写。多命令：`core/src/shell/parse.ts`（约 2000 行 bash/zsh/POSIX/PowerShell 扫描器）拆成子命令逐条评估、任一命中即拦，解析不了的整条拒绝（`parse.ts:176` 的 opaque 分支，fail-closed）——扫描器体量大且绑 Effect，只借「拆子命令 + fail-closed」语义。可执行名不做归一化（resource 是命令原文），去 `.exe`/剥路径/大小写折叠要借 codex `command_safety` 的形状。
 - **server**（`packages/server/src/`）：effect/http-api 的 REST 服务（`handlers/mcp.ts:19-90` 是「管理外部 MCP server 的增删连断 + PTY 票据」的 handler，不是把工具挂成 MCP 的 server）。**没有现成 MCP server 挂载实现**。放弃。
 
 ## 5. 「不要碰」清单

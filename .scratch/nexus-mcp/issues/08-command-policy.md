@@ -34,7 +34,7 @@
 - vmThreads 的 VM 上下文里 `fetch` 抛的异常来自主 realm，`toBeInstanceOf(Error)` 跨 realm 判否 → panel 测试「停止后 MCP 端点不可用」改为断言错误消息非空，其余 3 个 panel 失败是该用例失败后的级联（服务停在 stopped）。此改动属于 panel 测试，本票顺手修，复盘时归入「环境升级没被检查拦住」类。
 - cargo 的 `timeout_kills_child_and_reports` 在并行负载下偶发时序抖动（AGENTS.md 已有记载），单独重跑即过，与本票无关。
 
-**复用来源：** 原案是搬 codex 的 `execpolicy-rules`（token 级前缀匹配）。开工前调查了 opencode（结论见 `docs/research/opencode-reusable-parts.md` 未覆盖、调查记录在票 Comments），小白拍板改用更轻的组合：
+**复用来源：** 原案是搬 codex 的 `execpolicy-rules`（token 级前缀匹配）。开工前调查了 opencode（原调研文档未覆盖，结论已补进 `docs/research/opencode-reusable-parts.md` §4「命令权限/危险命令」），小白拍板改用更轻的组合：
 
 - **匹配引擎**：opencode `packages/core/src/util/wildcard.ts` 的 15 行通配算法（MIT，末尾 ` *` 可省略、`\` 归一 `/`、Windows 大小写不敏感），手写成零依赖 Rust 版，不引入 regex crate。
 - **可执行名归一化**：借 codex `shell-command/src/command_safety` 的 `executable_name_lookup_key` 形状（剥路径与盘符、ASCII 折叠、去 `.exe/.cmd/.bat/.com`）。

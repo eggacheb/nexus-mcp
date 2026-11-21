@@ -12,3 +12,9 @@ if [ -n "$blocked" ]; then
   echo "用 git restore --staged 移除后再提交；产物目录以 .gitignore 为准。" >&2
   exit 1
 fi
+
+# 票 08 复盘：提交前快速检查（约 10 秒），全量检查在 pre-push
+cd "$(git rev-parse --show-toplevel)" || exit 1
+echo "pre-commit: typecheck + cargo check"
+npm run typecheck || exit 1
+cargo check --manifest-path crates/executor/Cargo.toml || exit 1
