@@ -33,6 +33,9 @@
 - 路径一律相对沙箱根目录解析，越界直接报错，不做「尽力而为」的修补。
 - 工具描述写给人看，不带治理元数据，不出现 `providerId`、`rpcMethod`、`safetyClassification` 这类字段。
 - 新增工具先写失败的测试再写实现，不从实现反推测试。
+- cargo 测试里真实 spawn 子进程的用例要在模块内串行（形状照 `jobs_tests.rs` 的 SPAWN_LOCK），否则并行负载会挤爆既有的时序断言。
+- 票做完在 Comments 注明每条验收清单对应哪个测试用例；没有断言的验收线不算过。
+- 跑 vitest / cargo test / `npm run check` 这类长命令用 `& scripts/run-logged.ps1 { <命令> }`：输出落 %TEMP% 日志，只回显结尾与退出码。
 
 ## 复用 codex 代码的规则
 
