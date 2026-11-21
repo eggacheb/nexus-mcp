@@ -28,12 +28,16 @@ function textOf(result: { content?: unknown }): string {
   return parts.map((part) => part.text ?? "").join("\n");
 }
 
+function newClient(): Client {
+  return new Client({ name: "vitest-http", version: "0.1.0" });
+}
+
 async function connectClient(
   url: URL,
   options?: ConstructorParameters<typeof StreamableHTTPClientTransport>[1],
 ): Promise<{ client: Client; transport: StreamableHTTPClientTransport }> {
   const transport = new StreamableHTTPClientTransport(url, options);
-  const client = new Client({ name: "vitest-http", version: "0.1.0" });
+  const client = newClient();
   await client.connect(transport);
   return { client, transport };
 }
@@ -45,7 +49,7 @@ async function connectError(
   options?: ConstructorParameters<typeof StreamableHTTPClientTransport>[1],
 ): Promise<CodedError> {
   const transport = new StreamableHTTPClientTransport(url, options);
-  const client = new Client({ name: "vitest-http", version: "0.1.0" });
+  const client = newClient();
   const error = await client.connect(transport).then(
     () => null,
     (err: unknown) => err as CodedError,
@@ -57,7 +61,7 @@ async function connectError(
 /** 带着已失效的会话 id 发普通请求，客户端不会重新 initialize，直接打服务端 */
 async function staleSessionError(url: URL, sessionId: string): Promise<CodedError> {
   const transport = new StreamableHTTPClientTransport(url, { ...authInit(TOKEN), sessionId });
-  const client = new Client({ name: "vitest-http", version: "0.1.0" });
+  const client = newClient();
   await client.connect(transport);
   const error = await client.listTools().then(
     () => null,

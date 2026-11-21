@@ -13,3 +13,9 @@ export function log(message: string): void {
 export function recentLogs(count = 100): string[] {
   return lines.slice(-count);
 }
+
+/** 把文本里出现的敏感串全部替换成 ***；日志与对外错误消息都该过这一道 */
+export function redactText(text: string, secret: string): string {
+  if (!secret) return text;
+  return text.split(secret).join("***");
+}

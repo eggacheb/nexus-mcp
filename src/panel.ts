@@ -4,7 +4,8 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import path from "node:path";
 import type { AppConfig } from "./config.js";
 import { loadConfig, saveConfig } from "./config.js";
-import { log, recentLogs } from "./log.js";
+import { readBody, sendJson as sendJsonRaw } from "./httpHelpers.js";
+import { log, recentLogs, redactText } from "./log.js";
 import type { McpService } from "./mcpService.js";
 import type { ComponentStatus } from "./status.js";
 import { executorStatus, probeTunnel } from "./status.js";
@@ -257,36 +258,13 @@ const PAGE = `<!doctype html>
 </html>
 `;
 
+/** 面板的 JSON 响应一律 no-store，状态和日志不允许被中间层缓存 */
 function sendJson(res: ServerResponse, status: number, payload: unknown): void {
-  const body = JSON.stringify(payload);
-  res.writeHead(status, {
-    "Content-Type": "application/json; charset=utf-8",
-    "Content-Length": Buffer.byteLength(body),
-    "Cache-Control": "no-store",
-  });
-  res.end(body);
-}
-
-function readBody(req: IncomingMessage): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    let size = 0;
-    req.on("data", (chunk: Buffer) => {
-      size += chunk.length;
-      if (size > MAX_BODY_BYTES) {
-        reject(new Error("请求体过大"));
-        req.destroy();
-        return;
-      }
-      chunks.push(chunk);
-    });
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-    req.on("error", reject);
-  });
+  sendJsonRaw(res, status, payload, { "Cache-Control": "no-store" });
 }
 
 async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
-  const raw = await readBody(req);
+  const raw = await readBody(req, MAX_BODY_BYTES);
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -326,11 +304,6 @@ function blockUnsafeWrite(req: IncomingMessage, res: ServerResponse, panelPort: 
     return true;
   }
   return false;
-}
-
-function redact(line: string, token: string): string {
-  if (!token) return line;
-  return line.split(token).join("***");
 }
 
 export async function startPanel(config: AppConfig, service: McpService): Promise<PanelHandle> {
@@ -389,7 +362,7 @@ export async function startPanel(config: AppConfig, service: McpService): Promis
 
     if (req.method === "GET" && url.pathname === "/api/logs") {
       const token = config.token;
-      sendJson(res, 200, { lines: recentLogs().map((line) => redact(line, token)) });
+      sendJson(res, 200, { lines: recentLogs().map((line) => redactText(line, token)) });
       return;
     }
 
@@ -472,12 +445,13 @@ export async function startPanel(config: AppConfig, service: McpService): Promis
   const server = http.createServer((req, res) => {
     route(req, res).catch((error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);
-      log(`面板请求失败: ${message}`);
+      const safeMessage = redactText(message, config.token);
+      log(`面板请求失败: ${safeMessage}`);
       if (res.headersSent) {
         res.end();
         return;
       }
-      sendJson(res, 500, { error: `面板内部错误: ${message}` });
+      sendJson(res, 500, { error: `面板内部错误: ${safeMessage}` });
     });
   });
 

@@ -4,7 +4,8 @@ import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { AppConfig } from "./config.js";
-import { log } from "./log.js";
+import { readBody, sendJson } from "./httpHelpers.js";
+import { log, redactText } from "./log.js";
 import { createServer } from "./server.js";
 
 const MCP_PATH = "/mcp";
@@ -12,12 +13,23 @@ const MCP_PATH = "/mcp";
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
 const LISTEN_HOST = "127.0.0.1";
 const SESSION_HEADER = "mcp-session-id";
+/** 空闲超过这个时长且没有任何请求的会话直接回收，防止客户端异常断开造成泄漏 */
+const IDLE_SESSION_MS = 30 * 60 * 1000;
+const SESSION_SWEEP_MS = 60_000;
+
+/** JSON-RPC 自定义错误码，落在服务端保留区间 -32000~-32099 */
+const RPC_AUTH_FAILED = -32001;
+const RPC_SESSION_GONE = -32002;
+const RPC_PARSE_ERROR = -32700;
+const RPC_INVALID_REQUEST = -32600;
+const RPC_INTERNAL_ERROR = -32603;
 
 interface Session {
   id?: string;
   server: McpServer;
   transport: StreamableHTTPServerTransport;
   closed: boolean;
+  lastSeen: number;
 }
 
 export interface McpService {
@@ -75,21 +87,6 @@ function checkAuth(req: IncomingMessage, config: AppConfig): AuthFailure | null 
   return null;
 }
 
-function sendJson(
-  res: ServerResponse,
-  status: number,
-  payload: unknown,
-  headers: Record<string, string> = {},
-): void {
-  const body = JSON.stringify(payload);
-  res.writeHead(status, {
-    "Content-Type": "application/json; charset=utf-8",
-    "Content-Length": Buffer.byteLength(body),
-    ...headers,
-  });
-  res.end(body);
-}
-
 function sendRpcError(
   res: ServerResponse,
   status: number,
@@ -100,22 +97,8 @@ function sendRpcError(
   sendJson(res, status, { jsonrpc: "2.0", error: { code, message }, id: null }, headers);
 }
 
-function readBody(req: IncomingMessage): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    let size = 0;
-    req.on("data", (chunk: Buffer) => {
-      size += chunk.length;
-      if (size > MAX_BODY_BYTES) {
-        reject(new Error(`请求体超过 ${MAX_BODY_BYTES} 字节`));
-        req.destroy();
-        return;
-      }
-      chunks.push(chunk);
-    });
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-    req.on("error", reject);
-  });
+function sendSessionNotFound(res: ServerResponse): void {
+  sendRpcError(res, 404, RPC_SESSION_GONE, "会话不存在或已结束，请重新 initialize。");
 }
 
 function sessionIdOf(req: IncomingMessage): string | undefined {
@@ -163,7 +146,7 @@ function createSession(config: AppConfig, sessions: Map<string, Session>): Sessi
   transport.onerror = (error) => {
     log(`会话出错: ${error.message}`);
   };
-  session = { server: createServer(config), transport, closed: false };
+  session = { server: createServer(config), transport, closed: false, lastSeen: Date.now() };
   return session;
 }
 
@@ -172,9 +155,25 @@ export function createMcpService(config: AppConfig): McpService {
   let listener: Server | undefined;
   let actualPort = config.port;
   let ready = false;
+  let sweeper: NodeJS.Timeout | undefined;
 
   function url(): string {
     return `http://${LISTEN_HOST}:${actualPort}${MCP_PATH}`;
+  }
+
+  /** 任何要写日志或回给客户端的动态文本都先过这道，防止令牌从查询串之类的地方漏出去 */
+  function safeText(message: string): string {
+    return redactText(message, config.token);
+  }
+
+  function sweepIdleSessions(): void {
+    const now = Date.now();
+    for (const session of [...sessions.values()]) {
+      if (now - session.lastSeen > IDLE_SESSION_MS) {
+        log(`回收空闲会话 ${safeText(session.id ?? "(未完成初始化)")}`);
+        void releaseSession(session, sessions);
+      }
+    }
   }
 
   async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -188,7 +187,7 @@ export function createMcpService(config: AppConfig): McpService {
 
     const auth = checkAuth(req, config);
     if (auth) {
-      sendRpcError(res, auth.status, -32001, auth.message, {
+      sendRpcError(res, auth.status, RPC_AUTH_FAILED, auth.message, {
         "WWW-Authenticate": 'Bearer realm="nexus-mcp"',
       });
       return;
@@ -196,7 +195,7 @@ export function createMcpService(config: AppConfig): McpService {
 
     const method = req.method ?? "GET";
     if (method !== "POST" && method !== "GET" && method !== "DELETE") {
-      sendRpcError(res, 405, -32600, `MCP 端点不接受 ${method}`, {
+      sendRpcError(res, 405, RPC_INVALID_REQUEST, `MCP 端点不接受 ${method}`, {
         Allow: "GET, POST, DELETE",
       });
       return;
@@ -207,31 +206,32 @@ export function createMcpService(config: AppConfig): McpService {
     if (method === "POST") {
       let raw: string;
       try {
-        raw = await readBody(req);
+        raw = await readBody(req, MAX_BODY_BYTES);
       } catch (error) {
-        sendRpcError(res, 413, -32600, (error as Error).message);
+        sendRpcError(res, 413, RPC_INVALID_REQUEST, (error as Error).message);
         return;
       }
       let parsed: unknown;
       try {
         parsed = JSON.parse(raw);
       } catch {
-        sendRpcError(res, 400, -32700, "请求体不是合法 JSON。");
+        sendRpcError(res, 400, RPC_PARSE_ERROR, "请求体不是合法 JSON。");
         return;
       }
 
       if (sessionId) {
         const existing = sessions.get(sessionId);
         if (!existing) {
-          sendRpcError(res, 404, -32001, "会话不存在或已结束，请重新 initialize。");
+          sendSessionNotFound(res);
           return;
         }
+        existing.lastSeen = Date.now();
         await existing.transport.handleRequest(req, res, parsed);
         return;
       }
 
       if (!hasInitializeMessage(parsed)) {
-        sendRpcError(res, 400, -32600, `缺少 ${SESSION_HEADER} 头，只有 initialize 请求可以不带头。`);
+        sendRpcError(res, 400, RPC_INVALID_REQUEST, `缺少 ${SESSION_HEADER} 头，只有 initialize 请求可以不带头。`);
         return;
       }
 
@@ -240,19 +240,23 @@ export function createMcpService(config: AppConfig): McpService {
       await session.transport.handleRequest(req, res, parsed);
       if (session.id) {
         log(`会话已建立 ${session.id}，当前 ${sessions.size} 个`);
+      } else {
+        // initialize 没走完（客户端中断或协议错误），别把孤儿实例留在表外
+        await releaseSession(session, sessions);
       }
       return;
     }
 
     if (!sessionId) {
-      sendRpcError(res, 400, -32600, `缺少 ${SESSION_HEADER} 头。`);
+      sendRpcError(res, 400, RPC_INVALID_REQUEST, `缺少 ${SESSION_HEADER} 头。`);
       return;
     }
     const existing = sessions.get(sessionId);
     if (!existing) {
-      sendRpcError(res, 404, -32001, "会话不存在或已结束，请重新 initialize。");
+      sendSessionNotFound(res);
       return;
     }
+    existing.lastSeen = Date.now();
     await existing.transport.handleRequest(req, res);
   }
 
@@ -262,12 +266,12 @@ export function createMcpService(config: AppConfig): McpService {
     const server = http.createServer((req, res) => {
       route(req, res).catch((error: unknown) => {
         const message = error instanceof Error ? error.message : String(error);
-        log(`请求处理失败: ${message}`);
+        log(`请求处理失败: ${safeText(message)}`);
         if (res.headersSent) {
           res.end();
           return;
         }
-        sendRpcError(res, 500, -32603, `服务内部错误: ${message}`);
+        sendRpcError(res, 500, RPC_INTERNAL_ERROR, `服务内部错误: ${safeText(message)}`);
       });
     });
 
@@ -284,6 +288,8 @@ export function createMcpService(config: AppConfig): McpService {
     const address = server.address();
     actualPort = typeof address === "object" && address ? address.port : config.port;
     ready = true;
+    sweeper = setInterval(() => sweepIdleSessions(), SESSION_SWEEP_MS);
+    sweeper.unref();
     log(
       config.token
         ? `MCP 端点已就绪: ${url()}（已启用 Bearer 校验）`
@@ -295,6 +301,10 @@ export function createMcpService(config: AppConfig): McpService {
     const current = listener;
     listener = undefined;
     ready = false;
+    if (sweeper) {
+      clearInterval(sweeper);
+      sweeper = undefined;
+    }
 
     if (current) {
       await new Promise<void>((resolve) => {
