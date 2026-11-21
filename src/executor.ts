@@ -54,6 +54,17 @@ export interface WriteSuccess {
   bytes_written: number;
 }
 
+export interface EditSuccess {
+  ok: true;
+  /** 实际替换的处数（replace_all 时为全部匹配数） */
+  replacements: number;
+  /** 首处替换在原文件中的行号范围（1 起，含端点，与 read 行号一致） */
+  start_line: number;
+  end_line: number;
+  /** 编辑后的文件总行数 */
+  total_lines: number;
+}
+
 export interface ExecutorFailure {
   ok: false;
   error: string;
@@ -61,6 +72,7 @@ export interface ExecutorFailure {
 
 export type ReadResponse = ReadSuccess | ExecutorFailure;
 export type WriteResponse = WriteSuccess | ExecutorFailure;
+export type EditResponse = EditSuccess | ExecutorFailure;
 
 /** 执行器二进制路径；NEXUS_MCP_EXECUTOR 可覆盖（测试用来注入假执行器） */
 export function executorBinaryPath(): string {

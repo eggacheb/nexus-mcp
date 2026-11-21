@@ -3,7 +3,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { AppConfig } from "./config.js";
 import { displayPath, resolveInRoot } from "./config.js";
 import { getExecutor, resolveShell } from "./executor.js";
-import type { BashResponse, ReadResponse, WriteResponse } from "./executor.js";
+import type { BashResponse, EditResponse, ReadResponse, WriteResponse } from "./executor.js";
 
 /** read 未传 limit 时的默认行数，与工具 schema 的 limit 上限一致 */
 const MAX_READ_LINES = 2000;
@@ -110,10 +110,24 @@ export function registerTools(server: McpServer, config: AppConfig): void {
     async ({ path: filePath, old_string, new_string, replace_all }) => {
       try {
         const abs = resolveInRoot(config.root, filePath);
-        return stub(
-          "edit",
-          `目标: ${displayPath(config.root, abs)}  替换 ${old_string.length} → ${new_string.length} 字符，replace_all=${replace_all ?? false}`,
-        );
+        const response = await getExecutor().request<EditResponse>({
+          op: "edit",
+          path: abs,
+          root: config.root,
+          old_string,
+          new_string,
+          replace_all: replace_all ?? false,
+        });
+        if (!response.ok) return fail(response.error);
+        const where =
+          response.start_line === response.end_line
+            ? `第 ${response.start_line} 行`
+            : `第 ${response.start_line}-${response.end_line} 行`;
+        const detail =
+          response.replacements === 1
+            ? where
+            : `替换 ${response.replacements} 处，首处${where}`;
+        return ok(`已编辑 ${displayPath(config.root, abs)}（${detail}）`);
       } catch (err) {
         return fail((err as Error).message);
       }

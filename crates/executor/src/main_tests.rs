@@ -509,3 +509,99 @@ fn read_write_ops_missing_fields_give_readable_errors() {
     assert_eq!(response["ok"], json!(false));
     assert!(response["error"].as_str().unwrap().contains("write 请求字段有误"));
 }
+
+// ---------- edit op 测试 ----------
+
+fn edit_request_line(
+    root: &Path,
+    path: &Path,
+    old_string: &str,
+    new_string: &str,
+    replace_all: bool,
+) -> String {
+    json!({
+        "id": 13,
+        "op": "edit",
+        "path": path.to_string_lossy(),
+        "root": root.to_string_lossy(),
+        "old_string": old_string,
+        "new_string": new_string,
+        "replace_all": replace_all
+    })
+    .to_string()
+}
+
+#[test]
+fn edit_op_replaces_unique_match_and_reports_location() {
+    let root = temp_root("edit-unique");
+    let file = root.join("u.txt");
+    fs::write(&file, "alpha\nbeta\ngamma\n").unwrap();
+    let response = handle_request(&edit_request_line(&root, &file, "beta", "BETA", false));
+    assert_eq!(response["ok"], json!(true), "实际: {response}");
+    assert_eq!(response["replacements"], json!(1));
+    assert_eq!(response["start_line"], json!(2));
+    assert_eq!(response["end_line"], json!(2));
+    assert_eq!(fs::read(&file).unwrap(), b"alpha\nBETA\ngamma\n");
+    cleanup(&root);
+}
+
+#[test]
+fn edit_op_reports_count_for_ambiguous_match_and_keeps_file() {
+    let root = temp_root("edit-multi");
+    let file = root.join("m.txt");
+    fs::write(&file, "x\nx\nx\n").unwrap();
+    let response = handle_request(&edit_request_line(&root, &file, "x", "y", false));
+    assert_eq!(response["ok"], json!(false));
+    let error = response["error"].as_str().unwrap();
+    assert!(error.contains("匹配到 3 处"), "实际: {error}");
+    assert_eq!(fs::read(&file).unwrap(), b"x\nx\nx\n");
+
+    // replace_all 放行并报数量
+    let response = handle_request(&edit_request_line(&root, &file, "x", "y", true));
+    assert_eq!(response["ok"], json!(true), "实际: {response}");
+    assert_eq!(response["replacements"], json!(3));
+    assert_eq!(fs::read(&file).unwrap(), b"y\ny\ny\n");
+    cleanup(&root);
+}
+
+#[test]
+fn edit_op_rejects_empty_old_string_and_missing_file() {
+    let root = temp_root("edit-guard");
+    let file = root.join("g.txt");
+    fs::write(&file, "keep\n").unwrap();
+    let response = handle_request(&edit_request_line(&root, &file, "", "x", false));
+    assert_eq!(response["ok"], json!(false));
+    assert!(response["error"].as_str().unwrap().contains("old_string"));
+    assert_eq!(fs::read(&file).unwrap(), b"keep\n");
+
+    let missing = handle_request(&edit_request_line(
+        &root,
+        &root.join("ghost.txt"),
+        "a",
+        "b",
+        false,
+    ));
+    assert_eq!(missing["ok"], json!(false));
+    assert!(missing["error"].as_str().unwrap().contains("不存在"));
+
+    let response = handle_request(r#"{"id":14,"op":"edit"}"#);
+    assert_eq!(response["ok"], json!(false));
+    assert!(response["error"].as_str().unwrap().contains("edit 请求字段有误"));
+    cleanup(&root);
+}
+
+#[test]
+fn edit_op_preserves_crlf_and_mixed_endings() {
+    let root = temp_root("edit-endings");
+    let file = root.join("e.txt");
+    fs::write(&file, "one\r\ntwo\nthree\r\n").unwrap();
+    let response = handle_request(&edit_request_line(&root, &file, "two", "TWO", false));
+    assert_eq!(response["ok"], json!(true), "实际: {response}");
+    assert_eq!(fs::read(&file).unwrap(), "one\r\nTWO\nthree\r\n".as_bytes());
+
+    // 完全匹配不到时给缩进/空白差异提示
+    let response = handle_request(&edit_request_line(&root, &file, "nope", "x", false));
+    assert_eq!(response["ok"], json!(false));
+    assert!(response["error"].as_str().unwrap().contains("缩进"));
+    cleanup(&root);
+}

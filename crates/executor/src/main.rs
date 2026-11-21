@@ -3,6 +3,7 @@
 //! 协议：stdin 收单行 JSON 请求，stdout 回单行 JSON 响应，一行一个请求。
 //! 请求带自增 id（由协议层 TS 侧分配），响应原样带回 id。
 
+mod edit_match;
 mod head_tail_buffer;
 mod string;
 
@@ -19,6 +20,10 @@ use serde_json::{Value, json};
 
 use head_tail_buffer::{HeadTailBuffer, format_output_omission_marker};
 use string::{aligned_tail, truncated_prefix};
+
+use edit_match::{
+    CRLF, Match, find_occurrences, match_view, miss_hint, region_replacement,
+};
 
 const MAX_TIMEOUT_MS: u64 = 600_000;
 const POLL_INTERVAL_MS: u64 = 10;
@@ -70,6 +75,18 @@ struct WriteRequest {
     content: String,
 }
 
+/// edit 请求体。old_string → new_string 精确替换；匹配与行尾保真算法见 edit_match。
+#[derive(Deserialize)]
+struct EditRequest {
+    id: u64,
+    path: String,
+    root: String,
+    old_string: String,
+    new_string: String,
+    #[serde(default)]
+    replace_all: bool,
+}
+
 fn error_response(id: Option<u64>, message: impl Into<String>) -> Value {
     json!({ "id": id, "ok": false, "error": message.into() })
 }
@@ -96,6 +113,10 @@ fn handle_request(line: &str) -> Value {
         Some("write") => match serde_json::from_value::<WriteRequest>(parsed) {
             Ok(request) => run_write(&request),
             Err(err) => error_response(id, format!("write 请求字段有误: {err}")),
+        },
+        Some("edit") => match serde_json::from_value::<EditRequest>(parsed) {
+            Ok(request) => run_edit(&request),
+            Err(err) => error_response(id, format!("edit 请求字段有误: {err}")),
         },
         _ => error_response(id, "未知 op 或缺少 op"),
     }
@@ -318,34 +339,40 @@ fn root_not_writable_error(id: Option<u64>, root: &Path) -> Value {
     )
 }
 
-fn run_read(request: &ReadRequest) -> Value {
-    let id = Some(request.id);
-    if request.path.trim().is_empty() {
-        return error_response(id, "path 不能为空");
+/// read 与 edit 共用的「存在性 + 沙箱两道校验」，返回 canonicalize 后的真实路径。
+fn open_within_sandbox(root_str: &str, path_str: &str, id: Option<u64>) -> Result<PathBuf, Value> {
+    if path_str.trim().is_empty() {
+        return Err(error_response(id, "path 不能为空"));
     }
-    let root = match resolve_root(&request.root, id) {
-        Ok(r) => r,
-        Err(response) => return response,
-    };
-    let target = Path::new(&request.path);
-    if let Err(message) = ensure_lexically_within(&root.lexical, &request.path, target) {
-        return error_response(id, message);
+    let root = resolve_root(root_str, id)?;
+    let target = Path::new(path_str);
+    if let Err(message) = ensure_lexically_within(&root.lexical, path_str, target) {
+        return Err(error_response(id, message));
     }
     let metadata = match fs::metadata(target) {
         Ok(m) => m,
-        Err(_) => return error_response(id, format!("文件不存在: {}", request.path)),
+        Err(_) => return Err(error_response(id, format!("文件不存在: {path_str}"))),
     };
     if metadata.is_dir() {
-        return error_response(id, format!("路径是目录，不是文件: {}", request.path));
+        return Err(error_response(id, format!("路径是目录，不是文件: {path_str}")));
     }
     // 真实路径校验：符号链接按解析结果判定，指向根外一律拒绝
     let canonical = match fs::canonicalize(target) {
         Ok(p) => p,
-        Err(err) => return error_response(id, format!("路径解析失败: {} ({err})", request.path)),
+        Err(err) => return Err(error_response(id, format!("路径解析失败: {path_str} ({err})"))),
     };
     if let Containment::Outside = classify(&root.canonical, &canonical) {
-        return error_response(id, escape_error(&request.path, &canonical, &root.canonical));
+        return Err(error_response(id, escape_error(path_str, &canonical, &root.canonical)));
     }
+    Ok(canonical)
+}
+
+fn run_read(request: &ReadRequest) -> Value {
+    let id = Some(request.id);
+    let canonical = match open_within_sandbox(&request.root, &request.path, id) {
+        Ok(p) => p,
+        Err(response) => return response,
+    };
 
     let bytes = match fs::read(&canonical) {
         Ok(b) => b,
@@ -506,6 +533,117 @@ fn write_bytes(request: &WriteRequest, path: &Path) -> Value {
             format!("写入文件失败: {} ({err})", request.path),
         ),
     }
+}
+
+/// edit op：old_string → new_string 精确替换。只在唯一匹配（或 replace_all）时
+/// 动手；匹配、行尾保真与失败提示见 edit_match 模块。只支持已存在的 UTF-8 文件。
+fn run_edit(request: &EditRequest) -> Value {
+    let id = Some(request.id);
+    if request.old_string.is_empty() {
+        return error_response(id, "old_string 不能为空；创建或覆盖整个文件请用 write");
+    }
+    if request.old_string == request.new_string {
+        return error_response(id, "old_string 与 new_string 相同，没有可应用的改动");
+    }
+    let canonical = match open_within_sandbox(&request.root, &request.path, id) {
+        Ok(p) => p,
+        Err(response) => return response,
+    };
+    let bytes = match fs::read(&canonical) {
+        Ok(b) => b,
+        Err(err) => return error_response(id, format!("读取文件失败: {} ({err})", request.path)),
+    };
+    let source = match String::from_utf8(bytes) {
+        Ok(t) => t,
+        Err(_) => {
+            return error_response(
+                id,
+                format!("文件不是有效的 UTF-8 文本，edit 只支持 UTF-8 编码: {}", request.path),
+            )
+        }
+    };
+
+    // 只差 \r 的请求是在改行尾本身，按原样字节处理；其余都走 LF 视图匹配
+    let endings_only =
+        request.old_string.replace('\r', "") == request.new_string.replace('\r', "");
+    let matches: Vec<Match> = if endings_only {
+        find_occurrences(&source, &request.old_string)
+    } else {
+        match_view(&source, &request.old_string)
+    };
+    let replacements = matches.len();
+    if replacements == 0 {
+        let mut message = format!(
+            "在 {} 中找不到 old_string，可能是缩进或空白差异（old_string 必须与文件内容完全一致，包括缩进）。",
+            request.path
+        );
+        if let Some(hint) = miss_hint(&source, &request.old_string, &request.new_string) {
+            message.push_str(&format!("\n\n{hint}"));
+        }
+        return error_response(id, message);
+    }
+    if replacements > 1 && !request.replace_all {
+        return error_response(
+            id,
+            format!(
+                "old_string 匹配到 {replacements} 处，要求唯一。请补充上下文让它只匹配一处，或把 replace_all 设为 true 替换全部。"
+            ),
+        );
+    }
+    let replacement_lf = request.new_string.replace(CRLF, "\n");
+    let mut replaced = source.clone();
+    let selected = if request.replace_all {
+        &matches[..]
+    } else {
+        &matches[..1]
+    };
+    // 倒序替换，前面的偏移不受影响
+    for matched in selected.iter().rev() {
+        let text = if endings_only {
+            request.new_string.clone()
+        } else {
+            region_replacement(&source, matched, &replacement_lf)
+        };
+        replaced.replace_range(matched.start..matched.end, &text);
+    }
+    if replaced == source {
+        return error_response(
+            id,
+            if endings_only {
+                format!("没有可应用的改动: {} 已经是这些行尾了。", request.path)
+            } else {
+                format!(
+                    "没有可应用的改动: 这次编辑不会改变 {} 的内容。行尾跟随原文件；要改行尾本身，请在 old_string 或 new_string 里显式写 \\r。",
+                    request.path
+                )
+            },
+        );
+    }
+    if let Err(err) = fs::write(&canonical, replaced.as_bytes()) {
+        return error_response(id, format!("写入文件失败: {} ({err})", request.path));
+    }
+    // 改动位置：首处匹配在原文件里的行号（与 read 的行号一致）
+    let first = &matches[0];
+    let mut end_line = line_number_at(&source, first.end);
+    if source.as_bytes()[first.end - 1] == b'\n' {
+        end_line -= 1;
+    }
+    json!({
+        "id": request.id, "ok": true,
+        "replacements": replacements,
+        "start_line": line_number_at(&source, first.start),
+        "end_line": end_line,
+        "total_lines": replaced.lines().count()
+    })
+}
+
+/// 字节偏移所在的行号（1 起）。offset 必须落在字符边界上（匹配区间保证如此）。
+fn line_number_at(text: &str, offset: usize) -> u64 {
+    text.as_bytes()[..offset]
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count() as u64
+        + 1
 }
 
 /// stdout 与 stderr 各起一个线程，按到达顺序合并写进同一个有界缓冲。
