@@ -34,6 +34,34 @@ export interface BashFailure {
 
 export type BashResponse = BashSuccess | BashTimeout | BashFailure;
 
+export interface ReadSuccess {
+  ok: true;
+  /** 带行号的文件内容片段（行号右对齐 6 位 + tab），无尾部换行 */
+  content: string;
+  /** 文件总行数 */
+  total_lines: number;
+  /** 本次返回的第一行行号（1 起）；无内容时为 0 */
+  start_line: number;
+  /** 本次返回的最后一行行号；无内容时为 0 */
+  end_line: number;
+  /** 因字节上限未显示的行数 */
+  omitted_lines: number;
+}
+
+export interface WriteSuccess {
+  ok: true;
+  /** 实际落盘字节数（UTF-8） */
+  bytes_written: number;
+}
+
+export interface ExecutorFailure {
+  ok: false;
+  error: string;
+}
+
+export type ReadResponse = ReadSuccess | ExecutorFailure;
+export type WriteResponse = WriteSuccess | ExecutorFailure;
+
 /** 执行器二进制路径；NEXUS_MCP_EXECUTOR 可覆盖（测试用来注入假执行器） */
 export function executorBinaryPath(): string {
   const override = process.env.NEXUS_MCP_EXECUTOR;

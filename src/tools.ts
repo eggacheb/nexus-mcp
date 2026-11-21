@@ -3,7 +3,10 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { AppConfig } from "./config.js";
 import { displayPath, resolveInRoot } from "./config.js";
 import { getExecutor, resolveShell } from "./executor.js";
-import type { BashResponse } from "./executor.js";
+import type { BashResponse, ReadResponse, WriteResponse } from "./executor.js";
+
+/** read 未传 limit 时的默认行数，与工具 schema 的 limit 上限一致 */
+const MAX_READ_LINES = 2000;
 
 type TextResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
 
@@ -35,10 +38,29 @@ export function registerTools(server: McpServer, config: AppConfig): void {
     async ({ path: filePath, offset, limit }) => {
       try {
         const abs = resolveInRoot(config.root, filePath);
-        return stub(
-          "read",
-          `目标: ${displayPath(config.root, abs)}  offset=${offset ?? 1} limit=${limit ?? "全部"}`,
-        );
+        const response = await getExecutor().request<ReadResponse>({
+          op: "read",
+          path: abs,
+          root: config.root,
+          offset: offset ?? 1,
+          limit: limit ?? MAX_READ_LINES,
+          max_output_bytes: config.maxOutputBytes,
+        });
+        if (!response.ok) return fail(response.error);
+        if (response.total_lines === 0) return ok("（空文件，共 0 行）");
+        if (response.end_line === 0) {
+          return ok(
+            `文件共 ${response.total_lines} 行，offset=${offset ?? 1} 超出文件末尾，没有内容可读`,
+          );
+        }
+        let text = response.content;
+        if (response.end_line < response.total_lines) {
+          text += `\n[已显示 ${response.start_line}-${response.end_line} 行，文件共 ${response.total_lines} 行；用 offset=${response.end_line + 1} 继续读取]`;
+        }
+        if (response.omitted_lines > 0) {
+          text += `\n[输出超过字节上限，还有 ${response.omitted_lines} 行未显示；用 limit 缩小范围分次读取]`;
+        }
+        return ok(text);
       } catch (err) {
         return fail((err as Error).message);
       }
@@ -58,10 +80,14 @@ export function registerTools(server: McpServer, config: AppConfig): void {
     async ({ path: filePath, content }) => {
       try {
         const abs = resolveInRoot(config.root, filePath);
-        return stub(
-          "write",
-          `目标: ${displayPath(config.root, abs)}  写入 ${Buffer.byteLength(content, "utf8")} 字节`,
-        );
+        const response = await getExecutor().request<WriteResponse>({
+          op: "write",
+          path: abs,
+          root: config.root,
+          content,
+        });
+        if (!response.ok) return fail(response.error);
+        return ok(`已写入 ${displayPath(config.root, abs)}（${response.bytes_written} 字节）`);
       } catch (err) {
         return fail((err as Error).message);
       }

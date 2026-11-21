@@ -2,6 +2,9 @@
 
 use super::*;
 use serde_json::json;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 fn git_bash() -> Option<String> {
@@ -131,4 +134,378 @@ fn render_output_fixes_utf8_boundaries_at_cut_points() {
     buffer.push_chunk("中文输出".as_bytes());
     let rendered = render_output(&mut buffer);
     assert_eq!(rendered, "中\n... 4 bytes omitted ...\n出");
+}
+
+// ---------- read / write op 测试 ----------
+
+static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+fn temp_root(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "nexus-exec-{tag}-{}-{}",
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&dir).expect("创建临时根目录失败");
+    dir
+}
+
+fn read_request_line(
+    root: &Path,
+    path: &Path,
+    offset: Option<u64>,
+    limit: Option<u64>,
+    max_output_bytes: u64,
+) -> String {
+    json!({
+        "id": 9,
+        "op": "read",
+        "path": path.to_string_lossy(),
+        "root": root.to_string_lossy(),
+        "offset": offset,
+        "limit": limit,
+        "max_output_bytes": max_output_bytes
+    })
+    .to_string()
+}
+
+fn write_request_line(root: &Path, path: &Path, content: &str) -> String {
+    json!({
+        "id": 10,
+        "op": "write",
+        "path": path.to_string_lossy(),
+        "root": root.to_string_lossy(),
+        "content": content
+    })
+    .to_string()
+}
+
+/// 造「根内入口 → 根外目标」的逃逸链接，返回 (read 用路径, write 用路径)。
+/// Windows 无符号链接特权时退回免特权的目录 junction；unix 用文件符号链接。
+/// 都造不出来返回 None（调用方跳过断言）。
+fn make_escape_paths(root: &Path, outside_dir: &Path) -> Option<(PathBuf, PathBuf)> {
+    #[cfg(windows)]
+    {
+        let link = root.join("leakdir");
+        let status = Command::new("cmd")
+            .args(["/c", "mklink", "/j"])
+            .arg(&link)
+            .arg(outside_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .ok()?;
+        if status.success() && link.is_dir() {
+            Some((link.join("target.txt"), link.join("new.txt")))
+        } else {
+            None
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let link = root.join("leak.md");
+        std::os::unix::fs::symlink(outside_dir.join("target.txt"), &link).ok()?;
+        Some((link.clone(), link))
+    }
+}
+
+fn cleanup(dir: &Path) {
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn read_op_returns_numbered_lines_matching_real_positions() {
+    let root = temp_root("read-numbered");
+    fs::write(root.join("n.txt"), "l1\nl2\nl3\n").unwrap();
+    let response = handle_request(&read_request_line(
+        &root,
+        &root.join("n.txt"),
+        None,
+        None,
+        64 * 1024,
+    ));
+    assert_eq!(response["ok"], json!(true));
+    assert_eq!(response["total_lines"], json!(3));
+    assert_eq!(response["start_line"], json!(1));
+    assert_eq!(response["end_line"], json!(3));
+    let content = response["content"].as_str().unwrap();
+    assert!(content.contains("     1\tl1"), "实际: {content}");
+    assert!(content.contains("     2\tl2"));
+    assert!(content.contains("     3\tl3"));
+    cleanup(&root);
+}
+
+#[test]
+fn read_op_offset_limit_slice_keeps_real_line_numbers() {
+    let root = temp_root("read-slice");
+    let lines: Vec<String> = (1..=10).map(|i| format!("第{i}行")).collect();
+    let file = root.join("s.txt");
+    fs::write(&file, format!("{}\n", lines.join("\n"))).unwrap();
+    let response = handle_request(&read_request_line(&root, &file, Some(4), Some(3), 64 * 1024));
+    assert_eq!(response["ok"], json!(true));
+    assert_eq!(response["start_line"], json!(4));
+    assert_eq!(response["end_line"], json!(6));
+    let content = response["content"].as_str().unwrap();
+    assert!(content.contains("     4\t第4行"));
+    assert!(content.contains("     6\t第6行"));
+    assert!(!content.contains("第3行"));
+    assert!(!content.contains("第7行"));
+    cleanup(&root);
+}
+
+#[test]
+fn read_op_offset_beyond_eof_returns_existing_part() {
+    let root = temp_root("read-eof");
+    let file = root.join("t.txt");
+    fs::write(&file, "一\n二\n三\n").unwrap();
+    let partial = handle_request(&read_request_line(&root, &file, Some(2), Some(50), 64 * 1024));
+    assert_eq!(partial["ok"], json!(true));
+    assert_eq!(partial["start_line"], json!(2));
+    assert_eq!(partial["end_line"], json!(3));
+    assert!(partial["content"].as_str().unwrap().contains("     3\t三"));
+
+    let beyond = handle_request(&read_request_line(&root, &file, Some(99), None, 64 * 1024));
+    assert_eq!(beyond["ok"], json!(true));
+    assert_eq!(beyond["start_line"], json!(0));
+    assert_eq!(beyond["end_line"], json!(0));
+    assert_eq!(beyond["content"], json!(""));
+
+    let empty_path = root.join("empty.txt");
+    fs::write(&empty_path, "").unwrap();
+    let empty = handle_request(&read_request_line(&root, &empty_path, None, None, 64 * 1024));
+    assert_eq!(empty["ok"], json!(true));
+    assert_eq!(empty["total_lines"], json!(0));
+    cleanup(&root);
+}
+
+#[test]
+fn read_op_line_cap_stops_at_limit_and_byte_cap_marks_omitted() {
+    let root = temp_root("read-cap");
+    let file = root.join("big.txt");
+    let lines: Vec<String> = (1..=2100).map(|i| format!("line-{i}")).collect();
+    fs::write(&file, format!("{}\n", lines.join("\n"))).unwrap();
+    let response = handle_request(&read_request_line(&root, &file, None, None, 64 * 1024));
+    assert_eq!(response["ok"], json!(true));
+    assert_eq!(response["total_lines"], json!(2100));
+    assert_eq!(response["end_line"], json!(2000));
+    let content = response["content"].as_str().unwrap();
+    assert!(content.contains("2000\tline-2000"));
+    assert!(!content.contains("line-2001"));
+
+    let byte_capped =
+        handle_request(&read_request_line(&root, &file, None, Some(50), 200));
+    assert_eq!(byte_capped["ok"], json!(true));
+    assert!(byte_capped["omitted_lines"].as_u64().unwrap() > 0);
+    let capped_content = byte_capped["content"].as_str().unwrap();
+    assert!(!capped_content.contains('\u{FFFD}'));
+    // 行号前缀与换行也计入预算，总输出不超过上限
+    assert!(capped_content.len() <= 200, "实际 {} 字节", capped_content.len());
+    cleanup(&root);
+}
+
+#[test]
+fn read_op_rejects_non_utf8_with_readable_error() {
+    let root = temp_root("read-utf8");
+    let file = root.join("bin.dat");
+    fs::write(&file, [0xFFu8, 0xFE, 0x41, 0x00]).unwrap();
+    let response = handle_request(&read_request_line(&root, &file, None, None, 64 * 1024));
+    assert_eq!(response["ok"], json!(false));
+    let error = response["error"].as_str().unwrap();
+    assert!(error.contains("UTF-8"), "实际: {error}");
+    assert!(!error.contains('\u{FFFD}'));
+    cleanup(&root);
+}
+
+#[test]
+fn read_op_missing_file_and_directory_are_clean_errors() {
+    let root = temp_root("read-missing");
+    let missing = handle_request(&read_request_line(
+        &root,
+        &root.join("ghost.txt"),
+        None,
+        None,
+        64 * 1024,
+    ));
+    assert_eq!(missing["ok"], json!(false));
+    assert!(missing["error"].as_str().unwrap().contains("不存在"));
+
+    let dir = handle_request(&read_request_line(&root, &root, None, None, 64 * 1024));
+    assert_eq!(dir["ok"], json!(false));
+    assert!(dir["error"].as_str().unwrap().contains("目录"));
+    cleanup(&root);
+}
+
+#[test]
+fn read_op_rejects_dotdot_escape_and_names_the_path() {
+    let root = temp_root("read-dotdot");
+    let outside = root.join("..").join("read-escape-payload.txt");
+    let response = handle_request(&read_request_line(&root, &outside, None, None, 64 * 1024));
+    assert_eq!(response["ok"], json!(false));
+    let error = response["error"].as_str().unwrap();
+    assert!(error.contains("越界"), "实际: {error}");
+    assert!(error.contains("read-escape-payload.txt"), "实际: {error}");
+    cleanup(&root);
+}
+
+#[test]
+fn read_op_rejects_symlink_escape_and_names_the_path() {
+    let root = temp_root("read-link");
+    let outside = temp_root("read-link-out");
+    fs::write(outside.join("target.txt"), "secret").unwrap();
+    let Some((read_path, _)) = make_escape_paths(&root, &outside) else {
+        eprintln!("跳过：造不出逃逸链接（无特权且 junction 失败）");
+        cleanup(&root);
+        cleanup(&outside);
+        return;
+    };
+    let response = handle_request(&read_request_line(&root, &read_path, None, None, 64 * 1024));
+    assert_eq!(response["ok"], json!(false));
+    let error = response["error"].as_str().unwrap();
+    assert!(error.contains("越界"), "实际: {error}");
+    assert!(error.contains("leak"), "实际: {error}");
+    cleanup(&root);
+    cleanup(&outside);
+}
+
+#[test]
+fn read_op_accepts_dotdot_within_root_and_forward_slash_paths() {
+    let root = temp_root("read-slash");
+    fs::create_dir_all(root.join("sub")).unwrap();
+    fs::write(root.join("sub").join("f.txt"), "inside").unwrap();
+    // 反斜杠 + .. 留在根内
+    let inner = root.join("sub").join("..").join("sub").join("f.txt");
+    let response = handle_request(&read_request_line(&root, &inner, None, None, 64 * 1024));
+    assert_eq!(response["ok"], json!(true));
+    assert!(response["content"].as_str().unwrap().contains("inside"));
+    // 正斜杠绝对路径（Windows 盘符 + /）
+    let forward = format!("{}/sub/f.txt", root.to_string_lossy().replace('\\', "/"));
+    let response = handle_request(&read_request_line(&root, Path::new(&forward), None, None, 64 * 1024));
+    assert_eq!(response["ok"], json!(true), "实际: {response}");
+    assert!(response["content"].as_str().unwrap().contains("inside"));
+    cleanup(&root);
+}
+
+#[test]
+fn write_op_creates_overwrites_and_preserves_line_endings_exactly() {
+    let root = temp_root("write-basic");
+    let file = root.join("crlf.txt");
+    let first = handle_request(&write_request_line(&root, &file, "第一行\r\nsecond\r\n"));
+    assert_eq!(first["ok"], json!(true));
+    assert_eq!(first["bytes_written"], json!("第一行\r\nsecond\r\n".len()));
+    assert_eq!(fs::read(&file).unwrap(), "第一行\r\nsecond\r\n".as_bytes());
+
+    let overwrite = handle_request(&write_request_line(&root, &file, "only"));
+    assert_eq!(overwrite["ok"], json!(true));
+    assert_eq!(fs::read(&file).unwrap(), b"only");
+    cleanup(&root);
+}
+
+#[test]
+fn write_op_missing_parent_is_readable_error_without_creating_dirs() {
+    let root = temp_root("write-parent");
+    let target = root.join("no-such-dir").join("deep").join("child.txt");
+    let response = handle_request(&write_request_line(&root, &target, "x"));
+    assert_eq!(response["ok"], json!(false));
+    assert!(response["error"].as_str().unwrap().contains("目录"));
+    assert!(!root.join("no-such-dir").exists());
+    cleanup(&root);
+}
+
+#[test]
+fn write_op_rejects_root_itself() {
+    let root = temp_root("write-root");
+    let response = handle_request(&write_request_line(&root, &root, "x"));
+    assert_eq!(response["ok"], json!(false));
+    assert!(response["error"].as_str().unwrap().contains("根目录"));
+    // 带尾部分隔符的同义写法同样拒绝
+    let with_slash = PathBuf::from(format!("{}\\", root.to_string_lossy()));
+    let response = handle_request(&write_request_line(&root, &with_slash, "x"));
+    assert_eq!(response["ok"], json!(false));
+    assert!(response["error"].as_str().unwrap().contains("根目录"));
+    cleanup(&root);
+}
+
+#[test]
+fn write_op_rejects_existing_directory_target() {
+    let root = temp_root("write-dir");
+    fs::create_dir_all(root.join("docs")).unwrap();
+    let response = handle_request(&write_request_line(&root, &root.join("docs"), "x"));
+    assert_eq!(response["ok"], json!(false));
+    assert!(response["error"].as_str().unwrap().contains("目录"));
+    cleanup(&root);
+}
+
+#[test]
+fn write_op_rejects_dotdot_escape_and_names_the_path() {
+    let root = temp_root("write-dotdot");
+    let outside = root.join("..").join("write-escape-payload.txt");
+    let response = handle_request(&write_request_line(&root, &outside, "x"));
+    assert_eq!(response["ok"], json!(false));
+    let error = response["error"].as_str().unwrap();
+    assert!(error.contains("越界"), "实际: {error}");
+    assert!(error.contains("write-escape-payload.txt"), "实际: {error}");
+    assert!(!root.join("..").join("write-escape-payload.txt").exists());
+    cleanup(&root);
+}
+
+#[test]
+fn write_op_rejects_symlink_escape_and_names_the_path() {
+    let root = temp_root("write-link");
+    let outside = temp_root("write-link-out");
+    fs::write(outside.join("target.txt"), "secret").unwrap();
+    let Some((_, write_path)) = make_escape_paths(&root, &outside) else {
+        eprintln!("跳过：造不出逃逸链接（无特权且 junction 失败）");
+        cleanup(&root);
+        cleanup(&outside);
+        return;
+    };
+    let response = handle_request(&write_request_line(&root, &write_path, "x"));
+    assert_eq!(response["ok"], json!(false));
+    let error = response["error"].as_str().unwrap();
+    assert!(error.contains("越界"), "实际: {error}");
+    assert!(error.contains("leak"), "实际: {error}");
+    cleanup(&root);
+    cleanup(&outside);
+}
+
+#[test]
+fn write_op_rejects_dangling_symlink_instead_of_writing_through() {
+    let root = temp_root("write-dangling");
+    // Windows 文件符号链接需要特权；没有就跳过（junction 只能指目录，造不出悬空文件链接）
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::symlink_file;
+        let link = root.join("dangling.md");
+        if symlink_file(root.join("gone.txt"), &link).is_err() {
+            eprintln!("跳过：无符号链接特权");
+            cleanup(&root);
+            return;
+        }
+        let response = handle_request(&write_request_line(&root, &link, "x"));
+        assert_eq!(response["ok"], json!(false));
+        assert!(response["error"].as_str().unwrap().contains("符号链接"));
+        assert!(!root.join("gone.txt").exists());
+    }
+    #[cfg(not(windows))]
+    {
+        let link = root.join("dangling.md");
+        std::os::unix::fs::symlink(root.join("gone.txt"), &link).unwrap();
+        let response = handle_request(&write_request_line(&root, &link, "x"));
+        assert_eq!(response["ok"], json!(false));
+        assert!(response["error"].as_str().unwrap().contains("符号链接"));
+        assert!(!root.join("gone.txt").exists());
+    }
+    cleanup(&root);
+}
+
+#[test]
+fn read_write_ops_missing_fields_give_readable_errors() {
+    let response = handle_request(r#"{"id":11,"op":"read"}"#);
+    assert_eq!(response["ok"], json!(false));
+    assert!(response["error"].as_str().unwrap().contains("read 请求字段有误"));
+
+    let response = handle_request(r#"{"id":12,"op":"write"}"#);
+    assert_eq!(response["ok"], json!(false));
+    assert!(response["error"].as_str().unwrap().contains("write 请求字段有误"));
 }

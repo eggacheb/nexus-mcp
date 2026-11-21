@@ -105,7 +105,7 @@ describe("HTTP 传输（配置了令牌）", () => {
         arguments: { path: "package.json" },
       });
       expect(result.isError).toBeFalsy();
-      expect(textOf(result)).toContain("package.json");
+      expect(textOf(result)).toContain('"name": "nexus-mcp"');
 
       await transport.terminateSession();
       await client.close();
@@ -171,9 +171,9 @@ describe("HTTP 传输（配置了令牌）", () => {
         arguments: { path: "tsconfig.json" },
       });
 
-      expect(textOf(firstRead)).toContain("package.json");
-      expect(textOf(firstRead)).not.toContain("tsconfig.json");
-      expect(textOf(secondRead)).toContain("tsconfig.json");
+      expect(textOf(firstRead)).toContain('"name": "nexus-mcp"');
+      expect(textOf(firstRead)).not.toContain('"rootDir": "src"');
+      expect(textOf(secondRead)).toContain('"rootDir": "src"');
 
       // 一个客户端退出不应该影响另一个
       await first.transport.terminateSession();
@@ -184,7 +184,7 @@ describe("HTTP 传输（配置了令牌）", () => {
         arguments: { path: "AGENTS.md" },
       });
       expect(afterClose.isError).toBeFalsy();
-      expect(textOf(afterClose)).toContain("AGENTS.md");
+      expect(textOf(afterClose)).toContain("8 个工具");
 
       await second.transport.terminateSession();
       await second.client.close();

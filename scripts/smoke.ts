@@ -18,9 +18,14 @@ for (const tool of listed.tools) {
 
 const probe = await client.callTool({
   name: "read",
-  arguments: { path: "README.md", limit: 5 },
+  arguments: { path: "package.json", limit: 5 },
 });
 console.log("\nread 调用结果:");
 console.log(JSON.stringify(probe, null, 2));
+if (probe.isError) {
+  console.error("read 自检失败：工具返回 isError");
+  await client.close();
+  process.exit(1);
+}
 
 await client.close();
