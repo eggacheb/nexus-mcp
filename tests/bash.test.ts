@@ -81,13 +81,17 @@ function serverStderr(configPath: string, env: Record<string, string> = {}): Pro
 
 describe("bash 工具", () => {
   let session: StdioSession;
+  // 自带隔离配置：不读仓库根的 config.json（那里是部署配置，root 不是 projectRoot）
+  let mainConfig: TempConfig;
 
   beforeAll(async () => {
-    session = await connectStdio();
+    mainConfig = writeTempConfig();
+    session = await connectStdio({ NEXUS_MCP_CONFIG: mainConfig.path });
   }, 30_000);
 
   afterAll(async () => {
     await session?.close();
+    rmSync(mainConfig.dir, { recursive: true, force: true });
   });
 
   it(

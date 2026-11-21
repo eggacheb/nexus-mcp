@@ -1,18 +1,30 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 let client: Client;
+let configDir: string;
 
 beforeAll(async () => {
+  // 自带隔离配置：不读仓库根的 config.json（那里是部署配置，root 不是 projectRoot）
+  configDir = mkdtempSync(path.join(os.tmpdir(), "nexus-mcp-stdio-"));
+  const configPath = path.join(configDir, "config.json");
+  writeFileSync(
+    configPath,
+    JSON.stringify({ root: projectRoot, transport: "stdio" }, null, 2),
+    "utf8",
+  );
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [path.join(projectRoot, "dist", "index.js"), "--stdio"],
     cwd: projectRoot,
+    env: { ...process.env, NEXUS_MCP_CONFIG: configPath } as Record<string, string>,
     stderr: "ignore",
   });
   client = new Client({ name: "vitest", version: "0.1.0" });
@@ -21,6 +33,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await client.close();
+  rmSync(configDir, { recursive: true, force: true });
 });
 
 describe("工具清单", () => {

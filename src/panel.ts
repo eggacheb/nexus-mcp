@@ -7,8 +7,9 @@ import { loadConfig, saveConfig } from "./config.js";
 import { readBody, sendJson as sendJsonRaw } from "./httpHelpers.js";
 import { log, recentLogs, redactText } from "./log.js";
 import type { McpService } from "./mcpService.js";
-import type { ComponentStatus } from "./status.js";
-import { executorStatus, probeTunnel } from "./status.js";
+import type { ComponentStatus, TunnelStatus } from "./status.js";
+import { executorStatus, tunnelStatus } from "./status.js";
+import type { TunnelManager } from "./tunnel.js";
 
 const LISTEN_HOST = "127.0.0.1";
 const MAX_BODY_BYTES = 64 * 1024;
@@ -22,7 +23,7 @@ export interface PanelStatus {
     sessions: number;
   };
   executor: ComponentStatus;
-  tunnel: ComponentStatus;
+  tunnel: TunnelStatus;
   root: string;
   oauth: { url: string; available: boolean };
   panelPort: number;
@@ -126,6 +127,20 @@ const PAGE = `<!doctype html>
     <p class="hint" id="oauth-hint">—</p>
   </section>
 
+  <section class="card" data-block="tunnel">
+    <h2>隧道 <small>cloudflared · nexus.maliy.top</small></h2>
+    <div class="row">
+      <input id="tunnel-url" readonly value="未配置" />
+      <button id="tunnel-probe" class="ghost">检测可达性</button>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button id="tunnel-start">启动隧道</button>
+      <button id="tunnel-stop" class="ghost">停止隧道</button>
+    </div>
+    <p class="hint" id="tunnel-hint">—</p>
+    <pre id="tunnel-tail" style="height:72px" hidden></pre>
+  </section>
+
   <section class="card" data-block="root">
     <h2>根目录</h2>
     <div class="row">
@@ -181,6 +196,20 @@ const PAGE = `<!doctype html>
     document.getElementById("oauth-hint").textContent = s.oauth.available
       ? "已启用 · 客户端发起跳转后，批准需输入 config.json 的 token"
       : "未启用（config.json 的 token 为空），云端先用 Bearer 令牌";
+    var tunnelUrlInput = document.getElementById("tunnel-url");
+    if (document.activeElement !== tunnelUrlInput) tunnelUrlInput.value = s.tunnel.url || "未配置";
+    var tunnelParts = [s.tunnel.label];
+    if (s.tunnel.detail) tunnelParts.push(s.tunnel.detail);
+    var tunnelProc = s.tunnel.process || {};
+    if (tunnelProc.pid) tunnelParts.push("pid " + tunnelProc.pid);
+    if (tunnelProc.exitCode !== undefined && tunnelProc.exitCode !== null) {
+      tunnelParts.push("退出码 " + tunnelProc.exitCode);
+    }
+    document.getElementById("tunnel-hint").textContent = tunnelParts.join(" · ");
+    var tailBox = document.getElementById("tunnel-tail");
+    var tailLines = s.tunnel.process && s.tunnel.process.tail ? s.tunnel.process.tail : [];
+    tailBox.hidden = tailLines.length === 0;
+    tailBox.textContent = tailLines.join("\\n");
     if (document.activeElement !== rootInput) rootInput.value = s.root;
     document.getElementById("control-hint").textContent = "面板端口 " + s.panelPort;
   }
@@ -250,6 +279,16 @@ const PAGE = `<!doctype html>
     post("/api/service", { action: "reload" });
   });
 
+  document.getElementById("tunnel-start").addEventListener("click", function () {
+    post("/api/tunnel", { action: "start" });
+  });
+  document.getElementById("tunnel-stop").addEventListener("click", function () {
+    post("/api/tunnel", { action: "stop" });
+  });
+  document.getElementById("tunnel-probe").addEventListener("click", function () {
+    post("/api/tunnel", { action: "probe" });
+  });
+
   refresh();
   refreshLogs();
   setInterval(function () { refresh(); refreshLogs(); }, 5000);
@@ -275,6 +314,24 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> 
     throw new Error("请求体必须是 JSON 对象");
   }
   return parsed as Record<string, unknown>;
+}
+
+/**
+ * 写操作的公共壳：跨站防护 + JSON 解析，被拒或坏请求时已写完响应并返回 undefined。
+ * 返回 true 表示请求体可用。
+ */
+async function readWriteBody(
+  req: IncomingMessage,
+  res: ServerResponse,
+  panelPort: number,
+): Promise<Record<string, unknown> | undefined> {
+  if (blockUnsafeWrite(req, res, panelPort)) return undefined;
+  try {
+    return await readJson(req);
+  } catch (error) {
+    sendJson(res, 400, { error: (error as Error).message });
+    return undefined;
+  }
 }
 
 /**
@@ -306,7 +363,11 @@ function blockUnsafeWrite(req: IncomingMessage, res: ServerResponse, panelPort: 
   return false;
 }
 
-export async function startPanel(config: AppConfig, service: McpService): Promise<PanelHandle> {
+export async function startPanel(
+  config: AppConfig,
+  service: McpService,
+  tunnel?: TunnelManager,
+): Promise<PanelHandle> {
   let panelPort = config.panelPort;
 
   async function statusPayload(): Promise<PanelStatus> {
@@ -320,7 +381,7 @@ export async function startPanel(config: AppConfig, service: McpService): Promis
         sessions: service.sessionCount(),
       },
       executor: await executorStatus(),
-      tunnel: await probeTunnel(config),
+      tunnel: await tunnelStatus(config, tunnel),
       root: config.root,
       oauth: service.oauthInfo(),
       panelPort,
@@ -367,14 +428,8 @@ export async function startPanel(config: AppConfig, service: McpService): Promis
     }
 
     if (req.method === "POST" && url.pathname === "/api/root") {
-      if (blockUnsafeWrite(req, res, panelPort)) return;
-      let body: Record<string, unknown>;
-      try {
-        body = await readJson(req);
-      } catch (error) {
-        sendJson(res, 400, { error: (error as Error).message });
-        return;
-      }
+      const body = await readWriteBody(req, res, panelPort);
+      if (!body) return;
       const input = typeof body.root === "string" ? body.root.trim() : "";
       if (!input) {
         sendJson(res, 400, { error: "root 不能为空" });
@@ -398,14 +453,8 @@ export async function startPanel(config: AppConfig, service: McpService): Promis
     }
 
     if (req.method === "POST" && url.pathname === "/api/service") {
-      if (blockUnsafeWrite(req, res, panelPort)) return;
-      let body: Record<string, unknown>;
-      try {
-        body = await readJson(req);
-      } catch (error) {
-        sendJson(res, 400, { error: (error as Error).message });
-        return;
-      }
+      const body = await readWriteBody(req, res, panelPort);
+      if (!body) return;
       const action = typeof body.action === "string" ? body.action : "";
 
       try {
@@ -426,6 +475,37 @@ export async function startPanel(config: AppConfig, service: McpService): Promis
             await service.stop();
             await service.start();
           }
+        } else {
+          sendJson(res, 400, { error: `未知操作: ${action}` });
+          return;
+        }
+      } catch (error) {
+        sendJson(res, 500, { error: `操作失败: ${(error as Error).message}` });
+        return;
+      }
+
+      sendJson(res, 200, await statusPayload());
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/tunnel") {
+      if (!tunnel) {
+        sendJson(res, 400, { error: "未启用隧道管理（config.json 里没有 tunnel 段）" });
+        return;
+      }
+      const body = await readWriteBody(req, res, panelPort);
+      if (!body) return;
+      const action = typeof body.action === "string" ? body.action : "";
+
+      try {
+        if (action === "start") {
+          const result = await tunnel.start();
+          log(`面板操作: 启动隧道 ${result.started ? `pid=${result.pid}` : (result.reason ?? "未拉起")}`);
+        } else if (action === "stop") {
+          await tunnel.stop();
+          log("面板操作: 停止隧道");
+        } else if (action === "probe") {
+          // 探测在下面的 statusPayload 里做，这里只是触发一次带探测的状态刷新
         } else {
           sendJson(res, 400, { error: `未知操作: ${action}` });
           return;

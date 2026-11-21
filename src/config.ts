@@ -13,6 +13,15 @@ export interface CommandPolicyConfig {
   onUnmatched: "deny" | "allow";
 }
 
+export interface TunnelConfig {
+  /** cloudflared 可执行文件路径，默认 Program Files (x86) 下的安装位置 */
+  cloudflaredPath?: string;
+  /** 隧道配置（ingress）路径，默认 %USERPROFILE%\.cloudflared\config.yml */
+  configPath?: string;
+  /** 进程异常退出后自动重启（守护），默认开启 */
+  autoRestart?: boolean;
+}
+
 export interface AppConfig {
   /** 唯一允许访问的根目录，绝对路径 */
   root: string;
@@ -32,6 +41,8 @@ export interface AppConfig {
   commandPolicy: CommandPolicyConfig;
   /** 隧道公网地址，配了面板才会去探测连通性 */
   tunnelUrl?: string;
+  /** 本机 cloudflared 隧道管理；配置了这个段面板才提供启停按钮 */
+  tunnel?: TunnelConfig;
 }
 
 const DEFAULTS: Omit<AppConfig, "root" | "panelPort" | "commandPolicy"> = {
@@ -68,6 +79,33 @@ function normalizeCommandPolicy(raw: unknown): CommandPolicyConfig {
     );
   }
   return { allow: stringList(allow, "allow"), deny: stringList(deny, "deny"), onUnmatched: unmatched };
+}
+
+/** 隧道管理配置校验：形状不对启动即报错 */
+function normalizeTunnel(raw: unknown): TunnelConfig | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("config.json 的 tunnel 应是对象（{ cloudflaredPath?, configPath?, autoRestart? }）");
+  }
+  const { cloudflaredPath, configPath, autoRestart } = raw as Record<string, unknown>;
+  for (const [key, value] of [
+    ["cloudflaredPath", cloudflaredPath],
+    ["configPath", configPath],
+  ] as const) {
+    if (value !== undefined && (typeof value !== "string" || !value.trim())) {
+      throw new Error(`config.json 的 tunnel.${key} 必须是非空字符串`);
+    }
+  }
+  if (autoRestart !== undefined && typeof autoRestart !== "boolean") {
+    throw new Error("config.json 的 tunnel.autoRestart 必须是布尔值");
+  }
+  const result: TunnelConfig = {};
+  if (typeof cloudflaredPath === "string" && cloudflaredPath.trim()) {
+    result.cloudflaredPath = cloudflaredPath.trim();
+  }
+  if (typeof configPath === "string" && configPath.trim()) result.configPath = configPath.trim();
+  if (typeof autoRestart === "boolean") result.autoRestart = autoRestart;
+  return result;
 }
 
 export function configFilePath(): string {
@@ -120,6 +158,7 @@ export function loadConfig(): AppConfig {
   const port = Number.isInteger(raw.port) ? (raw.port as number) : DEFAULTS.port;
   const shell = raw.shell ?? DEFAULTS.shell;
   validateShell(shell);
+  const tunnel = normalizeTunnel(raw.tunnel);
 
   return {
     root,
@@ -134,6 +173,7 @@ export function loadConfig(): AppConfig {
     ...(typeof raw.tunnelUrl === "string" && raw.tunnelUrl.trim()
       ? { tunnelUrl: raw.tunnelUrl.trim() }
       : {}),
+    ...(tunnel ? { tunnel } : {}),
   };
 }
 
@@ -161,6 +201,7 @@ export function saveConfig(config: AppConfig): void {  const file = configFilePa
     commandPolicy: config.commandPolicy,
   };
   if (config.tunnelUrl) next.tunnelUrl = config.tunnelUrl;
+  if (config.tunnel) next.tunnel = config.tunnel;
 
   writeFileSync(file, `${JSON.stringify(next, null, 2)}\n`, "utf8");
 }

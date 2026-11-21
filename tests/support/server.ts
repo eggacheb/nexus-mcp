@@ -25,6 +25,10 @@ export interface RunningServer {
 export interface StartOptions {
   token?: string;
   tunnelUrl?: string;
+  /** config.json 的 tunnel 段，透传给服务的隧道管理器 */
+  tunnel?: Record<string, unknown>;
+  /** NEXUS_TUNNEL_STUB：插在 cloudflared 参数最前面的 stub 脚本路径 */
+  tunnelStubPath?: string;
 }
 
 export function freePort(): Promise<number> {
@@ -78,6 +82,7 @@ export async function startServer(options: StartOptions = {}): Promise<RunningSe
         token: options.token ?? "",
         shell: "auto",
         ...(options.tunnelUrl ? { tunnelUrl: options.tunnelUrl } : {}),
+        ...(options.tunnel ? { tunnel: options.tunnel } : {}),
       },
       null,
       2,
@@ -87,7 +92,13 @@ export async function startServer(options: StartOptions = {}): Promise<RunningSe
 
   const child: ChildProcess = spawn(process.execPath, [path.join(projectRoot, "dist", "index.js")], {
     cwd: projectRoot,
-    env: { ...process.env, NEXUS_MCP_CONFIG: configPath },
+    env: {
+      ...process.env,
+      NEXUS_MCP_CONFIG: configPath,
+      // 测试机上可能跑着真隧道，外部进程检测一律关闭，用例只管自己拉起的进程
+      NEXUS_TUNNEL_EXTERNAL: "off",
+      ...(options.tunnelStubPath ? { NEXUS_TUNNEL_STUB: options.tunnelStubPath } : {}),
+    },
     stdio: ["ignore", "pipe", "pipe"],
   });
 

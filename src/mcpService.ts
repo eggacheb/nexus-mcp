@@ -12,6 +12,8 @@ import { OAuthProvider, safeEqual } from "./oauth.js";
 import { createServer } from "./server.js";
 
 const MCP_PATH = "/mcp";
+/** 健康检查：无鉴权，面板可达性探测与排障（公网/本地）都打这里 */
+const HEALTH_PATH = "/health";
 /** 请求体上限，与传输层默认值一致；超出直接 413，不进入解析 */
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
 const LISTEN_HOST = "127.0.0.1";
@@ -207,6 +209,12 @@ export function createMcpService(config: AppConfig): McpService {
 
     // OAuth 元数据 / 注册 / 授权 / 令牌端点先于 MCP 端点处理
     if (await oauth.handle(req, res, requestUrl.pathname, requestUrl)) {
+      return;
+    }
+
+    // 健康检查在鉴权之前：只暴露服务存活，不带任何敏感信息
+    if (requestUrl.pathname === HEALTH_PATH) {
+      sendJson(res, 200, { ok: true, service: "nexus-mcp" });
       return;
     }
 
