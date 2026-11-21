@@ -2,11 +2,9 @@ import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { gitBashPath } from "./config.js";
 import type { AppConfig } from "./config.js";
-
-const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+import { appRoot, isPackaged } from "./paths.js";
 
 export interface ShellSpec {
   kind: "git-bash" | "pwsh";
@@ -154,16 +152,32 @@ export function crashHelperBinaryPath(): string {
   return releaseBinaryPath("crash-helper");
 }
 
+/** 打包产物里执行器与 nexus-mcp.exe 同目录；开发态在 cargo 的 release 目录 */
 function releaseBinaryPath(name: string): string {
   const suffix = process.platform === "win32" ? ".exe" : "";
-  return path.join(projectRoot, "crates", "target", "release", `${name}${suffix}`);
+  const dir = isPackaged ? appRoot : path.join(appRoot, "crates", "target", "release");
+  return path.join(dir, `${name}${suffix}`);
+}
+
+/** 缺执行器时给两套人话：装好的用户该重装，写代码的人该先 build */
+function missingExecutorMessage(binary: string): string {
+  return isPackaged
+    ? `执行器不存在: ${binary}。执行器应和 nexus-mcp.exe 在同一目录，重新运行安装包即可修复。`
+    : `执行器不存在: ${binary}。先运行 npm run build 构建执行器。`;
 }
 
 /** shell 配置 → 具体执行程序。powershell(5.1) 在 loadConfig 启动校验时就被拒绝 */
 export function resolveShell(config: AppConfig): ShellSpec {
   if (config.shell === "pwsh") return { kind: "pwsh", program: "pwsh" };
-  // auto 与 git-bash：loadConfig 已确保 Git Bash 存在
-  return { kind: "git-bash", program: gitBashPath() };
+  // 打包版里 auto 可能在缺 Git Bash 的机器上降级放行，真要用 shell 时才在这里报错
+  const bash = gitBashPath();
+  if (!existsSync(bash)) {
+    throw new Error(
+      `找不到 Git Bash（${bash}），这条工具需要命令执行。装一个 Git for Windows 即可，` +
+        "或在 config.json 里把 shell 改成 pwsh；read/write/edit/glob/grep 不需要它。",
+    );
+  }
+  return { kind: "git-bash", program: bash };
 }
 
 interface Pending {
@@ -223,7 +237,7 @@ export class ExecutorClient {
     if (this.child) return this.child;
     const binary = executorBinaryPath();
     if (!existsSync(binary)) {
-      throw new Error(`执行器不存在: ${binary}。先运行 npm run build 构建执行器。`);
+      throw new Error(missingExecutorMessage(binary));
     }
     const child = spawn(binary, [], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
     this.child = child;
@@ -304,7 +318,7 @@ export interface ExecutorProbe {
 export async function probeExecutorHandshake(): Promise<ExecutorProbe> {
   const binary = executorBinaryPath();
   if (!existsSync(binary)) {
-    return { ok: false, detail: `执行器不存在: ${binary}。先运行 npm run build 构建执行器。` };
+    return { ok: false, detail: missingExecutorMessage(binary) };
   }
   return new Promise((resolve) => {
     let child: ChildProcess | null = null;

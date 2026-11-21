@@ -10,6 +10,7 @@ import type { McpService } from "./mcpService.js";
 import type { ComponentStatus, TunnelStatus } from "./status.js";
 import { executorStatus, tunnelStatus } from "./status.js";
 import type { TunnelManager } from "./tunnel.js";
+import { VERSION } from "./version.js";
 
 const LISTEN_HOST = "127.0.0.1";
 const MAX_BODY_BYTES = 64 * 1024;
@@ -27,6 +28,8 @@ export interface PanelStatus {
   root: string;
   oauth: { url: string; available: boolean };
   panelPort: number;
+  /** 程序版本，页头直接显示；与安装包文件名、package.json 同源 */
+  version: string;
 }
 
 export interface PanelHandle {
@@ -94,6 +97,7 @@ const PAGE = `<!doctype html>
 <main>
   <header>
     <h1>nexus-mcp</h1>
+    <span class="hint" id="app-version" style="margin:0">v${VERSION}</span>
     <span class="hint" style="margin:0">本地控制面板 · 停 MCP 服务不影响这块页面</span>
   </header>
 
@@ -182,6 +186,7 @@ const PAGE = `<!doctype html>
     setLight("light-executor", s.executor);
     setLight("light-resource-mcp", s.service);
     setLight("light-tunnel", s.tunnel);
+    document.getElementById("app-version").textContent = "v" + s.version;
     document.getElementById("mcp-url").value = s.service.url;
     document.getElementById("mcp-hint").textContent =
       "状态：" + s.service.label + " · 端口 " + s.service.port + " · 会话 " + s.service.sessions + " 个";
@@ -385,6 +390,7 @@ export async function startPanel(
       root: config.root,
       oauth: service.oauthInfo(),
       panelPort,
+      version: VERSION,
     };
   }
 

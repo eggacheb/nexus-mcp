@@ -6,6 +6,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { VERSION } from "../src/version.js";
 import { projectRoot, startServer } from "./support/server.js";
 import type { RunningServer } from "./support/server.js";
 
@@ -17,6 +18,7 @@ interface StatusBody {
   tunnel: { state: string; label: string; detail?: string };
   root: string;
   oauth: { url: string; available: boolean };
+  version: string;
 }
 
 async function getStatus(server: RunningServer): Promise<StatusBody> {
@@ -84,6 +86,15 @@ describe("本地控制面板", () => {
     // 复制按钮由页面脚本调用剪贴板
     expect(html).toContain("clipboard");
     expect(html).toContain("复制");
+  });
+
+  it("版本号可见：页头直接印出，状态接口同源", async () => {
+    const status = await getStatus(server);
+    expect(status.version).toBe(VERSION);
+
+    // 版本号由服务端直接写进 HTML，不依赖页面脚本渲染
+    const html = await (await fetch(server.panelUrl)).text();
+    expect(html).toContain(`id="app-version" style="margin:0">v${VERSION}<`);
   });
 
   it(

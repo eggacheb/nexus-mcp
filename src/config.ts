@@ -1,6 +1,8 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { appRoot, isPackaged } from "./paths.js";
+import { log } from "./log.js";
 
 export type ShellKind = "auto" | "git-bash" | "pwsh" | "powershell";
 
@@ -108,11 +110,54 @@ function normalizeTunnel(raw: unknown): TunnelConfig | undefined {
   return result;
 }
 
+/**
+ * 配置文件位置：环境变量 NEXUS_MCP_CONFIG 显式指定优先，
+ * 否则取程序根目录（打包版是 exe 同目录，开发态是仓库根）。
+ */
 export function configFilePath(): string {
   const override = process.env.NEXUS_MCP_CONFIG;
   if (override && override.trim()) return path.resolve(override);
-  const here = path.dirname(fileURLToPath(import.meta.url));
-  return path.resolve(here, "..", "config.json");
+  return path.join(appRoot, "config.json");
+}
+
+/** 没配 root 时的沙箱根：打包版固定为 exe 同目录的 workspace，开发态沿用当前目录 */
+function defaultRoot(): string {
+  if (!isPackaged) return process.cwd();
+  const workspace = path.join(appRoot, "workspace");
+  try {
+    mkdirSync(workspace, { recursive: true });
+  } catch (error) {
+    // 目录建不出来（只读安装位置之类）也别拦着服务起来，第一次 read/write 会报真因
+    log(`创建 workspace 失败（${workspace}）：${(error as Error).message}`);
+  }
+  return workspace;
+}
+
+/**
+ * 首次运行（没有 config.json）生成默认配置：令牌随机，用户照着填进云端连接器。
+ * 写盘失败不拦着服务起来，退回相同的内置值继续跑。
+ */
+function writeInitialConfig(file: string): Partial<AppConfig> {
+  const initial: Partial<AppConfig> = {
+    root: defaultRoot(),
+    transport: DEFAULTS.transport,
+    port: DEFAULTS.port,
+    panelPort: DEFAULTS.port + 1,
+    token: randomBytes(16).toString("hex"),
+    shell: DEFAULTS.shell,
+    maxOutputBytes: DEFAULTS.maxOutputBytes,
+    defaultTimeoutMs: DEFAULTS.defaultTimeoutMs,
+    commandPolicy: { allow: [], deny: [], onUnmatched: "deny" },
+  };
+  try {
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, `${JSON.stringify(initial, null, 2)}\n`, "utf8");
+    log(`首次运行，已生成默认配置: ${file}`);
+    log(`访问令牌（token 字段）：${initial.token} —— 填进云端连接器的 Bearer 令牌，之后可在该文件里改`);
+  } catch (error) {
+    log(`默认配置写入失败（${file}）：${(error as Error).message}，本次按内置默认值运行`);
+  }
+  return initial;
 }
 
 /** 默认 Git Bash 路径；可用环境变量 NEXUS_GIT_BASH 覆盖（测试用） */
@@ -135,13 +180,26 @@ function validateShell(shell: ShellKind): void {
   if (shell === "auto" || shell === "git-bash") {
     const bash = gitBashPath();
     if (!existsSync(bash)) {
-      throw new Error(
-        `找不到 Git Bash（${bash}）。请安装 Git for Windows，或在 config.json 里显式指定 shell 为 pwsh。`,
+      // 显式选了 git-bash 就是用户点名要它，缺了必须报错。
+      // auto 在打包版里降级成警告：没装过开发工具链的机器也要能先跑文件类工具，
+      // bash / job_* 等真要用 shell 的时候再由 resolveShell 报错。
+      if (shell === "git-bash" || !isPackaged) {
+        throw new Error(
+          `找不到 Git Bash（${bash}）。请安装 Git for Windows，或在 config.json 里显式指定 shell 为 pwsh。`,
+        );
+      }
+      log(
+        `没找到 Git Bash（${bash}）：bash 与 job_* 会报错，read/write/edit/glob/grep 不受影响。` +
+          "需要命令执行时装一个 Git for Windows，或在 config.json 里把 shell 改成 pwsh。",
       );
     }
   }
 }
 
+/**
+ * 读配置。优先级：环境变量 > 可执行文件同目录的 config.json > 内置默认。
+ * 文件不存在时先按默认值生成一份，不让首次运行直接崩。
+ */
 export function loadConfig(): AppConfig {
   const file = configFilePath();
   let raw: Partial<AppConfig> = {};
@@ -152,10 +210,21 @@ export function loadConfig(): AppConfig {
     } catch (err) {
       throw new Error(`config.json 解析失败 (${file}): ${(err as Error).message}`);
     }
+  } else {
+    raw = writeInitialConfig(file);
   }
 
-  const root = path.resolve(raw.root ?? process.cwd());
-  const port = Number.isInteger(raw.port) ? (raw.port as number) : DEFAULTS.port;
+  // 环境变量只认非空值：空串按未设置处理，避免 PowerShell 里 `$env:X=""` 的误伤
+  const envRoot = process.env.NEXUS_MCP_ROOT?.trim();
+  const envToken = process.env.NEXUS_MCP_TOKEN;
+  const envPort = Number(process.env.NEXUS_MCP_PORT);
+
+  const root = path.resolve(envRoot || raw.root || defaultRoot());
+  const port = Number.isInteger(envPort) && envPort > 0
+    ? envPort
+    : Number.isInteger(raw.port)
+      ? (raw.port as number)
+      : DEFAULTS.port;
   const shell = raw.shell ?? DEFAULTS.shell;
   validateShell(shell);
   const tunnel = normalizeTunnel(raw.tunnel);
@@ -165,7 +234,7 @@ export function loadConfig(): AppConfig {
     transport: raw.transport === "stdio" ? "stdio" : DEFAULTS.transport,
     port,
     panelPort: Number.isInteger(raw.panelPort) ? (raw.panelPort as number) : port + 1,
-    token: typeof raw.token === "string" ? raw.token : DEFAULTS.token,
+    token: envToken ? envToken : typeof raw.token === "string" ? raw.token : DEFAULTS.token,
     shell,
     maxOutputBytes: raw.maxOutputBytes ?? DEFAULTS.maxOutputBytes,
     defaultTimeoutMs: raw.defaultTimeoutMs ?? DEFAULTS.defaultTimeoutMs,
@@ -178,7 +247,8 @@ export function loadConfig(): AppConfig {
 }
 
 /** 把当前配置写回 config.json，保留文件里本程序不认识的键 */
-export function saveConfig(config: AppConfig): void {  const file = configFilePath();
+export function saveConfig(config: AppConfig): void {
+  const file = configFilePath();
   let raw: Record<string, unknown> = {};
   if (existsSync(file)) {
     try {
