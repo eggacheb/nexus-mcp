@@ -2,6 +2,8 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { AppConfig } from "./config.js";
 import { displayPath, resolveInRoot } from "./config.js";
+import { getExecutor, resolveShell } from "./executor.js";
+import type { BashResponse } from "./executor.js";
 
 type TextResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
 
@@ -107,10 +109,21 @@ export function registerTools(server: McpServer, config: AppConfig): void {
     async ({ command, cwd, timeout_ms }) => {
       try {
         const dir = cwd ? resolveInRoot(config.root, cwd) : config.root;
-        return stub(
-          "bash",
-          `cwd: ${displayPath(config.root, dir)}  命令: ${command}  超时: ${timeout_ms ?? config.defaultTimeoutMs}ms`,
-        );
+        const timeout = timeout_ms ?? config.defaultTimeoutMs;
+        const response = await getExecutor().request<BashResponse>({
+          op: "bash",
+          command,
+          cwd: dir,
+          timeout_ms: timeout,
+          max_output_bytes: config.maxOutputBytes,
+          shell: resolveShell(config),
+        });
+        if (!response.ok) return fail(response.error);
+        const body = response.output ? `\n\n${response.output}` : "";
+        if (response.timed_out) {
+          return ok(`timed_out: ${timeout}ms（命令已终止）${body}`);
+        }
+        return ok(`exit_code: ${response.exit_code}${body}`);
       } catch (err) {
         return fail((err as Error).message);
       }

@@ -7,18 +7,19 @@
 
 ## 目录
 
-- `src/` — TypeScript 侧：MCP 协议、工具定义、HTTP 传输、面板
+- `src/` — TypeScript 侧：MCP 协议、工具定义、HTTP 传输、面板、执行器协议客户端（`executor.ts`）
+- `crates/executor/` — Rust 执行器：唯一的命令执行层，stdio 单行 JSON 协议，`bash` 已接入
 - `scripts/` — 自检与本地 CI
-- `crates/` — Rust 执行器（尚未落地，负责命令执行、文件读写、补丁应用）
 
 ## 命令
 
 原样抄自 `package.json`，改动前先看那里：
 
 - 类型检查：`npm run typecheck`
-- 编译：`npm run build`
+- 编译：`npm run build`（先 `cargo build --release` 构建执行器，再 `tsc`）
+- 测试：`npm run test`（vitest，测试只走 MCP 客户端入口）；Rust 侧单独跑 `npm run test:rs`
 - 自检：`npm run smoke`（起服务、列出工具、调一次 `read`）
-- 本地 CI：`npm run check`（typecheck + build + smoke，提交前必须全部通过）
+- 本地 CI：`npm run check`（build + vitest + cargo test + smoke，提交前必须全部通过）
 
 ## 不能碰
 

@@ -1,6 +1,8 @@
 node_modules/
 dist/
 build/
+crates/target/
+crates/executor/target/
 *.log
 config.local.json
 .DS_Store

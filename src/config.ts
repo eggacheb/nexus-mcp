@@ -41,6 +41,33 @@ export function configFilePath(): string {
   return path.resolve(here, "..", "config.json");
 }
 
+/** 默认 Git Bash 路径；可用环境变量 NEXUS_GIT_BASH 覆盖（测试用） */
+export function gitBashPath(): string {
+  const override = process.env.NEXUS_GIT_BASH;
+  if (override && override.trim()) return path.resolve(override.trim());
+  const programFiles = process.env.ProgramFiles ?? "C:\\Program Files";
+  return path.join(programFiles, "Git", "bin", "bash.exe");
+}
+
+/** shell 配置在启动时校验，坏了直接不让服务起来 */
+function validateShell(shell: ShellKind): void {
+  if (shell === "powershell") {
+    throw new Error(
+      "shell 配置为 powershell（Windows PowerShell 5.1）不受支持：5.1 的控制台编码跟随系统代码页，" +
+        "中文系统下子进程输出会乱码，无法满足工具输出一律 UTF-8 的约定。" +
+        "请把 config.json 里的 shell 改成 pwsh（PowerShell 7）或 git-bash。",
+    );
+  }
+  if (shell === "auto" || shell === "git-bash") {
+    const bash = gitBashPath();
+    if (!existsSync(bash)) {
+      throw new Error(
+        `找不到 Git Bash（${bash}）。请安装 Git for Windows，或在 config.json 里显式指定 shell 为 pwsh。`,
+      );
+    }
+  }
+}
+
 export function loadConfig(): AppConfig {
   const file = configFilePath();
   let raw: Partial<AppConfig> = {};
@@ -55,6 +82,8 @@ export function loadConfig(): AppConfig {
 
   const root = path.resolve(raw.root ?? process.cwd());
   const port = Number.isInteger(raw.port) ? (raw.port as number) : DEFAULTS.port;
+  const shell = raw.shell ?? DEFAULTS.shell;
+  validateShell(shell);
 
   return {
     root,
@@ -62,7 +91,7 @@ export function loadConfig(): AppConfig {
     port,
     panelPort: Number.isInteger(raw.panelPort) ? (raw.panelPort as number) : port + 1,
     token: typeof raw.token === "string" ? raw.token : DEFAULTS.token,
-    shell: raw.shell ?? DEFAULTS.shell,
+    shell,
     maxOutputBytes: raw.maxOutputBytes ?? DEFAULTS.maxOutputBytes,
     defaultTimeoutMs: raw.defaultTimeoutMs ?? DEFAULTS.defaultTimeoutMs,
     ...(typeof raw.tunnelUrl === "string" && raw.tunnelUrl.trim()
@@ -72,8 +101,7 @@ export function loadConfig(): AppConfig {
 }
 
 /** 把当前配置写回 config.json，保留文件里本程序不认识的键 */
-export function saveConfig(config: AppConfig): void {
-  const file = configFilePath();
+export function saveConfig(config: AppConfig): void {  const file = configFilePath();
   let raw: Record<string, unknown> = {};
   if (existsSync(file)) {
     try {

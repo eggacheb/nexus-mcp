@@ -6,13 +6,15 @@
   "description": "Minimal MCP server exposing local filesystem and shell tools to web AI clients",
   "main": "dist/index.js",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build:executor": "cargo build --release --manifest-path crates/executor/Cargo.toml",
+    "build": "npm run build:executor && tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
-    "test": "vitest run",
+    "test": "npm run build:executor && vitest run",
+    "test:rs": "cargo test --manifest-path crates/executor/Cargo.toml",
     "smoke": "tsx scripts/smoke.ts",
-    "check": "npm run build && npm run test && npm run smoke"
+    "check": "npm run build && npm run test && npm run test:rs && npm run smoke"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",

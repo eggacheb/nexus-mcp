@@ -1,0 +1,6 @@
+This project includes code derived from OpenAI Codex (https://github.com/openai/codex),
+licensed under the Apache License, Version 2.0. Copyright 2025 OpenAI.
+
+Copied or adapted portions (see file headers for details):
+- crates/executor/src/head_tail_buffer.rs  (from codex-rs/utils/head-tail-buffer)
+- crates/executor/src/string.rs            (take_bytes_at_char_boundary from codex-rs/utils/string)
