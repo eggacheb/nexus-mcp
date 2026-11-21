@@ -102,6 +102,34 @@ export type EditResponse = EditSuccess | ExecutorFailure;
 export type GlobResponse = GlobSuccess | ExecutorFailure;
 export type GrepResponse = GrepSuccess | ExecutorFailure;
 
+export interface JobStartSuccess {
+  ok: true;
+  /** 任务 id，形如 job-1 */
+  job_id: string;
+  /** 任务主进程 pid */
+  pid: number;
+}
+
+export interface JobOutputSuccess {
+  ok: true;
+  job_id: string;
+  /** running 表示任务还在跑；exited 表示已结束（failed 不会出现：启动失败在 job_start 直接报错） */
+  status: "running" | "exited";
+  /** 结束后为退出码；运行中为 null */
+  exit_code: number | null;
+  /** 本次增量输出（请求落在已丢弃区间时为省略标注文本） */
+  output: string;
+  /** 下一次 job_output 应传的字节偏移 */
+  next_offset: number;
+  /** 迄今产生的总字节数 */
+  total_bytes: number;
+  /** 缓冲内已丢弃、无法再读到的字节数 */
+  omitted_bytes: number;
+}
+
+export type JobStartResponse = JobStartSuccess | ExecutorFailure;
+export type JobOutputResponse = JobOutputSuccess | ExecutorFailure;
+
 /** 执行器二进制路径；NEXUS_MCP_EXECUTOR 可覆盖（测试用来注入假执行器） */
 export function executorBinaryPath(): string {
   const override = process.env.NEXUS_MCP_EXECUTOR;

@@ -7,14 +7,17 @@ mod edit_match;
 mod glob_search;
 mod grep_search;
 mod head_tail_buffer;
+mod jobs;
 mod ripgrep;
 mod string;
+#[cfg(windows)]
+mod win_job;
 
 use std::fs;
 use std::io::{BufRead, Read, Write, stdin, stdout};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -36,9 +39,9 @@ const MAX_READ_LINES: u64 = 2_000;
 const DEFAULT_READ_MAX_OUTPUT_BYTES: u64 = 64 * 1024;
 
 #[derive(Deserialize)]
-struct ShellSpec {
-    kind: String,
-    program: String,
+pub struct ShellSpec {
+    pub kind: String,
+    pub program: String,
 }
 
 /// bash 请求体。op 分发在 handle_request 里完成，这里只管 bash 自己的字段。
@@ -129,47 +132,76 @@ fn handle_request(line: &str) -> Value {
             Ok(request) => grep_search::run_grep(&request),
             Err(err) => error_response(id, format!("grep 请求字段有误: {err}")),
         },
+        Some("job_start") => match serde_json::from_value::<jobs::JobStartRequest>(parsed) {
+            Ok(request) => jobs::registry()
+                .lock()
+                .expect("任务注册表锁不应中毒")
+                .start(&request),
+            Err(err) => error_response(id, format!("job_start 请求字段有误: {err}")),
+        },
+        Some("job_output") => match serde_json::from_value::<jobs::JobOutputRequest>(parsed) {
+            Ok(request) => jobs::registry()
+                .lock()
+                .expect("任务注册表锁不应中毒")
+                .output(&request),
+            Err(err) => error_response(id, format!("job_output 请求字段有误: {err}")),
+        },
         _ => error_response(id, "未知 op 或缺少 op"),
     }
 }
 
+/// bash 与 job_start 共用：校验 command/cwd/shell kind 并组装 Command（不含 stdio）。
+fn build_shell_command(
+    kind: &str,
+    program: &str,
+    command_line: &str,
+    cwd: &str,
+) -> Result<Command, String> {
+    if command_line.trim().is_empty() {
+        return Err("command 不能为空".into());
+    }
+    if !Path::new(cwd).is_dir() {
+        return Err(format!("工作目录不存在或不是目录: {cwd}"));
+    }
+    let mut command = Command::new(program);
+    match kind {
+        // Git Bash：非登录模式，避免 profile 脚本改掉环境变量
+        "git-bash" => {
+            command.arg("-c").arg(command_line);
+            command
+                .env("LANG", "zh_CN.UTF-8")
+                .env("LC_ALL", "C.UTF-8")
+                .env("MSYS_NO_PATHCONV", "1");
+        }
+        // PowerShell 7：先强制控制台输出编码为 UTF-8，再跑命令
+        "pwsh" => {
+            command
+                .arg("-NoProfile")
+                .arg("-NonInteractive")
+                .arg("-Command")
+                .arg(format!(
+                    "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; {command_line}"
+                ));
+        }
+        other => return Err(format!("不支持的 shell kind: {other}")),
+    }
+    command.current_dir(cwd);
+    Ok(command)
+}
+
 fn run_bash(request: &BashRequest) -> Value {
-    if request.command.trim().is_empty() {
-        return error_response(Some(request.id), "command 不能为空");
-    }
-    if !Path::new(&request.cwd).is_dir() {
-        return error_response(
-            Some(request.id),
-            format!("工作目录不存在或不是目录: {}", request.cwd),
-        );
-    }
     let max_bytes = request.max_output_bytes.max(1);
     let timeout_ms = request.timeout_ms.clamp(1, MAX_TIMEOUT_MS);
 
-    let args: Vec<String> = match request.shell.kind.as_str() {
-        // Git Bash：非登录模式，避免 profile 脚本改掉环境变量
-        "git-bash" => vec!["-c".into(), request.command.clone()],
-        // PowerShell 7：先强制控制台输出编码为 UTF-8，再跑命令
-        "pwsh" => vec![
-            "-NoProfile".into(),
-            "-NonInteractive".into(),
-            "-Command".into(),
-            format!(
-                "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; {}",
-                request.command
-            ),
-        ],
-        other => return error_response(Some(request.id), format!("不支持的 shell kind: {other}")),
+    let mut command = match build_shell_command(
+        &request.shell.kind,
+        &request.shell.program,
+        &request.command,
+        &request.cwd,
+    ) {
+        Ok(command) => command,
+        Err(message) => return error_response(Some(request.id), message),
     };
-
-    let mut command = Command::new(&request.shell.program);
-    command.args(&args).current_dir(&request.cwd);
-    if request.shell.kind == "git-bash" {
-        command
-            .env("LANG", "zh_CN.UTF-8")
-            .env("LC_ALL", "C.UTF-8")
-            .env("MSYS_NO_PATHCONV", "1");
-    }
 
     let mut child = match command
         .stdin(Stdio::null())
@@ -716,14 +748,18 @@ fn spawn_readers(
     buffer: Arc<Mutex<HeadTailBuffer>>,
 ) -> Vec<thread::JoinHandle<()>> {
     vec![
-        drain_stream(stdout_stream, Arc::clone(&buffer)),
-        drain_stream(stderr_stream, buffer),
+        drain_stream(stdout_stream, Arc::clone(&buffer), None),
+        drain_stream(stderr_stream, buffer, None),
     ]
 }
 
+/// 泵一个输出流到有界缓冲，读尽（EOF/错误）后发一次完成信号。
+/// bash 等待用不到信号传 None（直接 join）；后台任务的监控线程
+/// 用信号在宽限内判断泵是否收尾，避免被握着管道的泄漏孙进程卡住。
 fn drain_stream<R: Read + Send + 'static>(
     mut stream: R,
     buffer: Arc<Mutex<HeadTailBuffer>>,
+    done: Option<mpsc::Sender<()>>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut chunk = [0u8; 8192];
@@ -736,6 +772,9 @@ fn drain_stream<R: Read + Send + 'static>(
                     }
                 }
             }
+        }
+        if let Some(done) = done {
+            let _ = done.send(());
         }
     })
 }
@@ -784,6 +823,12 @@ fn main() {
             break;
         }
     }
+    // stdin EOF 或写响应失败意味着协议层已离开：终止所有还在跑的后台任务，
+    // 不留孤儿进程（Windows 侧另有 Job Object 兜底，见 win_job）
+    jobs::registry()
+        .lock()
+        .expect("任务注册表锁不应中毒")
+        .kill_all_running();
 }
 
 #[cfg(test)]

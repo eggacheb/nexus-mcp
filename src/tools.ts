@@ -8,6 +8,8 @@ import type {
   EditResponse,
   GlobResponse,
   GrepResponse,
+  JobOutputResponse,
+  JobStartResponse,
   ReadResponse,
   WriteResponse,
 } from "./executor.js";
@@ -30,10 +32,6 @@ function ok(text: string): TextResult {
 
 function fail(message: string): TextResult {
   return { content: [{ type: "text", text: message }], isError: true };
-}
-
-function stub(name: string, detail: string): TextResult {
-  return ok(`[stub] ${name} 已注册，执行层尚未接入。\n${detail}`);
 }
 
 export function registerTools(server: McpServer, config: AppConfig): void {
@@ -277,7 +275,17 @@ export function registerTools(server: McpServer, config: AppConfig): void {
     async ({ command, cwd }) => {
       try {
         const dir = cwd ? resolveInRoot(config.root, cwd) : config.root;
-        return stub("job_start", `cwd: ${displayPath(config.root, dir)}  命令: ${command}`);
+        const response = await getExecutor().request<JobStartResponse>({
+          op: "job_start",
+          command,
+          cwd: dir,
+          max_output_bytes: config.maxOutputBytes,
+          shell: resolveShell(config),
+        });
+        if (!response.ok) return fail(response.error);
+        return ok(
+          `已启动后台任务 ${response.job_id}（pid ${response.pid}）。用 job_output 查看输出与状态。`,
+        );
       } catch (err) {
         return fail((err as Error).message);
       }
@@ -295,7 +303,26 @@ export function registerTools(server: McpServer, config: AppConfig): void {
       },
     },
     async ({ job_id, offset }) => {
-      return stub("job_output", `job_id: ${job_id}  offset: ${offset ?? 0}`);
+      try {
+        const response = await getExecutor().request<JobOutputResponse>({
+          op: "job_output",
+          job_id,
+          offset: offset ?? 0,
+          max_output_bytes: config.maxOutputBytes,
+        });
+        if (!response.ok) return fail(response.error);
+        const head = [`status: ${response.status}`];
+        if (response.exit_code !== null) head.push(`exit_code: ${response.exit_code}`);
+        let body = response.output;
+        if (body === "" && response.status === "running") body = "（暂无新输出）";
+        let text = `${head.join("\n")}\n\n${body}`;
+        if (response.status === "running" || response.next_offset < response.total_bytes) {
+          text += `\n\n[下次调用用 offset=${response.next_offset} 继续读取]`;
+        }
+        return ok(text);
+      } catch (err) {
+        return fail((err as Error).message);
+      }
     },
   );
 }
