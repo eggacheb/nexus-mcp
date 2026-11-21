@@ -15,3 +15,5 @@
 - [ ] 服务退出时终止所有后台任务，不残留子进程
 - [ ] 同一 `job_start` 连续启动多个任务时 id 不冲突
 - [ ] 任务结束时释放句柄，长时间运行不累积内存
+
+**复用来源：** 只抄 codex `exec-server` 的进程事件模型形状（`ExecProcess`、`ExecProcessEvent`、`ProcessOutputChunk`，见 `docs/research/codex-reusable-parts.md` §2.6），**不要**把 `codex-exec-server` 加进依赖：它 166 个源文件，还要拖 tonic、tungstenite、otel、rama。输出缓冲用票 03 已经搬进来的 `head-tail-buffer`，不要另写一套。

@@ -19,4 +19,4 @@
 - [ ] 交接笔记里的排障顺序原样保留在文档里，方便下次断线时照着查
 - [ ] 记录沙箱限制：本机部分命令（注册计划任务、COM 实例化）需用户手动执行
 
-参考：`.scratch/nexus-mcp/notes/tunnel-handover.md`
+参考：`docs/research/tunnel-handover.md`

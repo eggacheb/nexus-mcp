@@ -16,3 +16,5 @@
 - [ ] 超过 `timeout_ms` 的子进程被终止，返回明确的超时信息而不是挂起
 - [ ] 输出超过上限时保留头部与尾部，中间标注省略的字节数
 - [ ] 执行器进程意外退出时，协议层返回可读错误而不是卡死等待
+
+**复用来源：** 输出有界缓冲直接搬 codex 的 `utils/head-tail-buffer`（零依赖，纯 std，拷文件即可）；UTF-8 安全截断搬 `utils/string` 的 `take_bytes_at_char_boundary`。两者都在 `D:\code\Nexus\cankaoproject\codex\codex-rs` 下，对应说明见 `docs/research/codex-reusable-parts.md` §2.9 与 §5。不要自己写环形缓冲。

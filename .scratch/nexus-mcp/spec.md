@@ -157,6 +157,6 @@ Rust 执行层内部保留单元测试（补丁匹配、路径越界判定、UTF
 
 ## Further Notes
 
-- codex 可复用组件的调研结论在 Nexus 仓库的 `docs/research/codex-reusable-parts.md`，移植前先读它，尤其是「哪些不能直接搬」那一节。
+- codex 可复用组件的调研结论在本项目 `docs/research/codex-reusable-parts.md`，移植前先读它，尤其是「哪些不能直接搬」那一节。
 - Gemini 网页版必须走 https，本机调试时用 HTTP 直连测试客户端即可；真正接 Gemini 时需要隧道，隧道地址变化会影响已保存的配置，面板上要能重新生成。
 - 工具清单一旦对外发布就当作稳定契约，改名或改参数视为破坏性变更。

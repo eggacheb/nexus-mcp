@@ -15,3 +15,5 @@
 - [ ] 替换后文件仍是合法 UTF-8，不产生乱码
 - [ ] 空 `old_string` 被拒绝，避免整文件被清空
 - [ ] 算法层有单元测试覆盖：唯一匹配、多匹配、无匹配、空白差异、跨行块
+
+**复用来源：** 匹配算法在 codex 的 `apply-patch` crate 里，直接抄这几个文件：`parser.rs`、`streaming_parser.rs`、`seek_sequence.rs`、`text_file.rs`、`file_update.rs`、`invocation.rs`。其中 `file_update.rs` 依赖 `ExecutorFileSystem`，把它换成自己的文件系统接口（约十个方法）即可，其余文件原样保留。**不要**把整个 crate 加进依赖，它依赖 `codex-exec-server`，会拖进 7 个 `rama` alpha 包。细节见 `docs/research/codex-reusable-parts.md` §2.1 与 §3.1。

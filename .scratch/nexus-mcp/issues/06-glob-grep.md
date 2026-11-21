@@ -15,3 +15,5 @@
 - [ ] 结果数量超限时截断，并说明「还有更多」
 - [ ] 无匹配时返回空结果加一句说明，不当作错误
 - [ ] 二进制文件被跳过，不把乱码塞进结果
+
+**复用来源：** 遍历参数抄 codex `file-search` 里 `WalkBuilder` 的配置（`hidden(false)`、`follow_links(true)`、`require_git(true)`、可关全部 ignore 规则），约 20 行，见 `docs/research/codex-reusable-parts.md` §2.2。**不要**直接用它做 `glob`：那个 crate 是 fzf 式模糊评分排序（`nucleo` 打分），语义不是 glob 精确匹配。`grep` 不抄任何东西，直接调 `rg --json`，codex 自己也是这么做的。

@@ -14,3 +14,5 @@
 - [ ] 拦截信息写给模型看：说明被拦的命令、原因、以及可以怎么做替代
 - [ ] 白名单规则有单元测试覆盖：前缀匹配、参数位置、大小写、路径形式
 - [ ] 拦截不绕过沙箱：即使命令被放行，工作目录仍在根目录内
+
+**复用来源：** 这是整个仓库里唯一「依赖干净、可以直接搬」的组件：codex 的 `execpolicy-rules` crate，只有 7 个轻量依赖（`caseless`、`multimap`、`shlex`、`thiserror`、`unicode-normalization`、`serde`、`utils-absolute-path`），纯逻辑、无平台绑定，Windows 大小写和 `.exe` 后缀都处理过了。直接把源码拷过来。**不要**连带搬 `execpolicy`（它多一层 Starlark 解释器，只在要开放用户可编辑策略文件时才需要）。见 `docs/research/codex-reusable-parts.md` §2.4。危险命令黑名单可以参考 codex `shell-command` 的 `command_safety/` 目录，但只抄规则表，不要抄那个 crate（它依赖 protocol）。

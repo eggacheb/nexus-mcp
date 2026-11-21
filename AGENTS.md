@@ -32,6 +32,16 @@
 - 工具描述写给人看，不带治理元数据，不出现 `providerId`、`rpcMethod`、`safetyClassification` 这类字段。
 - 新增工具先写失败的测试再写实现，不从实现反推测试。
 
+## 复用 codex 代码的规则
+
+移植任何算法前，先读 `docs/research/codex-reusable-parts.md`。
+
+源码在本机 `D:\code\Nexus\cankaoproject\codex\codex-rs`，**只读参考，不要在那个目录里执行 `cargo build`**：它的 workspace 有 6 条 `[patch.crates-io]` 指向 git fork，构建会拉一堆外部仓库。
+
+可以直接搬的只有四样：`execpolicy-rules`、`utils/head-tail-buffer`、`utils/string`、`apply-patch` 的匹配算法（后者的文件系统后端要换成自己的接口）。
+
+不要引入 `codex-protocol`，它依赖 `network-proxy`，会拖进 7 个 `rama` 0.3.0-alpha 包。不要搬 `sandboxing`、`linux-sandbox`、`windows-sandbox-rs`、`mxc-sandbox`、`exec-server`、`network-proxy`，体量和平台绑定都不划算。
+
 ## Agent skills
 
 ### Issue tracker
