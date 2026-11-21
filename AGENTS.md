@@ -36,7 +36,7 @@
 
 ## 复用 codex 代码的规则
 
-移植任何算法前，先读 `docs/research/codex-reusable-parts.md`。
+移植任何算法前，先读 `docs/research/codex-reusable-parts.md` 和 `docs/research/opencode-reusable-parts.md`（后者是 opencode 侧的对位调研，MIT 无 NOTICE 负担，同样只读参考、不在该目录构建）。
 
 源码在本机 `D:\code\Nexus\cankaoproject\codex\codex-rs`，**只读参考，不要在那个目录里执行 `cargo build`**：它的 workspace 有 6 条 `[patch.crates-io]` 指向 git fork，构建会拉一堆外部仓库。
 
