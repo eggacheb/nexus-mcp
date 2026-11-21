@@ -38,13 +38,14 @@ afterAll(async () => {
 });
 
 describe("工具清单", () => {
-  it("暴露全部 8 个工具", async () => {
+  it("暴露全部 9 个工具", async () => {
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual([
       "bash",
       "edit",
       "glob",
       "grep",
+      "job_kill",
       "job_output",
       "job_start",
       "read",

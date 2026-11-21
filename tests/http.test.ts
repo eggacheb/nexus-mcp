@@ -14,6 +14,7 @@ const ALL_TOOLS = [
   "edit",
   "glob",
   "grep",
+  "job_kill",
   "job_output",
   "job_start",
   "read",
@@ -93,7 +94,7 @@ describe("HTTP 传输（配置了令牌）", () => {
   });
 
   it(
-    "官方客户端经 HTTP 初始化后可以列出 8 个工具并调用",
+    "官方客户端经 HTTP 初始化后可以列出 9 个工具并调用",
     async () => {
       const { client, transport } = await connectClient(server.mcpUrl, authInit(TOKEN));
 
@@ -140,7 +141,7 @@ describe("HTTP 传输（配置了令牌）", () => {
     async () => {
       const { client, transport } = await connectClient(server.mcpUrl, authInit(TOKEN));
       const { tools } = await client.listTools();
-      expect(tools.length).toBe(8);
+      expect(tools.length).toBe(9);
       await transport.terminateSession();
       await client.close();
 
@@ -185,7 +186,7 @@ describe("HTTP 传输（配置了令牌）", () => {
         arguments: { path: "AGENTS.md" },
       });
       expectOk(afterClose);
-      expect(textOf(afterClose)).toContain("8 个工具");
+      expect(textOf(afterClose)).toContain("9 个工具");
 
       await second.transport.terminateSession();
       await second.client.close();

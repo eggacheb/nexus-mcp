@@ -1,7 +1,7 @@
 # nexus-mcp
 
-给云端 AI（Gemini 自定义 MCP、ChatGPT 连接器）用的本地 MCP 服务，暴露 8 个工具：
-`read` / `write` / `edit` / `bash` / `glob` / `grep` / `job_start` / `job_output`。
+给云端 AI（Gemini 自定义 MCP、ChatGPT 连接器）用的本地 MCP 服务，暴露 9 个工具：
+`read` / `write` / `edit` / `bash` / `glob` / `grep` / `job_start` / `job_output` / `job_kill`。
 
 目标读者是模型，不是人：工具描述要短、参数要少、返回要能直接读懂。
 

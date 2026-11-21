@@ -118,7 +118,7 @@ describe("本地控制面板", () => {
     async () => {
       const before = await connectClient(server.mcpUrl);
       const listed = await before.client.listTools();
-      expect(listed.tools.length).toBe(8);
+      expect(listed.tools.length).toBe(9);
       await before.transport.terminateSession();
       await before.client.close();
 
@@ -147,7 +147,7 @@ describe("本地控制面板", () => {
 
       const after = await connectClient(server.mcpUrl);
       const relisted = await after.client.listTools();
-      expect(relisted.tools.length).toBe(8);
+      expect(relisted.tools.length).toBe(9);
       await after.transport.terminateSession();
       await after.client.close();
     },

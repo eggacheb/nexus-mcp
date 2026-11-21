@@ -51,6 +51,13 @@ pub struct JobOutputRequest {
     pub max_output_bytes: u64,
 }
 
+/// 终止不需要 force/graceful 开关：Windows 侧两侧保险都是硬杀，协议里没有软信号通道。
+#[derive(Deserialize)]
+pub struct JobKillRequest {
+    pub id: u64,
+    pub job_id: String,
+}
+
 /// 任务状态。Running 期间子进程由监控线程盯着；Exited 后只留有界缓冲与退出码。
 #[derive(Clone, Copy)]
 enum JobState {
@@ -198,24 +205,9 @@ impl JobRegistry {
     /// 请求落在已丢弃的中间段时给出省略标注并跳到尾部起点。
     pub fn output(&mut self, request: &JobOutputRequest) -> Value {
         let id = Some(request.id);
-        let Some(job_id) = parse_job_id(&request.job_id) else {
-            return crate::error_response(
-                id,
-                format!(
-                    "job_id 格式有误: {}（应为 job_start 返回的 job-N）",
-                    request.job_id
-                ),
-            );
-        };
-        self.reconcile_finished();
-        let Some(job) = self.jobs.get(&job_id) else {
-            return crate::error_response(
-                id,
-                format!(
-                    "job 不存在: {}（id 由 job_start 返回；服务重启后旧 id 一律失效，完成任务过多时最早的记录也会被清理）",
-                    request.job_id
-                ),
-            );
+        let job = match self.resolve_job(id, &request.job_id) {
+            Ok(job) => job,
+            Err(response) => return response,
         };
 
         // 快照缓冲：head 在前 tail 在后（omitted>0 时中间隔着丢弃段），拷贝一次
@@ -291,6 +283,36 @@ impl JobRegistry {
         })
     }
 
+    /// 终止单个后台任务：回执式——立即返回 killed 回执，不等进程退出。
+    /// 退出确认由监控线程收敛（10ms 轮询 try_wait），模型随后用 job_output 轮询。
+    /// 已结束的任务幂等返回 killed=false + 已记录退出码，让模型能区分
+    /// 「我杀了它」和「它本来结束了」；被杀任务复用 exited，不设第三态。
+    pub fn kill(&mut self, request: &JobKillRequest) -> Value {
+        let id = Some(request.id);
+        let job = match self.resolve_job(id, &request.job_id) {
+            Ok(job) => job,
+            Err(response) => return response,
+        };
+        let state = *job.state.lock().expect("任务状态锁不应中毒");
+        if let JobState::Exited { exit_code } = state {
+            return json!({
+                "id": request.id, "ok": true,
+                "job_id": request.job_id,
+                "killed": false,
+                "status": "exited",
+                "exit_code": exit_code,
+            });
+        }
+        job.terminate_tree();
+        json!({
+            "id": request.id, "ok": true,
+            "job_id": request.job_id,
+            "killed": true,
+            "status": "running",
+            "exit_code": null,
+        })
+    }
+
     /// 服务退出清理：终止所有还在跑的后台任务，不留孤儿进程。
     /// Windows 下即便这一步没跑到（执行器被硬杀），job 句柄随进程关闭也会杀树。
     pub fn kill_all_running(&mut self) {
@@ -302,6 +324,27 @@ impl JobRegistry {
             .collect();
         for job in running {
             job.terminate_tree();
+        }
+    }
+
+    /// 解析 job_id 并取出任务：output 与 kill 共用，保证错误形状完全一致。
+    /// 格式错误与「不存在」是两类错误，分别照旧给出原来的文案。
+    fn resolve_job(&mut self, id: Option<u64>, raw: &str) -> Result<Arc<Job>, Value> {
+        let Some(job_id) = parse_job_id(raw) else {
+            return Err(crate::error_response(
+                id,
+                format!("job_id 格式有误: {raw}（应为 job_start 返回的 job-N）"),
+            ));
+        };
+        self.reconcile_finished();
+        match self.jobs.get(&job_id) {
+            Some(job) => Ok(Arc::clone(job)),
+            None => Err(crate::error_response(
+                id,
+                format!(
+                    "job 不存在: {raw}（id 由 job_start 返回；服务重启后旧 id 一律失效，完成任务过多时最早的记录也会被清理）"
+                ),
+            )),
         }
     }
 

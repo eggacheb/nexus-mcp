@@ -1,7 +1,7 @@
-//! job_start / job_output 注册表级测试。每个测试用独立 JobRegistry，
+//! job_start / job_output / job_kill 注册表级测试。每个测试用独立 JobRegistry，
 //! 与全局注册表（handle_request 路径）互不干扰；需要 Git Bash。
 
-use crate::jobs::{JobOutputRequest, JobRegistry, JobStartRequest};
+use crate::jobs::{JobKillRequest, JobOutputRequest, JobRegistry, JobStartRequest};
 use crate::ShellSpec;
 use serde_json::Value;
 use std::path::Path;
@@ -50,6 +50,13 @@ fn output_request(job_id: &str, offset: Option<u64>, max_output_bytes: u64) -> J
         job_id: job_id.into(),
         offset,
         max_output_bytes,
+    }
+}
+
+fn kill_request(job_id: &str) -> JobKillRequest {
+    JobKillRequest {
+        id: 3,
+        job_id: job_id.into(),
     }
 }
 
@@ -283,4 +290,80 @@ fn kill_all_running_terminates_jobs() {
         assert!(Instant::now() < deadline, "kill_all 后任务没有退出");
         thread::sleep(Duration::from_millis(30));
     }
+}
+
+#[test]
+fn kill_running_job_returns_receipt_then_converges_to_exited() {
+    let _guard = spawn_lock();
+    let mut registry = JobRegistry::new();
+    let start = registry.start(&start_request("echo keep-me; sleep 30", 4096));
+    assert_eq!(start["ok"], Value::Bool(true));
+    let job_id = start["job_id"].as_str().unwrap().to_string();
+
+    // 等首段输出出现：确认任务确实在跑，输出缓冲里有既有内容
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let response = registry.output(&output_request(&job_id, None, 4096));
+        assert_eq!(response["status"], "running");
+        if response["output"].as_str().unwrap().contains("keep-me") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "首段输出迟迟没出现");
+        thread::sleep(Duration::from_millis(30));
+    }
+
+    // 回执式：立刻返回 killed=true，status 仍是 running（退出确认靠后续轮询）
+    let receipt = registry.kill(&kill_request(&job_id));
+    assert_eq!(receipt["ok"], Value::Bool(true));
+    assert_eq!(receipt["job_id"], job_id);
+    assert_eq!(receipt["killed"], Value::Bool(true));
+    assert_eq!(receipt["status"], "running");
+    assert_eq!(receipt["exit_code"], Value::Null);
+
+    // 监控线程收敛：任务死亡、退出码非 0，既有输出照旧可读
+    let final_response = wait_exited(&mut registry, &job_id, 4096, 10_000);
+    assert!(
+        final_response["exit_code"].as_i64().unwrap() != 0,
+        "被杀任务应拿到非 0 退出码: {final_response}"
+    );
+    assert!(
+        final_response["output"].as_str().unwrap().contains("keep-me"),
+        "杀后既有输出不能丢: {final_response}"
+    );
+}
+
+#[test]
+fn kill_finished_job_returns_recorded_exit_code() {
+    let _guard = spawn_lock();
+    let mut registry = JobRegistry::new();
+    let start = registry.start(&start_request("echo done-already", 4096));
+    let job_id = start["job_id"].as_str().unwrap().to_string();
+    wait_exited(&mut registry, &job_id, 4096, 10_000);
+
+    // 幂等：不报错，killed=false + 已记录退出码，模型能区分「本来结束了」
+    let receipt = registry.kill(&kill_request(&job_id));
+    assert_eq!(receipt["ok"], Value::Bool(true));
+    assert_eq!(receipt["killed"], Value::Bool(false));
+    assert_eq!(receipt["status"], "exited");
+    assert_eq!(receipt["exit_code"], 0);
+}
+
+#[test]
+fn kill_unknown_job_id_is_a_clear_error() {
+    let mut registry = JobRegistry::new();
+    let response = registry.kill(&kill_request("job-99999"));
+    assert_eq!(response["ok"], Value::Bool(false));
+    let error = response["error"].as_str().unwrap();
+    assert!(error.contains("不存在"), "报错要指明不存在: {error}");
+    assert!(error.contains("job-99999"), "报错要带上原始 id: {error}");
+    // 与 job_output 同形状：只有 id/ok/error 三个字段
+    assert_eq!(response["id"], 3);
+}
+
+#[test]
+fn kill_malformed_job_id_is_a_clear_error() {
+    let mut registry = JobRegistry::new();
+    let response = registry.kill(&kill_request("not-a-job"));
+    assert_eq!(response["ok"], Value::Bool(false));
+    assert!(response["error"].as_str().unwrap().contains("格式"));
 }

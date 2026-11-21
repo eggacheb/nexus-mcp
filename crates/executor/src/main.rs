@@ -150,6 +150,13 @@ fn handle_request(line: &str) -> Value {
                 .output(&request),
             Err(err) => error_response(id, format!("job_output 请求字段有误: {err}")),
         },
+        Some("job_kill") => match serde_json::from_value::<jobs::JobKillRequest>(parsed) {
+            Ok(request) => jobs::registry()
+                .lock()
+                .expect("任务注册表锁不应中毒")
+                .kill(&request),
+            Err(err) => error_response(id, format!("job_kill 请求字段有误: {err}")),
+        },
         _ => error_response(id, "未知 op 或缺少 op"),
     }
 }

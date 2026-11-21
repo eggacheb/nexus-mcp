@@ -15,6 +15,7 @@ const ALL_TOOLS = [
   "edit",
   "glob",
   "grep",
+  "job_kill",
   "job_output",
   "job_start",
   "read",
@@ -124,7 +125,7 @@ describe("HTTP 传输（OAuth + 静态 Bearer 并存）", () => {
   );
 
   it(
-    "OAuth 全流程走通：注册 → 授权（本地令牌批准）→ 换令牌 → OAuth 令牌连 MCP 列出 8 个工具",
+    "OAuth 全流程走通：注册 → 授权（本地令牌批准）→ 换令牌 → OAuth 令牌连 MCP 列出 9 个工具",
     async () => {
       const reg = await registerClient();
       const { verifier, challenge } = pkce();

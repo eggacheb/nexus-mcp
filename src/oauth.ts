@@ -604,7 +604,7 @@ export class OAuthProvider {
       "授权访问本地 nexus-mcp",
       `<p><b>${escapeHtml(name)}</b> 请求通过 MCP 访问你电脑上的 nexus-mcp。</p>
 <p class="muted">授权完成后将跳转到：<code>${escapeHtml(redirectHost)}</code></p>
-<p class="muted">批准后，该客户端可通过 MCP 调用全部 8 个工具（受沙箱根目录与命令闸门约束）。</p>
+<p class="muted">批准后，该客户端可通过 MCP 调用全部 9 个工具（受沙箱根目录与命令闸门约束）。</p>
 ${error ? `<p class="err">${escapeHtml(error)}</p>` : ""}
 <form method="POST" action="/oauth/authorize" autocomplete="off">
 ${hidden}

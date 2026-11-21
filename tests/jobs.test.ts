@@ -126,13 +126,33 @@ function gitSleepPath(): string {
 
 /** 哨兵进程的映像名：全系统唯一，tasklist 计数不受并行测试影响 */
 const SENTRY_IMAGE = "nexus-orphan-sentry.exe";
+/** 孙进程测试的映像名：同样是唯一名，避免和并发测试里的同名进程混淆 */
+const GRANDCHILD_IMAGE = "nexus-kill-grandchild.exe";
 
-function sentryProcessCount(): number {
-  const out = execFileSync("tasklist", ["/FI", `IMAGENAME eq ${SENTRY_IMAGE}`, "/FO", "CSV", "/NH"], {
+/** 按映像名精确计数：映像名全系统唯一时，计数就是这族进程的条数 */
+function imageProcessCount(image: string): number {
+  const out = execFileSync("tasklist", ["/FI", `IMAGENAME eq ${image}`, "/FO", "CSV", "/NH"], {
     encoding: "utf8",
     windowsHide: true,
   });
-  return out.split("\n").filter((line) => line.includes(SENTRY_IMAGE)).length;
+  return out.split("\n").filter((line) => line.includes(image)).length;
+}
+
+function sentryProcessCount(): number {
+  return imageProcessCount(SENTRY_IMAGE);
+}
+
+/** job_kill 回执里的 killed 行 */
+function killedOf(text: string): boolean | null {
+  const match = text.match(/^killed: (true|false)$/m);
+  return match ? match[1] === "true" : null;
+}
+
+/** Windows 原生 ping.exe：拷成唯一映像名后，孙进程断言不依赖 MSYS pid */
+function windowsPingPath(): string {
+  const candidate = path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "PING.EXE");
+  if (!existsSync(candidate)) throw new Error(`找不到 Windows 原生 ping: ${candidate}`);
+  return candidate;
 }
 
 describe("job_start / job_output 工具", () => {
@@ -357,6 +377,166 @@ describe("job_start / job_output 工具", () => {
         rmSync(orphanRoot, { recursive: true, force: true });
         rmSync(orphanConfig.dir, { recursive: true, force: true });
       }
+    },
+  );
+});
+
+describe("job_kill 工具", () => {
+  let session: StdioSession;
+  let config: TempConfig;
+
+  beforeAll(async () => {
+    config = writeTempConfig();
+    session = await connectStdio({ NEXUS_MCP_CONFIG: config.path });
+  }, 30_000);
+
+  afterAll(async () => {
+    await session?.close();
+    if (config) rmSync(config.dir, { recursive: true, force: true });
+  });
+
+  it(
+    "杀运行中任务：立即返回 killed=true 回执，状态与退出码靠 job_output 收敛",
+    { timeout: 60_000 },
+    async () => {
+      const start = await callTool(session.client, "job_start", { command: "sleep 30" });
+      expectOk(start);
+      const jobId = jobIdOf(textOf(start));
+
+      const startedAt = Date.now();
+      const killed = await callTool(session.client, "job_kill", { job_id: jobId });
+      const elapsed = Date.now() - startedAt;
+      expectOk(killed);
+      const receipt = textOf(killed);
+      // 回执式：不等进程退出，杀完立刻回
+      expect(elapsed).toBeLessThan(2_000);
+      expect(killedOf(receipt)).toBe(true);
+      expect(statusOf(receipt)).toBe("running");
+      expect(exitCodeOf(receipt)).toBeNull();
+
+      // 退出确认由监控线程收敛，模型用 job_output 轮询
+      let text = "";
+      await waitFor(async () => {
+        const probe = await callTool(session.client, "job_output", { job_id: jobId });
+        expectOk(probe);
+        text = textOf(probe);
+        return statusOf(text) === "exited";
+      }, 10_000);
+      expect(exitCodeOf(text)).not.toBe(0);
+    },
+  );
+
+  it(
+    "杀已退出任务：killed=false + 已记录退出码，不报错",
+    { timeout: 30_000 },
+    async () => {
+      const start = await callTool(session.client, "job_start", { command: "echo finished-early" });
+      expectOk(start);
+      const jobId = jobIdOf(textOf(start));
+      await waitFor(async () => {
+        const probe = await callTool(session.client, "job_output", { job_id: jobId });
+        expectOk(probe);
+        return statusOf(textOf(probe)) === "exited";
+      }, 10_000);
+
+      const killed = await callTool(session.client, "job_kill", { job_id: jobId });
+      expectOk(killed);
+      const receipt = textOf(killed);
+      expect(killedOf(receipt)).toBe(false);
+      expect(statusOf(receipt)).toBe("exited");
+      expect(exitCodeOf(receipt)).toBe(0);
+    },
+  );
+
+  it("未知 job_id：报错形状与 job_output 一致", { timeout: 30_000 }, async () => {
+    const result = await callTool(session.client, "job_kill", { job_id: "job-99999" });
+    expect(result.isError).toBe(true);
+    const text = textOf(result);
+    expect(text).toContain("job-99999");
+    expect(text).toContain("不存在");
+  });
+
+  it(
+    "树内 detached 孙进程随任务一起终止",
+    { timeout: 60_000 },
+    async () => {
+      // 独立 root：把 Windows 原生 ping 拷成全系统唯一的映像名，
+      // 孙进程断言按映像名精确计数，不受并发测试影响
+      const root = mkdtempSync(path.join(os.tmpdir(), "nexus-mcp-kill-root-"));
+      copyFileSync(windowsPingPath(), path.join(root, GRANDCHILD_IMAGE));
+      const childConfig = writeTempConfig();
+      writeFileSync(
+        childConfig.path,
+        JSON.stringify({ root, transport: "stdio", shell: "auto" }, null, 2),
+        "utf8",
+      );
+      const childSession = await connectStdio({ NEXUS_MCP_CONFIG: childConfig.path });
+      try {
+        const baseline = imageProcessCount(GRANDCHILD_IMAGE);
+        const start = await callTool(childSession.client, "job_start", {
+          command: `nohup ./${GRANDCHILD_IMAGE} -n 60 127.0.0.1 >/dev/null 2>&1 & echo grandchild-started; sleep 30`,
+        });
+        expectOk(start);
+        const jobId = jobIdOf(textOf(start));
+        await waitFor(async () => imageProcessCount(GRANDCHILD_IMAGE) === baseline + 1, 15_000);
+
+        const killed = await callTool(childSession.client, "job_kill", { job_id: jobId });
+        expectOk(killed);
+        expect(killedOf(textOf(killed))).toBe(true);
+
+        // Job Object + taskkill 双保险：detached 孙进程必须一起消失
+        await waitFor(async () => imageProcessCount(GRANDCHILD_IMAGE) === baseline, 15_000, 200);
+      } finally {
+        await childSession?.close().catch(() => {});
+        // 断言失败时孙进程可能还活着、握着 exe 句柄，清理失败不能盖住原始错误
+        try {
+          rmSync(root, { recursive: true, force: true });
+        } catch {
+          // 临时目录留在 %TEMP%，由系统清理
+        }
+        rmSync(childConfig.dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it(
+    "杀后既有输出照常可读，增量读取不重复",
+    { timeout: 60_000 },
+    async () => {
+      const start = await callTool(session.client, "job_start", {
+        command: "echo before-kill; sleep 30",
+      });
+      expectOk(start);
+      const jobId = jobIdOf(textOf(start));
+
+      let text = "";
+      await waitFor(async () => {
+        const probe = await callTool(session.client, "job_output", { job_id: jobId });
+        expectOk(probe);
+        text = textOf(probe);
+        return bodyOf(text).includes("before-kill");
+      }, 10_000);
+      expect(statusOf(text)).toBe("running");
+      const offset = nextOffsetOf(text);
+
+      const killed = await callTool(session.client, "job_kill", { job_id: jobId });
+      expectOk(killed);
+      expect(killedOf(textOf(killed))).toBe(true);
+
+      // 从上次偏移继续读：不重复旧内容，状态已收敛
+      let after = "";
+      await waitFor(async () => {
+        const probe = await callTool(session.client, "job_output", { job_id: jobId, offset });
+        expectOk(probe);
+        after = textOf(probe);
+        return statusOf(after) === "exited";
+      }, 10_000);
+      expect(bodyOf(after)).not.toContain("before-kill");
+
+      // 从头再读：既有输出仍在缓冲里
+      const replay = await callTool(session.client, "job_output", { job_id: jobId, offset: 0 });
+      expectOk(replay);
+      expect(bodyOf(textOf(replay))).toContain("before-kill");
     },
   );
 });

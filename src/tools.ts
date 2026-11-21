@@ -8,6 +8,7 @@ import type {
   EditResponse,
   GlobResponse,
   GrepResponse,
+  JobKillResponse,
   JobOutputResponse,
   JobStartResponse,
   ReadResponse,
@@ -322,6 +323,35 @@ export function registerTools(server: McpServer, config: AppConfig): void {
           text += `\n\n[下次调用用 offset=${response.next_offset} 继续读取]`;
         }
         return ok(text);
+      } catch (err) {
+        return fail((err as Error).message);
+      }
+    },
+  );
+
+  server.registerTool(
+    "job_kill",
+    {
+      title: "Kill background job",
+      description:
+        "终止后台任务（连同它派生的子进程），立刻返回回执，用 job_output 确认退出。",
+      inputSchema: {
+        job_id: z.string().describe("job_start 返回的 id"),
+      },
+    },
+    async ({ job_id }) => {
+      try {
+        const response = await getExecutor().request<JobKillResponse>({
+          op: "job_kill",
+          job_id,
+        });
+        if (!response.ok) return fail(response.error);
+        const head = [`killed: ${response.killed}`, `status: ${response.status}`];
+        if (response.exit_code !== null) head.push(`exit_code: ${response.exit_code}`);
+        const note = response.killed
+          ? `已终止 ${response.job_id} 的进程树。用 job_output 确认退出码。`
+          : `${response.job_id} 已经结束（exit_code: ${response.exit_code}），无需终止。`;
+        return ok(`${head.join("\n")}\n\n${note}`);
       } catch (err) {
         return fail((err as Error).message);
       }

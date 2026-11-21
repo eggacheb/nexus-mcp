@@ -127,8 +127,20 @@ export interface JobOutputSuccess {
   omitted_bytes: number;
 }
 
+export interface JobKillSuccess {
+  ok: true;
+  job_id: string;
+  /** true 表示本次调用发出了终止；false 表示任务在调用前已经结束 */
+  killed: boolean;
+  /** 回执时刻的状态：killed=true 时为 running，退出靠后续 job_output 轮询 */
+  status: "running" | "exited";
+  /** 已结束任务的退出码；killed=true 时为 null */
+  exit_code: number | null;
+}
+
 export type JobStartResponse = JobStartSuccess | ExecutorFailure;
 export type JobOutputResponse = JobOutputSuccess | ExecutorFailure;
+export type JobKillResponse = JobKillSuccess | ExecutorFailure;
 
 /** 执行器二进制路径；NEXUS_MCP_EXECUTOR 可覆盖（测试用来注入假执行器） */
 export function executorBinaryPath(): string {
