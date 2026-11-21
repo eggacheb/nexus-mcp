@@ -1,3 +1,4 @@
+import { expectOk } from "./support/tool.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -81,7 +82,7 @@ describe("edit 工具", () => {
         old_string: "beta",
         new_string: "BETA",
       });
-      expect(result.isError).toBeFalsy();
+      expectOk(result);
       expect(textOf(result)).toContain("第 2 行");
       expect(readRaw("unique.txt")).toBe("alpha\nBETA\ngamma\n");
     },
@@ -97,7 +98,7 @@ describe("edit 工具", () => {
         old_string: "fn a() {\n    body();\n}",
         new_string: "fn a() {\n    body(1);\n}",
       });
-      expect(result.isError).toBeFalsy();
+      expectOk(result);
       expect(textOf(result)).toContain("第 1-3 行");
       expect(readRaw("block.txt")).toBe("fn a() {\n    body(1);\n}\nfn b() {\n}\n");
     },
@@ -165,7 +166,7 @@ describe("edit 工具", () => {
         new_string: "y",
         replace_all: true,
       });
-      expect(result.isError).toBeFalsy();
+      expectOk(result);
       expect(textOf(result)).toContain("替换 3 处");
       expect(readRaw("all.txt")).toBe("y\ny\ny\n");
     },
@@ -181,7 +182,7 @@ describe("edit 工具", () => {
         old_string: "let a = 1;\nlet b = 2;",
         new_string: "let a = 10;\nlet b = 20;",
       });
-      expect(result.isError).toBeFalsy();
+      expectOk(result);
       expect(readRaw("fuzzy.txt")).toBe("let a = 10;\nlet b = 20;\n");
     },
   );
@@ -212,7 +213,7 @@ describe("edit 工具", () => {
         old_string: "second",
         new_string: "2nd",
       });
-      expect(result.isError).toBeFalsy();
+      expectOk(result);
       expect(readBytes("crlf.txt")).toEqual(Buffer.from("第一行\r\n2nd\r\nthird\r\n", "utf8"));
     },
   );
@@ -227,7 +228,7 @@ describe("edit 工具", () => {
         old_string: "two",
         new_string: "TWO",
       });
-      expect(first.isError).toBeFalsy();
+      expectOk(first);
       expect(readBytes("mixed.txt")).toEqual(Buffer.from("one\r\nTWO\nthree\r\n", "utf8"));
 
       // 跨行替换：保留的行逐字节沿用原行尾，新插入的行继承区域行尾
@@ -236,7 +237,7 @@ describe("edit 工具", () => {
         old_string: "one\r\nTWO",
         new_string: "one\r\nTWO\r\n1.5",
       });
-      expect(second.isError).toBeFalsy();
+      expectOk(second);
       expect(readBytes("mixed.txt")).toEqual(
         Buffer.from("one\r\nTWO\r\n1.5\nthree\r\n", "utf8"),
       );
@@ -253,7 +254,7 @@ describe("edit 工具", () => {
         old_string: "旧标题",
         new_string: "新标题",
       });
-      expect(result.isError).toBeFalsy();
+      expectOk(result);
       const raw = readBytes("utf8.txt");
       expect(raw.equals(Buffer.from("标题：新标题\n正文：第一段\n", "utf8"))).toBe(true);
       expect(raw.toString("utf8")).not.toContain("\uFFFD");

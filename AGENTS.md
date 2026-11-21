@@ -29,13 +29,15 @@
 
 ## 约定
 
-- 工具输出与子进程一律强制 UTF-8：Git Bash 设 `LANG=zh_CN.UTF-8`、`LC_ALL=C.UTF-8`、`MSYS_NO_PATHCONV=1`；pwsh 7 设 `[Console]::OutputEncoding`。
+- 工具输出与子进程一律强制 UTF-8：Git Bash 设 `LANG=zh_CN.UTF-8`、`LC_ALL=C.UTF-8`、`MSYS_NO_PATHCONV=1`；pwsh 7 设 `[Console]::OutputEncoding`。`tasklist`/`taskkill` 这类只做 ASCII 匹配的系统工具除外。
+- 本机出网走系统代理（`HTTPS_PROXY` 等指向本地代理）。Node 24 的 fetch 默认不理会这些环境变量：需要公网请求的代码开 `NODE_USE_ENV_PROXY=1`（服务入口 `src/index.ts` 已开），别裸写直连探测。
+- 测试不得依赖机器状态：stdio 测试自带 `NEXUS_MCP_CONFIG` 隔离配置（裸读仓库根的 config.json 会被部署配置带偏），隧道用例用 `NEXUS_TUNNEL_EXTERNAL=off` / `isRunningExternal` 桩与真隧道隔离。
 - 路径一律相对沙箱根目录解析，越界直接报错，不做「尽力而为」的修补。
 - 工具描述写给人看，不带治理元数据，不出现 `providerId`、`rpcMethod`、`safetyClassification` 这类字段。
 - 新增工具先写失败的测试再写实现，不从实现反推测试。
 - cargo 测试里真实 spawn 子进程的用例要在模块内串行（形状照 `jobs_tests.rs` 的 SPAWN_LOCK），否则并行负载会挤爆既有的时序断言。
 - 票做完在 Comments 注明每条验收清单对应哪个测试用例；没有断言的验收线不算过。
-- 跑 vitest / cargo test / `npm run check` 这类长命令用 `& scripts/run-logged.ps1 { <命令> }`：输出落 %TEMP% 日志，只回显结尾、汇总行与退出码。
+- 跑 vitest / cargo test / `npm run check` 这类长命令用 `& scripts/run-logged.ps1 { <命令> }`：输出落 %TEMP% 日志，只回显结尾、汇总行与退出码。一次只包一条命令，多条语句串进同一个脚本块会吞掉汇总行。
 - vitest 固定走 vmThreads 池（`package.json` 的 test 脚本带 `--pool=vmThreads`）：Node 24.12 上默认池把 runner chunk 装载成两份，`describe()` 直接崩。VM 上下文里 `fetch` 等原生 API 抛的异常来自主 realm，`toBeInstanceOf(Error)` 这类跨 realm 断言会假阴性——断言错误形状（message 内容），别断言构造器。
 - 走 HTTP 的测试（`tests/support/server.ts` 的 `startServer`）spawn 的是真实的 `dist/index.js`：改完 src 先 `npm run build` 再跑 vitest，否则测的是旧产物；直接 import src 的 provider 级测试不受影响。
 

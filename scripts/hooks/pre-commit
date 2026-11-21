@@ -13,8 +13,25 @@ if [ -n "$blocked" ]; then
   exit 1
 fi
 
+# 票 10 复盘：stdio 测试必须自带 NEXUS_MCP_CONFIG。
+# 直接构造 StdioClientTransport 却不带配置的测试会裸读仓库根的 config.json——
+# 部署配置一旦存在（root 不是项目根），相对路径用例全被带偏（票 10 实测）。
+# 统一走 tests/support/server.ts 的 startServer 不受此限（它自己写隔离配置）。
+bad_tests=""
+for f in tests/*.test.ts; do
+  if grep -q "new StdioClientTransport" "$f" && ! grep -q "NEXUS_MCP_CONFIG" "$f"; then
+    bad_tests="$bad_tests $f"
+  fi
+done
+if [ -n "$bad_tests" ]; then
+  echo "pre-commit: 以下测试直接构造 StdioClientTransport 但没带 NEXUS_MCP_CONFIG：" >&2
+  printf '%s\n' $bad_tests | sed 's/^/  - /' >&2
+  echo "用临时目录配置（writeTempConfig / mkdtemp + config.json）经 env 传入，见 mcp.test.ts 的写法。" >&2
+  exit 1
+fi
+
 # 票 08 复盘：提交前快速检查（约 10 秒），全量检查在 pre-push
 cd "$(git rev-parse --show-toplevel)" || exit 1
-echo "pre-commit: typecheck + cargo check"
+echo "pre-commit: stdio-config check + typecheck + cargo check"
 npm run typecheck || exit 1
 cargo check --manifest-path crates/executor/Cargo.toml || exit 1

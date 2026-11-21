@@ -1,3 +1,4 @@
+import { expectOk } from "./support/tool.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -129,7 +130,7 @@ describe("glob/grep 工具", () => {
     { timeout: 15_000 },
     async () => {
       const result = await callGlob(session.client, { pattern: "*.txt", path: "sort" });
-      expect(result.isError).toBeFalsy();
+      expectOk(result);
       expect(pathLines(result)).toEqual(["sort/c.txt", "sort/b.txt", "sort/a.txt"]);
     },
   );
@@ -139,7 +140,7 @@ describe("glob/grep 工具", () => {
     { timeout: 15_000 },
     async () => {
       const result = await callGlob(session.client, { pattern: "**/*.ts" });
-      expect(result.isError).toBeFalsy();
+      expectOk(result);
       const paths = pathLines(result);
       expect(paths).toContain("src/app.ts");
       expect(paths).toContain("src/util.ts");
@@ -153,7 +154,7 @@ describe("glob/grep 工具", () => {
     { timeout: 15_000 },
     async () => {
       const inside = await callGlob(session.client, { pattern: "*.md", path: "docs" });
-      expect(inside.isError).toBeFalsy();
+      expectOk(inside);
       expect(pathLines(inside)).toEqual(["docs/readme.md"]);
 
       const dotdot = await callGlob(session.client, { pattern: "*.md", path: "../" });
@@ -189,7 +190,7 @@ describe("glob/grep 工具", () => {
         }
         if (linked) {
           const result = await callGlob(session.client, { pattern: "**/*.txt" });
-          expect(result.isError).toBeFalsy();
+          expectOk(result);
           expect(textOf(result)).not.toContain("leakdir");
           expect(textOf(result)).not.toContain("secret.txt");
         }
@@ -206,7 +207,7 @@ describe("glob/grep 工具", () => {
     { timeout: 30_000 },
     async () => {
       const result = await callGrep(session.client, { pattern: "world" });
-      expect(result.isError).toBeFalsy();
+      expectOk(result);
       expect(textOf(result)).toContain("src/app.ts:3: const world = 1;");
     },
   );
@@ -216,7 +217,7 @@ describe("glob/grep 工具", () => {
     { timeout: 30_000 },
     async () => {
       const result = await callGrep(session.client, { pattern: "hello", glob: "*.md" });
-      expect(result.isError).toBeFalsy();
+      expectOk(result);
       expect(textOf(result)).toContain("docs/readme.md:2: hello markdown");
       expect(textOf(result)).not.toContain("src/app.ts");
     },
@@ -227,14 +228,14 @@ describe("glob/grep 工具", () => {
     { timeout: 30_000 },
     async () => {
       const sensitive = await callGrep(session.client, { pattern: "hello mixed" });
-      expect(sensitive.isError).toBeFalsy();
+      expectOk(sensitive);
       expect(textOf(sensitive)).toContain("没有匹配");
 
       const insensitive = await callGrep(session.client, {
         pattern: "hello mixed",
         ignore_case: true,
       });
-      expect(insensitive.isError).toBeFalsy();
+      expectOk(insensitive);
       expect(textOf(insensitive)).toContain("src/app.ts:4: Hello Mixed Case");
     },
   );
@@ -266,14 +267,14 @@ describe("glob/grep 工具", () => {
     { timeout: 15_000 },
     async () => {
       const globResult = await callGlob(session.client, { pattern: "*.txt", path: "many" });
-      expect(globResult.isError).toBeFalsy();
+      expectOk(globResult);
       expect(pathLines(globResult)).toHaveLength(100);
       const globText = textOf(globResult);
       expect(globText).toContain("共 120 个");
       expect(globText).toContain("还有更多");
 
       const grepResult = await callGrep(session.client, { pattern: "needle" });
-      expect(grepResult.isError).toBeFalsy();
+      expectOk(grepResult);
       const grepText = textOf(grepResult);
       const grepLines = grepText.split("\n");
       // 100 条匹配行 + 尾注前的空行 + 尾注
@@ -289,11 +290,11 @@ describe("glob/grep 工具", () => {
     { timeout: 15_000 },
     async () => {
       const globResult = await callGlob(session.client, { pattern: "zzz-*.nomatch" });
-      expect(globResult.isError).toBeFalsy();
+      expectOk(globResult);
       expect(textOf(globResult)).toContain("没有匹配");
 
       const grepResult = await callGrep(session.client, { pattern: "nomatch-zzz-xyz" });
-      expect(grepResult.isError).toBeFalsy();
+      expectOk(grepResult);
       expect(textOf(grepResult)).toContain("没有匹配");
     },
   );
@@ -303,7 +304,7 @@ describe("glob/grep 工具", () => {
     { timeout: 30_000 },
     async () => {
       const result = await callGrep(session.client, { pattern: "hello" });
-      expect(result.isError).toBeFalsy();
+      expectOk(result);
       const text = textOf(result);
       expect(text).toContain("src/app.ts:1: const hello = 'app';");
       expect(text).toContain("src/util.ts:1: export function hello() {}");

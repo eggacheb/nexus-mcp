@@ -1,3 +1,4 @@
+import { expectOk } from "./support/tool.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -103,7 +104,7 @@ describe("命令闸门（默认配置：仅内置危险表）", () => {
 
   it("未命中危险表的命令照常执行", { timeout: 15_000 }, async () => {
     const result = await callTool(session.client, "bash", { command: "echo hello-nexus" });
-    expect(result.isError).toBeFalsy();
+    expectOk(result);
     expect(textOf(result)).toContain("exit_code: 0");
     expect(textOf(result)).toContain("hello-nexus");
   });
@@ -132,7 +133,7 @@ describe("命令闸门（白名单）", () => {
       const session = await connectStdio({ NEXUS_MCP_CONFIG: config.path });
       try {
         const allowed = await callTool(session.client, "bash", { command: "echo whitelisted" });
-        expect(allowed.isError).toBeFalsy();
+        expectOk(allowed);
         expect(textOf(allowed)).toContain("whitelisted");
 
         const denied = await callTool(session.client, "bash", { command: "curl https://example.com" });
@@ -158,7 +159,7 @@ describe("命令闸门（白名单）", () => {
       const session = await connectStdio({ NEXUS_MCP_CONFIG: config.path });
       try {
         const result = await callTool(session.client, "bash", { command: "pwd" });
-        expect(result.isError).toBeFalsy();
+        expectOk(result);
         expect(textOf(result)).toContain("exit_code: 0");
       } finally {
         await session.close();

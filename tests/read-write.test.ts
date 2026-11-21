@@ -1,3 +1,4 @@
+import { expectOk } from "./support/tool.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -118,7 +119,7 @@ describe("read/write 工具", () => {
       const file = path.join(root, "numbered.txt");
       writeFileSync(file, "alpha\nbeta\ngamma\n", "utf8");
       const result = await callRead(session.client, { path: "numbered.txt" });
-      expect(result.isError).toBeFalsy();
+      expectOk(result);
       const text = textOf(result);
       expect(text).toMatch(/1\talpha/);
       expect(text).toMatch(/2\tbeta/);
@@ -134,7 +135,7 @@ describe("read/write 工具", () => {
       const lines = Array.from({ length: 10 }, (_, i) => `第${i + 1}行`);
       writeFileSync(file, lines.join("\n") + "\n", "utf8");
       const result = await callRead(session.client, { path: "sliced.txt", offset: 4, limit: 3 });
-      expect(result.isError).toBeFalsy();
+      expectOk(result);
       const text = textOf(result);
       expect(text).toMatch(/4\t第4行/);
       expect(text).toMatch(/6\t第6行/);
@@ -150,20 +151,20 @@ describe("read/write 工具", () => {
       const file = path.join(root, "tail.txt");
       writeFileSync(file, "一\n二\n三\n", "utf8");
       const partial = await callRead(session.client, { path: "tail.txt", offset: 2, limit: 50 });
-      expect(partial.isError).toBeFalsy();
+      expectOk(partial);
       const text = textOf(partial);
       expect(text).toMatch(/2\t二/);
       expect(text).toMatch(/3\t三/);
       expect(text).not.toMatch(/1\t一/);
 
       const beyond = await callRead(session.client, { path: "tail.txt", offset: 99 });
-      expect(beyond.isError).toBeFalsy();
+      expectOk(beyond);
       expect(textOf(beyond)).toMatch(/共 3 行/);
       expect(textOf(beyond)).toContain("99");
 
       writeFileSync(path.join(root, "empty.txt"), "", "utf8");
       const empty = await callRead(session.client, { path: "empty.txt" });
-      expect(empty.isError).toBeFalsy();
+      expectOk(empty);
       expect(textOf(empty)).toContain("空文件");
     },
   );
@@ -176,7 +177,7 @@ describe("read/write 工具", () => {
       const lines = Array.from({ length: 2100 }, (_, i) => `line-${i + 1}`);
       writeFileSync(file, lines.join("\n") + "\n", "utf8");
       const result = await callRead(session.client, { path: "big.txt" });
-      expect(result.isError).toBeFalsy();
+      expectOk(result);
       const text = textOf(result);
       expect(text).toMatch(/2000\tline-2000/);
       expect(text).not.toContain("line-2001");
@@ -212,13 +213,13 @@ describe("read/write 工具", () => {
         path: target,
         content: "第一行\r\nsecond line\r\n",
       });
-      expect(written.isError).toBeFalsy();
+      expectOk(written);
       expect(readFileSync(path.join(root, target))).toEqual(
         Buffer.from("第一行\r\nsecond line\r\n", "utf8"),
       );
 
       const overwrite = await callWrite(session.client, { path: target, content: "only" });
-      expect(overwrite.isError).toBeFalsy();
+      expectOk(overwrite);
       expect(readFileSync(path.join(root, target), "utf8")).toBe("only");
     },
   );
@@ -292,24 +293,24 @@ describe("read/write 工具", () => {
     async () => {
       mkdirSync(path.join(root, "sub"), { recursive: true });
       const written = await callWrite(session.client, { path: "sub\\back.txt", content: "反斜杠内容" });
-      expect(written.isError).toBeFalsy();
+      expectOk(written);
       expect(existsSync(path.join(root, "sub", "back.txt"))).toBe(true);
 
       const absBackslash = await callRead(session.client, {
         path: path.join(root, "sub", "back.txt"),
       });
-      expect(absBackslash.isError).toBeFalsy();
+      expectOk(absBackslash);
       expect(textOf(absBackslash)).toContain("反斜杠内容");
 
       const forwardSlash = await callRead(session.client, {
         path: root.replace(/\\/g, "/") + "/sub/back.txt",
       });
-      expect(forwardSlash.isError).toBeFalsy();
+      expectOk(forwardSlash);
       expect(textOf(forwardSlash)).toContain("反斜杠内容");
 
       // .. 留在根内时放行
       const inner = await callRead(session.client, { path: "sub\\..\\crlf.txt" });
-      expect(inner.isError).toBeFalsy();
+      expectOk(inner);
       expect(textOf(inner)).toContain("only");
     },
   );

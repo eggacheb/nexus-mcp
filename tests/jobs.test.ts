@@ -1,3 +1,4 @@
+import { expectOk } from "./support/tool.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -156,7 +157,7 @@ describe("job_start / job_output 工具", () => {
       const started = Date.now();
       const result = await callTool(session.client, "job_start", { command: "sleep 3" });
       const elapsed = Date.now() - started;
-      expect(result.isError).toBeFalsy();
+      expectOk(result);
       expect(elapsed).toBeLessThan(2_000);
       const jobId = jobIdOf(textOf(result));
       expect(jobId).toMatch(/^job-\d+$/);
@@ -165,13 +166,13 @@ describe("job_start / job_output 工具", () => {
       const warmStart = Date.now();
       const warm = await callTool(session.client, "job_start", { command: "sleep 5" });
       const warmElapsed = Date.now() - warmStart;
-      expect(warm.isError).toBeFalsy();
+      expectOk(warm);
       expect(jobIdOf(textOf(warm))).toMatch(/^job-\d+$/);
       expect(warmElapsed).toBeLessThan(200);
 
       // 立刻查询：命令明明要跑 3 秒，此刻必须还在运行
       const probe = await callTool(session.client, "job_output", { job_id: jobId });
-      expect(probe.isError).toBeFalsy();
+      expectOk(probe);
       expect(statusOf(textOf(probe))).toBe("running");
     },
   );
@@ -182,8 +183,8 @@ describe("job_start / job_output 工具", () => {
     async () => {
       const first = await callTool(session.client, "job_start", { command: "echo quick-a" });
       const second = await callTool(session.client, "job_start", { command: "echo quick-b" });
-      expect(first.isError).toBeFalsy();
-      expect(second.isError).toBeFalsy();
+      expectOk(first);
+      expectOk(second);
       expect(jobIdOf(textOf(first))).not.toBe(jobIdOf(textOf(second)));
     },
   );
@@ -195,14 +196,14 @@ describe("job_start / job_output 工具", () => {
       const start = await callTool(session.client, "job_start", {
         command: "echo chunk-1; sleep 0.5; echo chunk-2; sleep 0.5; echo chunk-3",
       });
-      expect(start.isError).toBeFalsy();
+      expectOk(start);
       const jobId = jobIdOf(textOf(start));
 
       // 轮询到第一段输出出现（任务仍在运行）
       let text = "";
       await waitFor(async () => {
         const probe = await callTool(session.client, "job_output", { job_id: jobId });
-        expect(probe.isError).toBeFalsy();
+        expectOk(probe);
         text = textOf(probe);
         return bodyOf(text).includes("chunk-1");
       }, 5_000);
@@ -215,7 +216,7 @@ describe("job_start / job_output 工具", () => {
       let second!: ToolResult;
       await waitFor(async () => {
         second = await callTool(session.client, "job_output", { job_id: jobId, offset: offset1 });
-        expect(second.isError).toBeFalsy();
+        expectOk(second);
         return bodyOf(textOf(second)).includes("chunk-2");
       }, 10_000);
       const secondBody = bodyOf(textOf(second));
@@ -227,7 +228,7 @@ describe("job_start / job_output 工具", () => {
       let third!: ToolResult;
       await waitFor(async () => {
         third = await callTool(session.client, "job_output", { job_id: jobId, offset: offset2 });
-        expect(third.isError).toBeFalsy();
+        expectOk(third);
         return bodyOf(textOf(third)).includes("chunk-3");
       }, 10_000);
       const thirdBody = bodyOf(textOf(third));
@@ -237,7 +238,7 @@ describe("job_start / job_output 工具", () => {
       // 任务结束后：最终状态 + 退出码 + 完整输出可反复查看
       await waitFor(async () => {
         const probe = await callTool(session.client, "job_output", { job_id: jobId });
-        expect(probe.isError).toBeFalsy();
+        expectOk(probe);
         text = textOf(probe);
         return statusOf(text) === "exited";
       }, 10_000);
@@ -252,12 +253,12 @@ describe("job_start / job_output 工具", () => {
       const start = await callTool(session.client, "job_start", {
         command: "echo bad-output >&2; exit 3",
       });
-      expect(start.isError).toBeFalsy();
+      expectOk(start);
       const jobId = jobIdOf(textOf(start));
       let text = "";
       await waitFor(async () => {
         const probe = await callTool(session.client, "job_output", { job_id: jobId });
-        expect(probe.isError).toBeFalsy();
+        expectOk(probe);
         text = textOf(probe);
         return statusOf(text) === "exited";
       }, 10_000);
@@ -283,12 +284,12 @@ describe("job_start / job_output 工具", () => {
     { timeout: 30_000 },
     async () => {
       const start = await callTool(session.client, "job_start", { command: "seq 1 20000" });
-      expect(start.isError).toBeFalsy();
+      expectOk(start);
       const jobId = jobIdOf(textOf(start));
       let text = "";
       await waitFor(async () => {
         const probe = await callTool(session.client, "job_output", { job_id: jobId });
-        expect(probe.isError).toBeFalsy();
+        expectOk(probe);
         text = textOf(probe);
         return statusOf(text) === "exited";
       }, 15_000);
@@ -296,7 +297,7 @@ describe("job_start / job_output 工具", () => {
 
       // 头部：不出现省略标记
       const head = await callTool(session.client, "job_output", { job_id: jobId, offset: 0 });
-      expect(head.isError).toBeFalsy();
+      expectOk(head);
       expect(bodyOf(textOf(head))).not.toBe("");
       expect(textOf(head)).not.toContain("bytes omitted");
       expect(bodyOf(textOf(head))).toMatch(/^1\n/);
@@ -312,7 +313,7 @@ describe("job_start / job_output 工具", () => {
           expect(body).toMatch(/\.\.\. \d+ bytes omitted \.\.\./);
         }
         const step = await callTool(session.client, "job_output", { job_id: jobId, offset: nextOffsetOf(text2) });
-        expect(step.isError).toBeFalsy();
+        expectOk(step);
         text2 = textOf(step);
       }
       expect(sawMarker).toBe(true);
@@ -345,7 +346,7 @@ describe("job_start / job_output 工具", () => {
         const start = await callTool(orphanSession.client, "job_start", {
           command: `./${SENTRY_IMAGE} 300`,
         });
-        expect(start.isError).toBeFalsy();
+        expectOk(start);
         await waitFor(async () => sentryProcessCount() === baseline + 1, 10_000);
 
         // 服务退出（transport close 会终止 dist 进程 → 执行器 stdin 收到 EOF → 清理后台任务）

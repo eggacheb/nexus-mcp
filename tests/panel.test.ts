@@ -1,3 +1,4 @@
+import { expectOk } from "./support/tool.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -257,7 +258,7 @@ describe("本地控制面板", () => {
 
         const { client, transport } = await connectClient(server.mcpUrl);
         const inside = await client.callTool({ name: "read", arguments: { path: file } });
-        expect(inside.isError).toBeFalsy();
+        expectOk(inside);
 
         const outside = await client.callTool({
           name: "read",

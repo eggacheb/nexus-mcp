@@ -1,3 +1,4 @@
+import { expectOk } from "./support/tool.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -99,7 +100,7 @@ describe("bash 工具", () => {
     { timeout: 15_000 },
     async () => {
       const result = await callBash(session.client, { command: "echo hello-nexus" });
-      expect(result.isError).toBeFalsy();
+      expectOk(result);
       const text = textOf(result);
       expect(text).toContain("exit_code: 0");
       expect(text).toContain("hello-nexus");
@@ -111,7 +112,7 @@ describe("bash 工具", () => {
     { timeout: 15_000 },
     async () => {
       const result = await callBash(session.client, { command: "pwd", cwd: "docs" });
-      expect(result.isError).toBeFalsy();
+      expectOk(result);
       expect(textOf(result)).toContain("docs");
     },
   );
@@ -123,7 +124,7 @@ describe("bash 工具", () => {
       const result = await callBash(session.client, {
         command: "echo 到标准错误 >&2; printf '到标准输出'; exit 3",
       });
-      expect(result.isError).toBeFalsy();
+      expectOk(result);
       const text = textOf(result);
       expect(text).toContain("exit_code: 3");
       expect(text).toContain("到标准错误");
@@ -136,7 +137,7 @@ describe("bash 工具", () => {
     { timeout: 15_000 },
     async () => {
       const result = await callBash(session.client, { command: "echo 你好，世界" });
-      expect(result.isError).toBeFalsy();
+      expectOk(result);
       expect(textOf(result)).toContain("你好，世界");
     },
   );
@@ -148,7 +149,7 @@ describe("bash 工具", () => {
       const result = await callBash(session.client, {
         command: 'echo "$LANG|$LC_ALL|$MSYS_NO_PATHCONV"',
       });
-      expect(result.isError).toBeFalsy();
+      expectOk(result);
       expect(textOf(result)).toContain("zh_CN.UTF-8|C.UTF-8|1");
     },
   );
@@ -160,7 +161,7 @@ describe("bash 工具", () => {
       const started = Date.now();
       const result = await callBash(session.client, { command: "sleep 5", timeout_ms: 1000 });
       const elapsed = Date.now() - started;
-      expect(result.isError).toBeFalsy();
+      expectOk(result);
       const text = textOf(result);
       expect(text).toContain("timed_out");
       expect(elapsed).toBeLessThan(8_000);
@@ -172,7 +173,7 @@ describe("bash 工具", () => {
     { timeout: 15_000 },
     async () => {
       const result = await callBash(session.client, { command: "seq 1 20000" });
-      expect(result.isError).toBeFalsy();
+      expectOk(result);
       const text = textOf(result);
       expect(text).toContain("bytes omitted");
       expect(text).toContain("1\n2");
@@ -187,7 +188,7 @@ describe("bash 工具", () => {
       const result = await callBash(session.client, {
         command: 'for i in $(seq 1 10000); do echo "第${i}行"; done',
       });
-      expect(result.isError).toBeFalsy();
+      expectOk(result);
       const text = textOf(result);
       expect(text).toContain("bytes omitted");
       expect(text).not.toContain("\uFFFD");
@@ -257,7 +258,7 @@ describe("shell 配置校验", () => {
         const result = await callBash(session.client, {
           command: 'Write-Output "pwsh-中文-7"',
         });
-        expect(result.isError).toBeFalsy();
+        expectOk(result);
         const text = textOf(result);
         expect(text).toContain("exit_code: 0");
         expect(text).toContain("pwsh-中文-7");

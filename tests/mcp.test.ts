@@ -1,3 +1,4 @@
+import { expectOk } from "./support/tool.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -75,6 +76,6 @@ describe("沙箱边界", () => {
       name: "read",
       arguments: { path: "package.json" },
     });
-    expect(result.isError).toBeFalsy();
+    expectOk(result);
   });
 });

@@ -1,3 +1,4 @@
+import { expectOk } from "./support/tool.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -104,7 +105,7 @@ describe("HTTP 传输（配置了令牌）", () => {
         name: "read",
         arguments: { path: "package.json" },
       });
-      expect(result.isError).toBeFalsy();
+      expectOk(result);
       expect(textOf(result)).toContain('"name": "nexus-mcp"');
 
       await transport.terminateSession();
@@ -183,7 +184,7 @@ describe("HTTP 传输（配置了令牌）", () => {
         name: "read",
         arguments: { path: "AGENTS.md" },
       });
-      expect(afterClose.isError).toBeFalsy();
+      expectOk(afterClose);
       expect(textOf(afterClose)).toContain("8 个工具");
 
       await second.transport.terminateSession();
