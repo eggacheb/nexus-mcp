@@ -36,6 +36,30 @@
 
 字段全表与校验规则见 `src/config.ts`。
 
+## 分发
+
+打包机需要 Rust 与 Node 24；目标机器什么都不用装。
+
+```bash
+npm run package        # 约 25 秒：esbuild 打 CJS → SEA 注入 → zip → NSIS 安装包
+npm run package:smoke  # 拿刚出的产物在最小环境里自检：启动、连上、read、面板
+```
+
+产物落在 `release/`（不进版本库），文件名里的版本号取自 `package.json`：
+
+| 文件 | 大小 | 说明 |
+|---|---|---|
+| `nexus-mcp_<版本>_x64-setup.exe` | 22.4MB | NSIS 安装包，按用户装到 `%LOCALAPPDATA%\Programs\nexus-mcp`，桌面 + 开始菜单快捷方式，卸载入口进「应用和功能」 |
+| `nexus-mcp-<版本>-win64.zip` | 34.2MB | 绿色版，四个文件平铺：`nexus-mcp.exe`、`nexus-executor.exe`、`启动.cmd`、`使用说明.txt` |
+
+发给别人之前要知道的：
+
+1. 都没有签名，SmartScreen 首次会拦一次（「更多信息 → 仍要运行」），企业策略可能直接拦掉。要正经发就得买代码签名证书。
+2. 两个 exe 必须在同一目录：`nexus-mcp.exe` 找不到 `nexus-executor.exe` 时，只有文件类工具能用，报错里会指出缺哪个文件。
+3. 覆盖安装会先 `taskkill` 掉正在跑的 `nexus-mcp.exe` / `nexus-executor.exe`；卸载只删程序文件，`config.json` 与 `workspace` 留着。
+4. 第一次打包要联网取 NSIS 3.11（2.4MB，脚本里钉了 SHA-256 校验）；内网机器可以用 `NEXUS_NSIS_DIR` 指向已解压的 NSIS 目录跳过下载。
+5. 默认 MCP 端口 8787、面板 8788；目标机器上被占了就改 `config.json` 的 `port` / `panelPort`。
+
 ## 开发
 
 ```bash
