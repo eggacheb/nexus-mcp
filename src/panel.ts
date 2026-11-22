@@ -668,19 +668,42 @@ function runPowerShell(script: string): Promise<string> {
 /**
  * 弹系统文件夹选择框（Windows）。用户取消时返回空串。
  * 面板在浏览器里，浏览器给不了本地绝对路径，只能借系统对话框。
+ *
+ * 必须把对话框绑到当前前台窗口当 owner：隐藏进程弹的「孤儿」对话框 z-order 会落到
+ * 浏览器后面，用户得先把浏览器缩下去才看得见（2026-11-22 实测反馈）。
  */
 async function pickFolder(initial: string): Promise<string> {
   // 单引号字符串里 PowerShell 不展开变量，只要把 ' 变成 ''
   const escaped = initial.replace(/'/g, "''");
   const script = [
     "[Console]::OutputEncoding = [Text.Encoding]::UTF8",
-    "Add-Type -AssemblyName System.Windows.Forms | Out-Null",
+    "Add-Type -AssemblyName System.Windows.Forms",
+    "Add-Type -TypeDefinition @'",
+    "using System;",
+    "using System.Runtime.InteropServices;",
+    "using System.Windows.Forms;",
+    "public static class NexusWin32 {",
+    '  [DllImport("user32.dll")]',
+    "  public static extern IntPtr GetForegroundWindow();",
+    "}",
+    "public class NexusOwner : IWin32Window {",
+    "  private readonly IntPtr handle;",
+    "  public NexusOwner(IntPtr h) { handle = h; }",
+    "  public IntPtr Handle { get { return handle; } }",
+    "}",
+    "'@ -ReferencedAssemblies System.Windows.Forms",
     "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog",
     '$dialog.Description = "选择 nexus-mcp 的沙箱根目录"',
     `$dialog.SelectedPath = '${escaped}'`,
     "$dialog.ShowNewFolderButton = $true",
-    "if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $dialog.SelectedPath }",
-  ].join("; ");
+    "$owner = [NexusWin32]::GetForegroundWindow()",
+    "if ($owner -ne [IntPtr]::Zero) {",
+    "  $result = $dialog.ShowDialog([NexusOwner]::new($owner))",
+    "} else {",
+    "  $result = $dialog.ShowDialog()",
+    "}",
+    "if ($result -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $dialog.SelectedPath }",
+  ].join("\n");
   return runPowerShell(script);
 }
 
