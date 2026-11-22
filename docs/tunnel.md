@@ -47,15 +47,27 @@ cloudflared（本机进程，面板可启停）
 - **公网地址**显示（`config.json` 的 `tunnelUrl`）；
 - **启动 / 停止隧道**按钮：直接拉起/结束 cloudflared 进程，结果即时反映在状态块
   的隧道灯上；
-- **检测可达性**按钮：向 `https://nexus.maliy.top/health` 发一次真实请求；
-- 状态灯语义：
-  - 绿「在线」= 进程在跑且公网可达；
-  - 绿「运行中」= 进程在跑但没配 tunnelUrl，无法探公网（正常部署不会出现）；
+- **检测可达性**按钮：向 `https://nexus.maliy.top/health` 发一次真实请求，显示状态码
+  与往返毫秒数。**这个按钮不影响状态灯**；
+- 状态灯语义（主信号是 cloudflared 自己的就绪连接，不是公网往返）：
+  - 绿「在线」= `GET 127.0.0.1:20241/ready` 返回 `readyConnections > 0`；
+  - 黄「连接中」= cloudflared 在跑，但就绪连接是 0（还在连边缘，或边缘连接全断了）；
+  - 黄「运行中」= 进程在跑但 metrics 端口探不到（外部拉起没开 metrics、端口被改过），
+    这时不报红——探不到不等于不通；
   - 红「离线」= 进程没跑（附退出码）；
-  - 红「异常」= 进程在跑但公网探测非 200（隧道没连上边缘、ingress 指错地方，或后面的服务挂了）；
-  - 黄「不可用」= cloudflared 或 config.yml 路径失效；
-  - 黄「未配置」= config.json 没有 tunnel 段 / tunnelUrl；
+  - 黄「不可用」= cloudflared 或 config.yml 路径失效（这条排在探测之前，先报能修的配置问题）；
+  - 黄「未启用管理」= config.json 没有 tunnel 段（只填 tunnelUrl 也算），面板不给灯的结论；
 - 卡片下方显示 pid、退出码与 cloudflared 日志最后几行（排障用）。
+
+### 为什么状态灯不再看公网往返（2026-11-22 改）
+
+旧实现每 5 秒 `fetch https://nexus.maliy.top/health`，2 秒超时就判定「公网不通」。
+实测同一时刻：本地 `/ready` 1.2 毫秒、公网往返 2.1 秒，且 6 次抽样在 0.86-3.48 秒之间
+波动——超时线正好落在波动区间里，于是灯在两三秒一轮的红绿之间反复跳。
+
+根子是这条探测路径要绕经系统代理（注 2），而代理状态跟隧道通不通没有因果关系。
+现在公网探测只在手动点按钮时跑（超时放宽到 8 秒），状态灯只看本地就绪连接。
+`readyConnections` 由 cloudflared 自己维护，是「隧道真的连着 Cloudflare 边缘」的直接证据。
 
 对应 API：`POST /api/tunnel`，body `{"action":"start"|"stop"|"probe"}`，只接受本机
 面板来源（跨站写一律 403）。

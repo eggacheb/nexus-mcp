@@ -1,3 +1,4 @@
+import { execFile } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import http from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -8,7 +9,8 @@ import { readBody, sendJson as sendJsonRaw } from "./httpHelpers.js";
 import { log, recentLogs, redactText } from "./log.js";
 import type { McpService } from "./mcpService.js";
 import type { ComponentStatus, TunnelStatus } from "./status.js";
-import { executorStatus, tunnelStatus } from "./status.js";
+import { executorStatus, probePublicTunnel, tunnelStatus } from "./status.js";
+import { TOOL_SUMMARY } from "./tools.js";
 import type { TunnelManager } from "./tunnel.js";
 import { VERSION } from "./version.js";
 
@@ -26,7 +28,6 @@ export interface PanelStatus {
   executor: ComponentStatus;
   tunnel: TunnelStatus;
   root: string;
-  oauth: { url: string; available: boolean };
   panelPort: number;
   /** 程序版本，页头直接显示；与安装包文件名、package.json 同源 */
   version: string;
@@ -38,6 +39,10 @@ export interface PanelHandle {
   close(): Promise<void>;
 }
 
+const TOOL_ITEMS = TOOL_SUMMARY.map(
+  (tool) => `<li><b>${tool.name}</b><span>${tool.summary}</span></li>`,
+).join("\n      ");
+
 const PAGE = `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -45,133 +50,211 @@ const PAGE = `<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>nexus-mcp 控制面板</title>
 <style>
-  :root { color-scheme: dark; }
+  :root {
+    color-scheme: light;
+    --bg: #f5f6f8; --card: #ffffff; --line: #e4e7ec; --text: #1f2328; --muted: #667085;
+    --brand: #2563eb; --ok: #16a34a; --warn: #d97706; --bad: #dc2626;
+    --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  }
   * { box-sizing: border-box; }
   body {
-    margin: 0; min-height: 100vh; background: #0e1116; color: #e6edf3;
+    margin: 0; min-height: 100vh; background: var(--bg); color: var(--text);
     font: 14px/1.6 system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+    -webkit-font-smoothing: antialiased;
   }
   main {
-    max-width: 1080px; margin: 0 auto; padding: 28px 24px 40px;
-    display: grid; gap: 14px; grid-template-columns: repeat(2, minmax(0, 1fr));
+    max-width: 1440px; margin: 0 auto; padding: 24px 28px 56px;
+    display: grid; gap: 16px; grid-template-columns: repeat(2, minmax(0, 1fr));
   }
-  header { grid-column: 1 / -1; display: flex; align-items: baseline; gap: 12px; }
-  h1 { margin: 0; font-size: 20px; letter-spacing: .3px; }
-  h2 { margin: 0 0 10px; font-size: 13px; font-weight: 600; color: #8b98a8; letter-spacing: .4px; text-transform: uppercase; }
-  h2 small { font-weight: 400; text-transform: none; letter-spacing: 0; }
-  .card { background: #151a21; border: 1px solid #232b36; border-radius: 10px; padding: 16px; }
+  header { grid-column: 1 / -1; display: flex; align-items: baseline; flex-wrap: wrap; gap: 10px; }
+  h1 { margin: 0; font-size: 20px; font-weight: 650; letter-spacing: .2px; }
+  .tag { font-size: 12px; color: var(--muted); }
+  h2 {
+    margin: 0 0 14px; font-size: 12px; font-weight: 600; color: var(--muted);
+    letter-spacing: .6px; text-transform: uppercase;
+  }
+  h2 small { font-weight: 400; text-transform: none; letter-spacing: 0; margin-left: 6px; }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+    padding: 18px 20px; box-shadow: 0 1px 2px rgba(16,24,40,.04);
+  }
   .wide { grid-column: 1 / -1; }
-  .lights { display: grid; gap: 10px; }
-  .light { display: flex; align-items: center; gap: 10px; }
-  .light b { font-weight: 600; }
-  .light small { display: block; color: #8b98a8; font-size: 12px; }
-  .dot { width: 9px; height: 9px; border-radius: 50%; background: #55606e; box-shadow: 0 0 0 4px rgba(85,96,110,.15); flex: none; }
+  .bench {
+    grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center;
+    gap: 18px 26px; background: var(--card); border: 1px solid var(--line);
+    border-radius: 12px; padding: 14px 20px; box-shadow: 0 1px 2px rgba(16,24,40,.04);
+  }
+  .lights { display: flex; flex-wrap: wrap; gap: 8px 28px; flex: 1; min-width: 0; }
+  .light { display: flex; align-items: center; gap: 10px; min-width: 150px; }
+  .light b { display: block; font-weight: 600; font-size: 13px; }
+  .light small { display: block; color: var(--muted); font-size: 12px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: #c4c9d2; flex: none; }
   .light[data-state="up"] .dot,
-  .light[data-state="running"] .dot { background: #3fb950; box-shadow: 0 0 0 4px rgba(63,185,80,.16); }
+  .light[data-state="running"] .dot { background: var(--ok); box-shadow: 0 0 0 4px rgba(22,163,74,.14); }
   .light[data-state="down"] .dot,
-  .light[data-state="stopped"] .dot { background: #f85149; box-shadow: 0 0 0 4px rgba(248,81,73,.16); }
+  .light[data-state="stopped"] .dot { background: var(--bad); box-shadow: 0 0 0 4px rgba(220,38,38,.12); }
+  .light[data-state="connecting"] .dot,
   .light[data-state="unavailable"] .dot,
-  .light[data-state="unconfigured"] .dot { background: #d29922; box-shadow: 0 0 0 4px rgba(210,153,34,.16); }
-  .row { display: flex; gap: 8px; }
+  .light[data-state="unconfigured"] .dot { background: var(--warn); box-shadow: 0 0 0 4px rgba(217,119,6,.12); }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .row + .row { margin-top: 8px; }
+  label { display: block; margin: 12px 0 6px; font-size: 12px; color: var(--muted); }
+  label:first-of-type { margin-top: 0; }
   input {
-    flex: 1; min-width: 0; background: #0e1116; color: #e6edf3; border: 1px solid #2b3440;
-    border-radius: 7px; padding: 8px 10px; font: inherit; font-family: ui-monospace, Consolas, monospace;
+    flex: 1; min-width: 0; background: #fff; color: var(--text);
+    border: 1px solid #d0d5dd; border-radius: 8px; padding: 8px 11px; font: inherit;
+    font-family: var(--mono); font-size: 13px;
   }
+  input:focus { outline: none; border-color: var(--brand); box-shadow: 0 0 0 3px rgba(37,99,235,.14); }
+  input[readonly] { background: #fafbfc; }
   button {
-    background: #1f6feb; color: #fff; border: 0; border-radius: 7px; padding: 8px 14px;
-    font: inherit; cursor: pointer;
+    background: var(--brand); color: #fff; border: 1px solid transparent; border-radius: 8px;
+    padding: 8px 14px; font: inherit; cursor: pointer; white-space: nowrap;
   }
-  button.ghost { background: #21262d; border: 1px solid #30363d; }
-  button:hover { filter: brightness(1.1); }
-  a { color: #58a6ff; }
-  .hint { margin: 8px 0 0; color: #8b98a8; font-size: 12px; }
+  button:hover { filter: brightness(1.05); }
+  button:disabled { opacity: .55; cursor: default; }
+  button.ghost { background: #fff; color: #344054; border-color: #d0d5dd; }
+  button.danger { background: var(--bad); }
+  button[data-armed="1"] { background: #b91c1c; border-color: #b91c1c; }
+  a { color: var(--brand); }
+  a[aria-disabled="true"] { color: var(--muted); pointer-events: none; text-decoration: none; }
+  .hint { margin: 8px 0 0; color: var(--muted); font-size: 12px; }
+  .alert { margin: 0; padding: 10px 14px; border-radius: 9px; font-size: 13px; grid-column: 1 / -1; }
+  .alert[data-kind="error"] { background: #fef2f2; border: 1px solid #fecaca; color: #b91c1c; }
+  .alert[data-kind="ok"] { background: #f0fdf4; border: 1px solid #bbf7d0; color: #15803d; }
   pre {
-    margin: 0; height: 200px; overflow: auto; background: #0b0e12; border: 1px solid #1e252e;
-    border-radius: 7px; padding: 10px; font: 12px/1.55 ui-monospace, Consolas, monospace;
-    white-space: pre-wrap; word-break: break-all; color: #b8c4d0;
+    margin: 0; height: 340px; overflow: auto; background: #fbfcfd; border: 1px solid var(--line);
+    border-radius: 8px; padding: 10px 12px; font: 12px/1.65 var(--mono);
+    white-space: pre-wrap; word-break: break-word; color: #344054;
   }
-  @media (max-width: 720px) { main { grid-template-columns: 1fr; } }
+  pre .ts { color: #98a2b3; }
+  pre .lv-error { color: #b91c1c; }
+  pre .lv-warn { color: #b45309; }
+  .tools { list-style: none; margin: 0; padding: 0; display: grid; gap: 7px; }
+  .tools li { display: flex; gap: 10px; align-items: baseline; font-size: 13px; }
+  .tools b { font-family: var(--mono); font-size: 12px; color: var(--brand); min-width: 82px; }
+  .tools span { color: var(--muted); }
+  #tunnel-tail { height: 96px; margin-top: 10px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; padding: 20px 16px 40px; } }
 </style>
 </head>
 <body>
 <main>
   <header>
     <h1>nexus-mcp</h1>
-    <span class="hint" id="app-version" style="margin:0">v${VERSION}</span>
-    <span class="hint" style="margin:0">本地控制面板 · 停 MCP 服务不影响这块页面</span>
+    <span class="tag" id="app-version">v${VERSION}</span>
+    <span class="tag">本地控制面板 · 停 MCP 服务不影响这块页面</span>
   </header>
 
-  <section class="card" data-block="status">
-    <h2>状态</h2>
+  <p class="alert" id="alert" hidden></p>
+
+  <section class="bench" data-block="status">
     <div class="lights">
       <div class="light" id="light-executor" data-state="unavailable">
         <span class="dot"></span><div><b>执行器</b><small>读取中…</small></div>
       </div>
-      <div class="light" id="light-resource-mcp" data-state="down">
+      <div class="light" id="light-service" data-state="down">
         <span class="dot"></span><div><b>MCP 服务</b><small>读取中…</small></div>
       </div>
       <div class="light" id="light-tunnel" data-state="unconfigured">
         <span class="dot"></span><div><b>隧道</b><small>读取中…</small></div>
       </div>
     </div>
+    <div class="row" data-block="controls">
+      <button id="stop" class="danger">停止服务</button>
+      <button id="start">启动服务</button>
+      <button id="reload" class="ghost">重载配置</button>
+    </div>
   </section>
 
   <section class="card" data-block="address">
-    <h2>MCP 地址</h2>
+    <h2>连接信息</h2>
+    <label>云端要填的 MCP 地址</label>
     <div class="row">
       <input id="mcp-url" readonly value="读取中…" />
-      <button id="copy">复制</button>
+      <button id="copy-all">复制地址+令牌</button>
+    </div>
+    <label>令牌</label>
+    <div class="row">
+      <input id="mcp-token" type="password" readonly value="读取中…" />
+      <button id="toggle-token" class="ghost">显示</button>
+      <button id="copy-token" class="ghost">复制</button>
     </div>
     <p class="hint" id="mcp-hint">—</p>
-  </section>
-
-  <section class="card" data-block="oauth">
-    <h2>授权</h2>
+    <label>OAuth 授权</label>
     <a id="oauth-link" aria-disabled="true">OAuth 授权入口</a>
     <p class="hint" id="oauth-hint">—</p>
   </section>
 
   <section class="card" data-block="tunnel">
-    <h2>隧道 <small>cloudflared · nexus.maliy.top</small></h2>
+    <h2>隧道 <small id="tunnel-host">cloudflared</small></h2>
     <div class="row">
       <input id="tunnel-url" readonly value="未配置" />
       <button id="tunnel-probe" class="ghost">检测可达性</button>
     </div>
-    <div class="row" style="margin-top:8px">
+    <div class="row">
       <button id="tunnel-start">启动隧道</button>
-      <button id="tunnel-stop" class="ghost">停止隧道</button>
+      <button id="tunnel-stop" class="ghost danger">停止隧道</button>
     </div>
     <p class="hint" id="tunnel-hint">—</p>
-    <pre id="tunnel-tail" style="height:72px" hidden></pre>
+    <p class="hint" id="tunnel-probe-result" hidden></p>
+    <pre id="tunnel-tail" hidden></pre>
   </section>
 
   <section class="card" data-block="root">
     <h2>根目录</h2>
     <div class="row">
       <input id="root-path" value="" />
+      <button id="pick-root" class="ghost">选择…</button>
       <button id="save-root">保存</button>
     </div>
-    <p class="hint">改完立即生效，同时写回 config.json</p>
+    <p class="hint" id="root-hint">改完立即生效，同时写回 config.json</p>
+  </section>
+
+  <section class="card" data-block="tools">
+    <h2>可用工具 <small>${TOOL_SUMMARY.length} 个</small></h2>
+    <ul class="tools">
+      ${TOOL_ITEMS}
+    </ul>
   </section>
 
   <section class="card wide" data-block="logs">
     <h2>最近日志 <small>最近 100 行，令牌已抹掉</small></h2>
-    <pre id="logs">读取中…</pre>
-  </section>
-
-  <section class="card" data-block="controls">
-    <h2>服务</h2>
     <div class="row">
-      <button id="stop">停止</button>
-      <button id="start">启动</button>
-      <button id="reload" class="ghost">重载配置</button>
+      <input id="log-filter" placeholder="筛关键字，比如 error" />
+      <button id="log-new" class="ghost" hidden>有新日志</button>
     </div>
-    <p class="hint" id="control-hint">—</p>
+    <pre id="logs">读取中…</pre>
   </section>
 </main>
 <script>
-  var rootInput = document.getElementById("root-path");
   var logBox = document.getElementById("logs");
+  var rootInput = document.getElementById("root-path");
+  var alertBox = document.getElementById("alert");
+  var newLogButton = document.getElementById("log-new");
+  var tokenInput = document.getElementById("mcp-token");
+  var lastLines = [];
+  var lastLogText = "";
+  var filterText = "";
+  var lastTunnelOkAt = null;
+  var alertTimer = null;
+  var refreshing = false;
+  var logging = false;
+  var currentToken = "";
+
+  function showAlert(message, kind) {
+    alertBox.textContent = message;
+    alertBox.dataset.kind = kind || "error";
+    alertBox.hidden = false;
+    if (alertTimer) clearTimeout(alertTimer);
+    alertTimer = setTimeout(function () { alertBox.hidden = true; }, 8000);
+  }
+
+  function pad(n) { return n < 10 ? "0" + n : String(n); }
+
+  function clockText(date) {
+    return pad(date.getHours()) + ":" + pad(date.getMinutes()) + ":" + pad(date.getSeconds());
+  }
 
   function setLight(id, status) {
     var box = document.getElementById(id);
@@ -184,25 +267,28 @@ const PAGE = `<!doctype html>
 
   function applyStatus(s) {
     setLight("light-executor", s.executor);
-    setLight("light-resource-mcp", s.service);
+    setLight("light-service", s.service);
     setLight("light-tunnel", s.tunnel);
-    document.getElementById("app-version").textContent = "v" + s.version;
-    document.getElementById("mcp-url").value = s.service.url;
+
     document.getElementById("mcp-hint").textContent =
-      "状态：" + s.service.label + " · 端口 " + s.service.port + " · 会话 " + s.service.sessions + " 个";
-    var oauthLink = document.getElementById("oauth-link");
-    if (s.oauth.available) {
-      oauthLink.setAttribute("href", s.oauth.url);
-      oauthLink.removeAttribute("aria-disabled");
-    } else {
-      oauthLink.removeAttribute("href");
-      oauthLink.setAttribute("aria-disabled", "true");
-    }
-    document.getElementById("oauth-hint").textContent = s.oauth.available
-      ? "已启用 · 客户端发起跳转后，批准需输入 config.json 的 token"
-      : "未启用（config.json 的 token 为空），云端先用 Bearer 令牌";
+      s.service.label + " · 本地 http://127.0.0.1:" + s.service.port + "/mcp · 会话 " +
+      s.service.sessions + " 个 · 面板端口 " + s.panelPort;
+
     var tunnelUrlInput = document.getElementById("tunnel-url");
     if (document.activeElement !== tunnelUrlInput) tunnelUrlInput.value = s.tunnel.url || "未配置";
+
+    var tunnelHost = "cloudflared";
+    if (s.tunnel.url) {
+      try {
+        tunnelHost = "cloudflared · " + new URL(s.tunnel.url).host;
+      } catch (error) {
+        tunnelHost = "cloudflared · " + s.tunnel.url;
+      }
+    }
+    document.getElementById("tunnel-host").textContent = tunnelHost;
+
+    if (s.tunnel.state === "up") lastTunnelOkAt = new Date();
+
     var tunnelParts = [s.tunnel.label];
     if (s.tunnel.detail) tunnelParts.push(s.tunnel.detail);
     var tunnelProc = s.tunnel.process || {};
@@ -210,76 +296,223 @@ const PAGE = `<!doctype html>
     if (tunnelProc.exitCode !== undefined && tunnelProc.exitCode !== null) {
       tunnelParts.push("退出码 " + tunnelProc.exitCode);
     }
+    if (s.tunnel.state !== "up" && lastTunnelOkAt) {
+      tunnelParts.push("上次正常 " + clockText(lastTunnelOkAt));
+    }
     document.getElementById("tunnel-hint").textContent = tunnelParts.join(" · ");
+
     var tailBox = document.getElementById("tunnel-tail");
     var tailLines = s.tunnel.process && s.tunnel.process.tail ? s.tunnel.process.tail : [];
     tailBox.hidden = tailLines.length === 0;
     tailBox.textContent = tailLines.join("\\n");
+
     if (document.activeElement !== rootInput) rootInput.value = s.root;
-    document.getElementById("control-hint").textContent = "面板端口 " + s.panelPort;
+  }
+
+  function hasLogSelection() {
+    var selection = window.getSelection();
+    if (!selection || selection.toString().length === 0) return false;
+    var node = selection.anchorNode;
+    return !!node && logBox.contains(node);
+  }
+
+  function renderLogs(lines) {
+    var shown = filterText
+      ? lines.filter(function (line) { return line.toLowerCase().indexOf(filterText) >= 0; })
+      : lines;
+    if (shown.length === 0) {
+      logBox.textContent = filterText ? "（没有匹配合键字的日志）" : "（还没有日志）";
+      return;
+    }
+    var fragment = document.createDocumentFragment();
+    shown.forEach(function (line) {
+      var row = document.createElement("div");
+      var match = /^(\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d+Z)\\s+([\\s\\S]*)$/.exec(line);
+      var stamp = match ? match[1] : "";
+      var text = match ? match[2] : line;
+      if (stamp) {
+        var time = new Date(stamp);
+        var span = document.createElement("span");
+        span.className = "ts";
+        span.textContent = (isNaN(time.getTime()) ? stamp : clockText(time)) + "  ";
+        row.appendChild(span);
+      }
+      var message = document.createElement("span");
+      message.textContent = text;
+      if (/error|failed|失败|出错|异常/i.test(text)) message.className = "lv-error";
+      else if (/warn|警告|重试/i.test(text)) message.className = "lv-warn";
+      row.appendChild(message);
+      fragment.appendChild(row);
+    });
+    // 上翻看旧日志时，重排不该把视口顶回顶部
+    var keepScroll = logBox.scrollTop;
+    logBox.textContent = "";
+    logBox.appendChild(fragment);
+    logBox.scrollTop = keepScroll;
   }
 
   async function refresh() {
+    if (refreshing) return;
+    refreshing = true;
     try {
       var res = await fetch("/api/status", { cache: "no-store" });
       if (res.ok) applyStatus(await res.json());
-    } catch (error) { /* 面板自己还在，忽略这一轮 */ }
+    } catch (error) {
+      /* 面板自己还在，忽略这一轮 */
+    } finally {
+      refreshing = false;
+    }
   }
 
   async function refreshLogs() {
+    if (logging) return;
+    logging = true;
     try {
       var res = await fetch("/api/logs", { cache: "no-store" });
       if (!res.ok) return;
       var body = await res.json();
+      var lines = body.lines || [];
+      var text = lines.join("\\n");
       var atBottom = logBox.scrollTop + logBox.clientHeight >= logBox.scrollHeight - 24;
-      logBox.textContent = body.lines.length ? body.lines.join("\\n") : "（还没有日志）";
-      if (atBottom) logBox.scrollTop = logBox.scrollHeight;
-    } catch (error) { /* 同上 */ }
+      if (text === lastLogText) return;
+      if (hasLogSelection()) return;
+      lastLines = lines;
+      lastLogText = text;
+      renderLogs(lines);
+      if (atBottom) {
+        logBox.scrollTop = logBox.scrollHeight;
+        newLogButton.hidden = true;
+      } else {
+        newLogButton.hidden = false;
+      }
+    } catch (error) {
+      /* 同上 */
+    } finally {
+      logging = false;
+    }
   }
 
-  async function post(path, body) {
-    var res = await fetch(path, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body)
-    });
+  async function loadCredentials() {
+    try {
+      var res = await fetch("/api/credentials", { cache: "no-store" });
+      if (!res.ok) return;
+      var data = await res.json();
+      currentToken = data.token || "";
+      document.getElementById("mcp-url").value = data.publicUrl || data.url;
+      tokenInput.value = currentToken || "（token 为空，仅限本机调试）";
+      var link = document.getElementById("oauth-link");
+      if (data.oauth && data.oauth.available) {
+        link.setAttribute("href", data.oauth.url);
+        link.removeAttribute("aria-disabled");
+        document.getElementById("oauth-hint").textContent =
+          "已启用 · 客户端跳转后要输入上面的令牌才能批准";
+      } else {
+        link.removeAttribute("href");
+        link.setAttribute("aria-disabled", "true");
+        document.getElementById("oauth-hint").textContent =
+          "未启用（config.json 的 token 为空），云端直接用 Bearer 令牌";
+      }
+    } catch (error) {
+      /* 读不到就保持读取中 */
+    }
+  }
+
+  async function post(pathname, body) {
+    var res;
+    try {
+      res = await fetch(pathname, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+    } catch (error) {
+      showAlert("请求没发出去：" + error.message);
+      return null;
+    }
     var data = null;
     try { data = await res.json(); } catch (error) { data = null; }
     if (!res.ok) {
-      alert((data && data.error) || ("请求失败：HTTP " + res.status));
-      return false;
+      showAlert((data && data.error) || ("请求失败：HTTP " + res.status));
+      return null;
     }
     if (data && data.service) applyStatus(data);
-    await refreshLogs();
-    return true;
+    return data;
   }
 
-  document.getElementById("copy").addEventListener("click", async function () {
-    var input = document.getElementById("mcp-url");
-    var text = input.value;
+  async function copyText(text, button, label) {
     try {
       await navigator.clipboard.writeText(text);
     } catch (error) {
-      input.removeAttribute("readonly");
-      input.select();
+      var helper = document.createElement("textarea");
+      helper.value = text;
+      document.body.appendChild(helper);
+      helper.select();
       document.execCommand("copy");
-      input.setAttribute("readonly", "readonly");
+      document.body.removeChild(helper);
     }
-    this.textContent = "已复制";
-    var button = this;
-    setTimeout(function () { button.textContent = "复制"; }, 1200);
+    button.textContent = "已复制";
+    setTimeout(function () { button.textContent = label; }, 1200);
+  }
+
+  function armConfirm(button, label, run) {
+    if (button.dataset.armed === "1") {
+      button.dataset.armed = "";
+      button.textContent = label;
+      run();
+      return;
+    }
+    button.dataset.armed = "1";
+    button.textContent = "再点一次确认";
+    setTimeout(function () {
+      if (button.dataset.armed === "1") {
+        button.dataset.armed = "";
+        button.textContent = label;
+      }
+    }, 4000);
+  }
+
+  document.getElementById("copy-all").addEventListener("click", function () {
+    var url = document.getElementById("mcp-url").value;
+    var text = currentToken ? "地址：" + url + "\\n令牌：" + currentToken : "地址：" + url;
+    copyText(text, this, "复制地址+令牌");
   });
 
-  document.getElementById("save-root").addEventListener("click", function () {
-    post("/api/root", { root: rootInput.value });
+  document.getElementById("copy-token").addEventListener("click", function () {
+    copyText(currentToken, this, "复制");
+  });
+
+  document.getElementById("toggle-token").addEventListener("click", function () {
+    var hidden = tokenInput.type === "password";
+    tokenInput.type = hidden ? "text" : "password";
+    this.textContent = hidden ? "隐藏" : "显示";
+  });
+
+  document.getElementById("save-root").addEventListener("click", async function () {
+    var data = await post("/api/root", { root: rootInput.value });
+    if (data) showAlert("根目录已保存，工具立即生效", "ok");
+  });
+
+  document.getElementById("pick-root").addEventListener("click", async function () {
+    var button = this;
+    button.disabled = true;
+    button.textContent = "选择中…";
+    var data = await post("/api/browse", { path: rootInput.value });
+    button.disabled = false;
+    button.textContent = "选择…";
+    if (data && data.path) {
+      rootInput.value = data.path;
+      showAlert("路径已选好，点保存才生效", "ok");
+    }
   });
 
   document.getElementById("stop").addEventListener("click", function () {
-    post("/api/service", { action: "stop" });
+    armConfirm(this, "停止服务", function () { post("/api/service", { action: "stop" }); });
   });
+
   document.getElementById("start").addEventListener("click", function () {
     post("/api/service", { action: "start" });
   });
+
   document.getElementById("reload").addEventListener("click", function () {
     post("/api/service", { action: "reload" });
   });
@@ -287,16 +520,56 @@ const PAGE = `<!doctype html>
   document.getElementById("tunnel-start").addEventListener("click", function () {
     post("/api/tunnel", { action: "start" });
   });
+
   document.getElementById("tunnel-stop").addEventListener("click", function () {
-    post("/api/tunnel", { action: "stop" });
-  });
-  document.getElementById("tunnel-probe").addEventListener("click", function () {
-    post("/api/tunnel", { action: "probe" });
+    armConfirm(this, "停止隧道", function () { post("/api/tunnel", { action: "stop" }); });
   });
 
+  document.getElementById("tunnel-probe").addEventListener("click", async function () {
+    var button = this;
+    button.disabled = true;
+    button.textContent = "检测中…";
+    var data = await post("/api/tunnel", { action: "probe" });
+    button.disabled = false;
+    button.textContent = "检测可达性";
+    if (!data || !data.probe) return;
+    var probe = data.probe;
+    var box = document.getElementById("tunnel-probe-result");
+    box.hidden = false;
+    if (probe.ok) {
+      box.dataset.kind = "ok";
+      box.textContent = "公网可达：HTTP " + probe.status + "，" + probe.ms + " 毫秒往返";
+    } else {
+      box.dataset.kind = "error";
+      box.textContent = "公网不通：" + (probe.error || "未知原因") + "（" + probe.ms + " 毫秒）";
+    }
+  });
+
+  document.getElementById("log-filter").addEventListener("input", function () {
+    filterText = this.value.trim().toLowerCase();
+    renderLogs(lastLines);
+  });
+
+  newLogButton.addEventListener("click", function () {
+    logBox.scrollTop = logBox.scrollHeight;
+    newLogButton.hidden = true;
+  });
+
+  document.addEventListener("visibilitychange", function () {
+    if (!document.hidden) {
+      refresh();
+      refreshLogs();
+    }
+  });
+
+  loadCredentials();
   refresh();
   refreshLogs();
-  setInterval(function () { refresh(); refreshLogs(); }, 5000);
+  setInterval(function () {
+    if (document.hidden) return;
+    refresh();
+    refreshLogs();
+  }, 5000);
 </script>
 </body>
 </html>
@@ -368,6 +641,44 @@ function blockUnsafeWrite(req: IncomingMessage, res: ServerResponse, panelPort: 
   return false;
 }
 
+/** 跑一段 PowerShell：优先 pwsh 7（AGENTS.md 的要求），机器上没有就退回自带的 5.1 */
+function runPowerShell(script: string): Promise<string> {
+  const args = ["-NoProfile", "-STA", "-WindowStyle", "Hidden", "-Command", script];
+  const attempt = (exe: string): Promise<string> =>
+    new Promise((resolve, reject) => {
+      execFile(exe, args, { windowsHide: true, timeout: 180_000 }, (error, stdout) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve(stdout.trim());
+      });
+    });
+  return attempt("pwsh.exe").catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== "ENOENT") throw error;
+    return attempt("powershell.exe");
+  });
+}
+
+/**
+ * 弹系统文件夹选择框（Windows）。用户取消时返回空串。
+ * 面板在浏览器里，浏览器给不了本地绝对路径，只能借系统对话框。
+ */
+async function pickFolder(initial: string): Promise<string> {
+  // 单引号字符串里 PowerShell 不展开变量，只要把 ' 变成 ''
+  const escaped = initial.replace(/'/g, "''");
+  const script = [
+    "[Console]::OutputEncoding = [Text.Encoding]::UTF8",
+    "Add-Type -AssemblyName System.Windows.Forms | Out-Null",
+    "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog",
+    '$dialog.Description = "选择 nexus-mcp 的沙箱根目录"',
+    `$dialog.SelectedPath = '${escaped}'`,
+    "$dialog.ShowNewFolderButton = $true",
+    "if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $dialog.SelectedPath }",
+  ].join("; ");
+  return runPowerShell(script);
+}
+
 export async function startPanel(
   config: AppConfig,
   service: McpService,
@@ -388,9 +699,26 @@ export async function startPanel(
       executor: await executorStatus(),
       tunnel: await tunnelStatus(config, tunnel),
       root: config.root,
-      oauth: service.oauthInfo(),
       panelPort,
       version: VERSION,
+    };
+  }
+
+  /** 面板要显示的敏感信息与公网地址；单独一个接口，避免 token 混进每 5 秒的状态轮询 */
+  function credentialsPayload(): {
+    url: string;
+    publicUrl: string;
+    token: string;
+    oauth: { url: string; available: boolean };
+  } {
+    const publicUrl = config.tunnelUrl
+      ? `${config.tunnelUrl.replace(/\/+$/, "")}/mcp`
+      : "";
+    return {
+      url: service.url(),
+      publicUrl,
+      token: config.token,
+      oauth: service.oauthInfo(),
     };
   }
 
@@ -427,9 +755,28 @@ export async function startPanel(
       return;
     }
 
+    if (req.method === "GET" && url.pathname === "/api/credentials") {
+      sendJson(res, 200, credentialsPayload());
+      return;
+    }
+
     if (req.method === "GET" && url.pathname === "/api/logs") {
       const token = config.token;
       sendJson(res, 200, { lines: recentLogs().map((line) => redactText(line, token)) });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/browse") {
+      const body = await readWriteBody(req, res, panelPort);
+      if (!body) return;
+      const start =
+        typeof body.path === "string" && path.isAbsolute(body.path.trim()) ? body.path.trim() : config.root;
+      try {
+        const picked = await pickFolder(start);
+        sendJson(res, 200, { path: picked });
+      } catch (error) {
+        sendJson(res, 500, { error: `打开目录选择框失败：${(error as Error).message}` });
+      }
       return;
     }
 
@@ -511,7 +858,11 @@ export async function startPanel(
           await tunnel.stop();
           log("面板操作: 停止隧道");
         } else if (action === "probe") {
-          // 探测在下面的 statusPayload 里做，这里只是触发一次带探测的状态刷新
+          // 手动探测：真的往外打一次，把状态码和往返耗时报给面板。
+          // 状态灯已经不靠它了（见 status.ts 的 tunnelStatus），这里只是链路体检。
+          const probe = await probePublicTunnel(config);
+          sendJson(res, 200, { probe });
+          return;
         } else {
           sendJson(res, 400, { error: `未知操作: ${action}` });
           return;

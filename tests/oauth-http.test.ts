@@ -236,11 +236,12 @@ describe("HTTP 传输（OAuth + 静态 Bearer 并存）", () => {
   );
 
   it(
-    "面板状态里 OAuth 入口已点亮并指向公网授权地址",
+    "面板凭据接口里 OAuth 入口已点亮并指向公网授权地址",
     async () => {
-      const status = (await (await fetch(`${server.panelUrl}/api/status`)).json()) as Record<string, any>;
-      expect(status.oauth.available).toBe(true);
-      expect(status.oauth.url).toBe(`${TUNNEL_BASE}/oauth/authorize`);
+      // 面板启动时从 /api/credentials 读一次 OAuth 入口，状态轮询里不再重复带
+      const body = (await (await fetch(`${server.panelUrl}/api/credentials`)).json()) as Record<string, any>;
+      expect(body.oauth.available).toBe(true);
+      expect(body.oauth.url).toBe(`${TUNNEL_BASE}/oauth/authorize`);
     },
     20_000,
   );

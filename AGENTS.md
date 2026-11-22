@@ -32,6 +32,7 @@
 - 工具输出与子进程一律强制 UTF-8：Git Bash 设 `LANG=zh_CN.UTF-8`、`LC_ALL=C.UTF-8`、`MSYS_NO_PATHCONV=1`；pwsh 7 设 `[Console]::OutputEncoding`。`tasklist`/`taskkill` 这类只做 ASCII 匹配的系统工具除外。
 - 本机出网走系统代理（`HTTPS_PROXY` 等指向本地代理）。Node 24 的 fetch 默认不理会这些环境变量：需要公网请求的代码开 `NODE_USE_ENV_PROXY=1`（服务入口 `src/index.ts` 已开），别裸写直连探测。
 - 测试不得依赖机器状态：stdio 测试自带 `NEXUS_MCP_CONFIG` 隔离配置（裸读仓库根的 config.json 会被部署配置带偏），隧道用例用 `NEXUS_TUNNEL_EXTERNAL=off` / `isRunningExternal` 桩与真隧道隔离。
+- 面板状态灯只读本地信号：隧道看 `127.0.0.1:20241/ready` 的 `readyConnections`，别拿公网往返驱动颜色。公网探测绕经系统代理，实测在 0.9-3.5 秒之间抖，会把健康的隧道打成红绿闪烁（详见 `docs/tunnel.md`）。
 - 路径一律相对沙箱根目录解析，越界直接报错，不做「尽力而为」的修补。
 - 工具描述写给人看，不带治理元数据，不出现 `providerId`、`rpcMethod`、`safetyClassification` 这类字段。
 - 新增工具先写失败的测试再写实现，不从实现反推测试。

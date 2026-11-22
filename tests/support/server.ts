@@ -82,7 +82,9 @@ export async function startServer(options: StartOptions = {}): Promise<RunningSe
         token: options.token ?? "",
         shell: "auto",
         ...(options.tunnelUrl ? { tunnelUrl: options.tunnelUrl } : {}),
-        ...(options.tunnel ? { tunnel: options.tunnel } : {}),
+        // 默认把 metrics 端口钉到 1：跑测试的机器上可能有真 cloudflared 占着 20241，
+        // 不隔离的话隧道用例会被机器状态带偏。用例要测就自己传 metricsPort 覆盖。
+        ...(options.tunnel ? { tunnel: { metricsPort: 1, ...options.tunnel } } : {}),
       },
       null,
       2,

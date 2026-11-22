@@ -273,7 +273,7 @@ describe("面板隧道卡（真实 dist 进程 + stub cloudflared）", () => {
   });
 
   it(
-    "面板启动隧道：managed 进程跑起来，公网可达变绿",
+    "面板启动隧道：managed 进程跑起来，状态跟着进程走",
     async () => {
       const response = await postTunnel(server, "start");
       expect(response.status).toBe(200);
@@ -282,30 +282,36 @@ describe("面板隧道卡（真实 dist 进程 + stub cloudflared）", () => {
       expect(started.tunnel.process?.managed).toBe(true);
       expect(started.tunnel.process?.pid).toBeGreaterThan(0);
 
-      // stub 写日志有延迟，轮询等尾部出现，顺带等公网探测变绿
+      // stub 写日志有延迟，轮询等尾部出现
       await waitFor(async () => {
         const status = await getStatus(server);
-        return (
-          (status.tunnel.process?.tail ?? []).join("\n").includes("stub: tunnel started") &&
-          status.tunnel.state === "up"
-        );
+        return (status.tunnel.process?.tail ?? []).join("\n").includes("stub: tunnel started");
       });
+      // metrics 端口在测试里钉到 1（没人监听）：进程在跑但验不了边缘 → 黄灯运行中，不报红
       const status = await getStatus(server);
-      expect(status.tunnel.state).toBe("up");
-      expect(status.tunnel.detail).toContain("公网可达");
+      expect(status.tunnel.state).toBe("connecting");
+      expect(status.tunnel.label).toBe("运行中");
+      expect(status.tunnel.detail).toContain("未验证边缘连接");
     },
     15_000,
   );
 
-  it("检测可达性：fake 隧道断开后，进程仍在但公网不通", async () => {
+  it("检测可达性：fake 隧道断开后只影响手动探测结果，状态灯不翻红", async () => {
     await new Promise<void>((resolve) => fakeServer.close(() => resolve()));
 
     const response = await postTunnel(server, "probe");
     expect(response.status).toBe(200);
-    const status = (await response.json()) as StatusBody;
+    const body = (await response.json()) as {
+      probe: { ok: boolean; status?: number; error?: string; ms?: number };
+    };
+    expect(body.probe.ok).toBe(false);
+    expect(body.probe.error ?? "").toBeTruthy();
+    expect(body.probe.ms).toBeGreaterThanOrEqual(0);
+
+    // 关键：公网断了，但进程还在跑，灯不该被打成红
+    const status = await getStatus(server);
     expect(status.tunnel.process?.running).toBe(true);
-    expect(status.tunnel.state).toBe("down");
-    expect(status.tunnel.detail).toContain("公网不通");
+    expect(status.tunnel.state).toBe("connecting");
   });
 
   it("面板停止隧道：进程退出，不再重启", async () => {

@@ -22,6 +22,8 @@ export interface TunnelConfig {
   configPath?: string;
   /** 进程异常退出后自动重启（守护），默认开启 */
   autoRestart?: boolean;
+  /** cloudflared 本地 metrics 端口，默认 20241（cloudflared 自己的默认监听端口） */
+  metricsPort?: number;
 }
 
 export interface AppConfig {
@@ -87,9 +89,11 @@ function normalizeCommandPolicy(raw: unknown): CommandPolicyConfig {
 function normalizeTunnel(raw: unknown): TunnelConfig | undefined {
   if (raw === undefined || raw === null) return undefined;
   if (typeof raw !== "object" || Array.isArray(raw)) {
-    throw new Error("config.json 的 tunnel 应是对象（{ cloudflaredPath?, configPath?, autoRestart? }）");
+    throw new Error(
+      "config.json 的 tunnel 应是对象（{ cloudflaredPath?, configPath?, autoRestart?, metricsPort? }）",
+    );
   }
-  const { cloudflaredPath, configPath, autoRestart } = raw as Record<string, unknown>;
+  const { cloudflaredPath, configPath, autoRestart, metricsPort } = raw as Record<string, unknown>;
   for (const [key, value] of [
     ["cloudflaredPath", cloudflaredPath],
     ["configPath", configPath],
@@ -101,12 +105,19 @@ function normalizeTunnel(raw: unknown): TunnelConfig | undefined {
   if (autoRestart !== undefined && typeof autoRestart !== "boolean") {
     throw new Error("config.json 的 tunnel.autoRestart 必须是布尔值");
   }
+  if (
+    metricsPort !== undefined &&
+    (typeof metricsPort !== "number" || !Number.isInteger(metricsPort) || metricsPort < 1 || metricsPort > 65535)
+  ) {
+    throw new Error("config.json 的 tunnel.metricsPort 必须是 1-65535 的整数");
+  }
   const result: TunnelConfig = {};
   if (typeof cloudflaredPath === "string" && cloudflaredPath.trim()) {
     result.cloudflaredPath = cloudflaredPath.trim();
   }
   if (typeof configPath === "string" && configPath.trim()) result.configPath = configPath.trim();
   if (typeof autoRestart === "boolean") result.autoRestart = autoRestart;
+  if (typeof metricsPort === "number") result.metricsPort = metricsPort;
   return result;
 }
 

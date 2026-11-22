@@ -7,6 +7,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { VERSION } from "../src/version.js";
+import { TOOL_SUMMARY } from "../src/tools.js";
 import { projectRoot, startServer } from "./support/server.js";
 import type { RunningServer } from "./support/server.js";
 
@@ -15,9 +16,8 @@ const TOKEN = "panel-token-8b41d";
 interface StatusBody {
   service: { state: string; label: string; port: number; url: string; sessions: number };
   executor: { state: string; label: string; detail?: string };
-  tunnel: { state: string; label: string; detail?: string };
+  tunnel: { state: string; label: string; detail?: string; url?: string };
   root: string;
-  oauth: { url: string; available: boolean };
   version: string;
 }
 
@@ -74,18 +74,69 @@ describe("本地控制面板", () => {
     await server?.stop();
   });
 
-  it("根路径返回一屏六块的页面", async () => {
+  it("根路径返回分栏页面，日间主题，含目录选择与日志筛选入口", async () => {
     const response = await fetch(server.panelUrl);
     expect(response.status).toBe(200);
     expect(response.headers.get("content-type")).toContain("text/html");
     const html = await response.text();
 
-    for (const block of ["status", "address", "oauth", "root", "logs", "controls"]) {
+    for (const block of ["status", "address", "tunnel", "root", "tools", "logs", "controls"]) {
       expect(html).toContain(`data-block="${block}"`);
     }
+    // 日间浅色主题：不再声明 dark color-scheme
+    expect(html).toContain("color-scheme: light");
+    expect(html).not.toContain("color-scheme: dark");
+    // 加宽布局与全宽日志
+    expect(html).toContain("max-width: 1440px");
+    expect(html).toContain('class="card wide" data-block="logs"');
+    // 根目录的原生选择按钮与日志筛选框
+    expect(html).toContain('id="pick-root"');
+    expect(html).toContain('id="log-filter"');
     // 复制按钮由页面脚本调用剪贴板
     expect(html).toContain("clipboard");
     expect(html).toContain("复制");
+  });
+
+  it("面板列出的工具与 MCP 实际注册的一致", async () => {
+    const html = await (await fetch(server.panelUrl)).text();
+    for (const tool of TOOL_SUMMARY) {
+      expect(html).toContain(`<b>${tool.name}</b>`);
+    }
+
+    const { client, transport } = await connectClient(server.mcpUrl);
+    const listed = await client.listTools();
+    expect(listed.tools.map((tool) => tool.name).sort()).toEqual(
+      TOOL_SUMMARY.map((tool) => tool.name).sort(),
+    );
+    await transport.terminateSession();
+    await client.close();
+  });
+
+  it("凭据接口给出公网地址与令牌，状态接口不含令牌", async () => {
+    const response = await fetch(`${server.panelUrl}/api/credentials`);
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      url: string;
+      publicUrl: string;
+      token: string;
+      oauth: { available: boolean };
+    };
+    expect(body.token).toBe(TOKEN);
+    expect(body.url).toBe(`http://127.0.0.1:${server.port}/mcp`);
+    // 没配 tunnelUrl 时没有公网地址，面板退回显示本地地址
+    expect(body.publicUrl).toBe("");
+    expect(body.oauth).toBeTruthy();
+
+    const statusText = JSON.stringify(await getStatus(server));
+    expect(statusText).not.toContain(TOKEN);
+  });
+
+  it("页面脚本能通过语法解析", async () => {
+    const html = await (await fetch(server.panelUrl)).text();
+    const script = /<script>([\s\S]*?)<\/script>/.exec(html);
+    expect(script).not.toBeNull();
+    // 只解析不执行：拦住模板字符串里前端代码的语法错误（字符串断言测不出这个）
+    expect(() => new Function(script?.[1] ?? "")).not.toThrow();
   });
 
   it("版本号可见：页头直接印出，状态接口同源", async () => {
@@ -94,7 +145,8 @@ describe("本地控制面板", () => {
 
     // 版本号由服务端直接写进 HTML，不依赖页面脚本渲染
     const html = await (await fetch(server.panelUrl)).text();
-    expect(html).toContain(`id="app-version" style="margin:0">v${VERSION}<`);
+    expect(html).toContain('id="app-version"');
+    expect(html).toContain(`v${VERSION}`);
   });
 
   it(
@@ -122,6 +174,8 @@ describe("本地控制面板", () => {
     expect(body.lines.length).toBeGreaterThan(0);
     expect(body.lines.length).toBeLessThanOrEqual(100);
     expect(body.lines.join("\n")).not.toContain(TOKEN);
+    // 每行都带 ISO 时间戳，面板按它显示本地时刻并做级别配色
+    expect(body.lines[0]).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z /);
   });
 
   it(
@@ -288,42 +342,89 @@ describe("本地控制面板", () => {
   );
 });
 
-describe("隧道状态来自真实探测", () => {
+describe("只配 tunnelUrl 的部署", () => {
   let server: RunningServer;
-  const fakeTunnel = http.createServer((_req, res) => {
-    res.writeHead(200, { "Content-Type": "text/plain" });
-    res.end("ok");
-  });
 
   beforeAll(async () => {
-    await new Promise<void>((resolve) => fakeTunnel.listen(0, "127.0.0.1", () => resolve()));
-    const address = fakeTunnel.address();
-    const tunnelPort = typeof address === "object" && address ? address.port : 0;
+    // 故意指向一个没人监听的回环端口：如果面板还拿公网往返点灯，这里就会是红的
+    server = await startServer({ token: TOKEN, tunnelUrl: "http://127.0.0.1:9/" });
+  }, 30_000);
+
+  afterAll(async () => {
+    await server?.stop();
+  });
+
+  it("没有 tunnel 段就不点灯：只保留公网地址，标未启用管理", async () => {
+    const status = await getStatus(server);
+    expect(status.tunnel.url).toBe("http://127.0.0.1:9/");
+    expect(status.tunnel.state).toBe("unconfigured");
+    expect(status.tunnel.label).toBe("未启用管理");
+  });
+});
+
+describe("隧道状态以 cloudflared 就绪连接为准", () => {
+  let server: RunningServer;
+  let fakeMetrics: http.Server;
+  let readyConnections = 3;
+
+  beforeAll(async () => {
+    fakeMetrics = http.createServer((req, res) => {
+      if (req.url === "/ready") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: 200, readyConnections }));
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+    await new Promise<void>((resolve) => fakeMetrics.listen(0, "127.0.0.1", () => resolve()));
+    const address = fakeMetrics.address();
+    const metricsPort = typeof address === "object" && address ? address.port : 0;
+
+    // 公网地址故意指向关闭的端口：任何公网探测都会立刻失败。
+    // 状态灯若还跟着它走，这里就永远是红的。
     server = await startServer({
       token: TOKEN,
-      tunnelUrl: `http://127.0.0.1:${tunnelPort}/`,
+      tunnelUrl: "http://127.0.0.1:1/",
+      tunnel: {
+        cloudflaredPath: path.join(projectRoot, "package.json"),
+        configPath: path.join(projectRoot, "package.json"),
+        metricsPort,
+      },
     });
   }, 30_000);
 
   afterAll(async () => {
     await server?.stop();
-    if (fakeTunnel.listening) {
-      await new Promise<void>((resolve) => fakeTunnel.close(() => resolve()));
-    }
+    await new Promise<void>((resolve) => {
+      if (!fakeMetrics.listening) {
+        resolve();
+        return;
+      }
+      fakeMetrics.close(() => resolve());
+    });
   });
 
   it(
-    "配了 tunnelUrl 就真去探，断了就变成离线",
+    "公网探测打不通，但就绪连接在，仍报在线",
     async () => {
-      const up = await getStatus(server);
-      expect(up.tunnel.state).toBe("up");
-
-      await new Promise<void>((resolve) => fakeTunnel.close(() => resolve()));
-
-      const down = await getStatus(server);
-      expect(down.tunnel.state).toBe("down");
-      expect(down.tunnel.label).toBe("离线");
+      readyConnections = 3;
+      const status = await getStatus(server);
+      expect(status.tunnel.state).toBe("up");
+      expect(status.tunnel.label).toBe("在线");
+      expect(status.tunnel.detail ?? "").toContain("3");
     },
-    25_000,
+    20_000,
+  );
+
+  it(
+    "就绪连接掉到 0 报连接中，不是在线",
+    async () => {
+      readyConnections = 0;
+      const status = await getStatus(server);
+      expect(status.tunnel.state).toBe("connecting");
+      expect(status.tunnel.label).toBe("连接中");
+    },
+    20_000,
   );
 });

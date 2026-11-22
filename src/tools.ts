@@ -25,6 +25,22 @@ const MAX_SEARCH_RESULTS = 100;
  */
 const GREP_TIMEOUT_MS = 300_000;
 
+/**
+ * 面板「可用工具」卡用的短说明。名称必须与下面 registerTools 注册的一一对应，
+ * tests/panel.test.ts 会拿它跟 MCP 客户端列出来的清单比对，防止两处漂移。
+ */
+export const TOOL_SUMMARY: ReadonlyArray<{ name: string; summary: string }> = [
+  { name: "read", summary: "读文件，支持行范围" },
+  { name: "write", summary: "写文件，自动建目录" },
+  { name: "edit", summary: "按上下文替换文件片段" },
+  { name: "bash", summary: "在沙箱里跑命令" },
+  { name: "glob", summary: "按通配符找文件" },
+  { name: "grep", summary: "按正则搜内容" },
+  { name: "job_start", summary: "起后台长任务" },
+  { name: "job_output", summary: "读后台任务输出" },
+  { name: "job_kill", summary: "结束后台任务" },
+];
+
 type TextResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
 
 function ok(text: string): TextResult {
