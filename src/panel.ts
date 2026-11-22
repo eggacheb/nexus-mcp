@@ -162,6 +162,7 @@ const PAGE = `<!doctype html>
     </div>
     <div class="row" data-block="controls">
       <button id="stop" class="danger">停止服务</button>
+      <button id="restart">重启服务</button>
       <button id="start">启动服务</button>
       <button id="reload" class="ghost">重载配置</button>
     </div>
@@ -509,6 +510,10 @@ const PAGE = `<!doctype html>
     armConfirm(this, "停止服务", function () { post("/api/service", { action: "stop" }); });
   });
 
+  document.getElementById("restart").addEventListener("click", function () {
+    armConfirm(this, "重启服务", function () { post("/api/service", { action: "restart" }); });
+  });
+
   document.getElementById("start").addEventListener("click", function () {
     post("/api/service", { action: "start" });
   });
@@ -817,6 +822,11 @@ export async function startPanel(
         } else if (action === "start") {
           await service.start();
           log("面板操作: 启动 MCP 服务");
+        } else if (action === "restart") {
+          // 只断开重连，不重读磁盘配置；要带上配置文件改动就用「重载配置」
+          await service.stop();
+          await service.start();
+          log("面板操作: 重启 MCP 服务");
         } else if (action === "reload") {
           const next = loadConfig();
           Object.assign(config, next);

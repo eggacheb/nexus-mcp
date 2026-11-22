@@ -92,6 +92,8 @@ describe("本地控制面板", () => {
     // 根目录的原生选择按钮与日志筛选框
     expect(html).toContain('id="pick-root"');
     expect(html).toContain('id="log-filter"');
+    // 服务重启按钮
+    expect(html).toContain('id="restart"');
     // 复制按钮由页面脚本调用剪贴板
     expect(html).toContain("clipboard");
     expect(html).toContain("复制");
@@ -215,6 +217,38 @@ describe("本地控制面板", () => {
       expect(relisted.tools.length).toBe(9);
       await after.transport.terminateSession();
       await after.client.close();
+    },
+    40_000,
+  );
+
+  it(
+    "重启服务：旧会话作废、端点恢复，面板不掉线",
+    async () => {
+      const before = await connectClient(server.mcpUrl);
+      expect(before.transport.sessionId).toBeTruthy();
+
+      const response = await postJson(server, "/api/service", { action: "restart" });
+      expect(response.status).toBe(200);
+      const status = (await response.json()) as StatusBody;
+      expect(status.service.state).toBe("running");
+
+      // 面板自己还在
+      expect((await fetch(server.panelUrl)).status).toBe(200);
+
+      // 旧会话被断开
+      const stale = await before.client.listTools().then(
+        () => null,
+        (error: unknown) => error as Error,
+      );
+      expect(stale).toBeTruthy();
+
+      // 新会话照常工作
+      const after = await connectClient(server.mcpUrl);
+      const relisted = await after.client.listTools();
+      expect(relisted.tools.length).toBe(9);
+      await after.transport.terminateSession();
+      await after.client.close();
+      await before.client.close();
     },
     40_000,
   );
