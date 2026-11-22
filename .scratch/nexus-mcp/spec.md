@@ -1,6 +1,6 @@
 # nexus-mcp 规格
 
-Status: ready-for-agent
+Status: done（13/13 票完成并验收，2026-11-22）
 Created: 2026-11-21
 
 ## Problem Statement
@@ -15,11 +15,11 @@ Gemini 网页版（`gemini.google.com` → 设置 → 关联应用 → 自定义
 
 ## Solution
 
-一个单目录沙箱的本地 MCP 服务，只暴露 8 个工具，由 TypeScript 协议层和 Rust 执行层组成：
+一个单目录沙箱的本地 MCP 服务，只暴露 9 个工具，由 TypeScript 协议层和 Rust 执行层组成：
 
 - **协议层（TypeScript）**：MCP stdio 与 streamable HTTP 双传输、Bearer 校验、OAuth 2.1 授权、本地网页面板、配置加载、工具定义与参数校验。不含任何文件系统或进程操作权限。
 - **执行层（Rust）**：命令执行、文件读写、补丁应用、路径沙箱校验、输出有界缓冲。通过 stdio JSON-RPC 被协议层调用，是唯一接触真实磁盘和进程的部分。
-- **工具集**：`read`、`write`、`edit`、`bash`、`glob`、`grep`、`job_start`、`job_output`。一个工具一个动作，参数扁平，全部无状态，`path` 一律是相对沙箱根目录的路径或绝对路径，不需要先创建项目或会话。
+- **工具集**：`read`、`write`、`edit`、`bash`、`glob`、`grep`、`job_start`、`job_output`、`job_kill`。一个工具一个动作，参数扁平，全部无状态，`path` 一律是相对沙箱根目录的路径或绝对路径，不需要先创建项目或会话。
 - **默认 shell**：Git Bash（POSIX 语义，适配云端模型生成的命令），可配置切换到 PowerShell 7。所有子进程强制 UTF-8。
 - **分发**：两个可执行文件（Rust 执行器 + TypeScript 协议层）加一个配置文件和一个启动脚本，用户机器不需要装 Rust 或 Node。
 
@@ -74,12 +74,13 @@ Gemini 网页版（`gemini.google.com` → 设置 → 关联应用 → 自定义
 
 ### 工具语义
 
-- 8 个工具，一个动作一个工具。禁止把多个动作塞进一个工具的 `action` 参数。
+- 9 个工具，一个动作一个工具。禁止把多个动作塞进一个工具的 `action` 参数。
 - 参数全部扁平，不引入 `projectId`、`sessionId`、`approvalId` 这类模型无法自主判断的间接层。
 - `read` 返回带行号的内容；`offset`/`limit` 按行切分。
 - `edit` 使用 `old_string`/`new_string` 精确替换，匹配不唯一时失败并提示「匹配到 N 处」。支持可选 `replace_all`。
 - `bash` 返回合并输出与退出码，退出码非零不算协议错误，由模型自行判断。
 - `job_start` 立刻返回 `job_id`，`job_output` 支持从指定字节偏移增量读取。
+- `job_kill` 对后台任务的进程树做回执式终止：返回按步骤记录的终止回执（逐步说明每一步做了什么、结果如何），树杀兜底走 Windows Job Object。
 - 所有工具错误以「可直接展示给模型的一句话」返回，不使用堆栈。
 
 ### 沙箱与路径
@@ -100,7 +101,7 @@ Gemini 网页版（`gemini.google.com` → 设置 → 关联应用 → 自定义
 
 - `edit` 主路径从 opencode 的 `core/src/tool/plugin/edit.ts` 移植：三级匹配降级（精确 → Unicode 归一化 → 行级尾空白）+ CRLF 双向保真 + missHint（MIT，剥掉 Effect 壳即可用）。
 - codex 的 `apply-patch`（`parser`、`seek_sequence`、`text_file`）保留为「后续支持 patch 文本」时的备选，文件系统后端换成自有 trait，当前票不引入。
-- 命令白名单与可执行名归一化从 codex 的 `execpolicy-rules` 移植。
+- 通配匹配从 opencode 的 `packages/core/src/util/wildcard.ts` 零依赖移植；可执行名归一化取 codex `command_safety` 的 `executable_name_lookup_key` 形状；危险规则表以 codex 的 rm 谓词与 cmd/PowerShell 删除类规则为底，`format`/`diskpart`/`reg delete` 为自写（codex 没有对应规则）。整张表的复用来源裁决见 `docs/adr/0007-command-policy-reuse-opencode-wildcard.md`。
 - 输出有界缓冲从 codex 的 `head-tail-buffer` 移植。
 - UTF-8 边界截断从 codex 的 `utils/string` 移植。
 - glob/grep 的 ripgrep 调用组合、二进制发现与下载校验从 opencode 的 `ripgrep.ts` 与 `ripgrep/binary.ts` 移植。
@@ -111,12 +112,12 @@ Gemini 网页版（`gemini.google.com` → 设置 → 关联应用 → 自定义
 ### 面板
 
 - 本地网页，由协议层同进程提供，不引入 Tauri、Electron 或任何桌面框架。
-- 一屏六块：状态灯、MCP 地址（可复制）、OAuth 入口、根目录选择、最近日志、启停与重载。
+- 一屏多块：三盏状态灯（执行器 / MCP 服务 / 隧道）、连接信息（MCP 地址与令牌复制、OAuth 授权入口）、隧道卡（启停与可达性检测）、根目录选择（保存即生效）、可用工具卡、最近 100 行日志，服务按钮有停止 / 启动 / 重启 / 重载。
 - 面板只读本地状态，不承载业务逻辑。
 
 ### 分发
 
-- 产物为两个可执行文件 + `config.json` + 启动脚本，打成一个 zip。
+- 产物为两个可执行文件 + `config.json` + 启动脚本；对外发布两个形态：NSIS 安装包（按用户安装、带卸载入口）与 zip 绿色版（票 11 拍板）。
 - 协议层打包成单文件可执行程序，运行时不依赖已安装的 Node。
 - 配置优先级：环境变量指定的路径 > 可执行文件同目录的 `config.json` > 内置默认值。
 - 代码按跨平台写（路径、shell 探测都按平台分支），但只构建 Windows 产物。

@@ -1,13 +1,13 @@
 # Issue tracker: Local Markdown
 
-Issue 与 spec 都以 markdown 文件形式存放在本仓库的 `.scratch/` 下。
+Issue 与 spec 都以 markdown 文件形式存放在本仓库的 `.scratch/` 下。本仓库有 GitHub 远程，但 issue 不放 GitHub Issues——工具链全部走本地文件。
 
 ## 约定
 
-- 一个功能一个目录：`.scratch/<feature-slug>/`
+- 一个功能一个目录：`.scratch/<feature-slug>/`（当前唯一功能目录是 `.scratch/nexus-mcp/`）
 - spec 是 `.scratch/<feature-slug>/spec.md`
 - 实现票一票一文件：`.scratch/<feature-slug>/issues/<NN>-<slug>.md`，从 `01` 编号，禁止把所有票塞进一个文件
-- 票的 triage 状态写在文件靠上的 `Status:` 行
+- 票的 triage 状态写在文件靠上的 `Status:` 行。本仓库在用的取值：`ready-for-agent`（可开工）、`done`（完成；票做完在 `## Comments` 注明每条验收清单对应哪个测试用例）
 - 讨论记录追加到文件底部的 `## Comments` 标题下
 
 ## 技能说「publish to the issue tracker」时
