@@ -15,13 +15,39 @@
 **三步上手：**
 
 1. 双击桌面上的 `nexus-mcp`（或解压目录里的 `启动.cmd`），控制面板会在浏览器里打开。
-2. 面板上的「MCP 地址」是云端要填的地址；令牌在安装目录 `config.json` 的 `token` 字段（首次启动自动生成，同时打印在启动窗口里）。
+2. 面板「连接信息」里直接显示云端要填的 MCP 地址和令牌，点「复制地址+令牌」一次带走
+   （首次启动自动生成，同时打印在启动窗口里）。
 3. 把地址和令牌填进 Gemini 自定义 MCP / ChatGPT 连接器的 Bearer 鉴权，就能调 9 个工具。
 
 首次启动会在程序目录生成 `config.json` 和 `workspace/`（默认沙箱根）。卸载不会删这两个。
 
 `bash` 与 `job_*` 需要机器上有 Git Bash（Git for Windows）；`read` / `write` / `edit` / `glob` / `grep`
 不依赖任何外部命令。`grep` 首次使用会下载一份固定版本的 ripgrep 到全局缓存。
+
+## 开机自启（可选）
+
+安装包和绿色版**都不会**加开机自启。要的话，在
+`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup` 放一个 `nexus-mcp.vbs`：
+
+```vbs
+Set sh = CreateObject("WScript.Shell")
+sh.CurrentDirectory = "C:\Users\<你>\AppData\Local\Programs\nexus-mcp"
+sh.Run """C:\Users\<你>\AppData\Local\Programs\nexus-mcp\nexus-mcp.exe""", 0, False
+```
+
+结尾的 `0` 是隐藏窗口，`False` 是不等它退出。
+
+**卸载程序不会删这个文件**（它只认自己装的东西）。卸载后记得手动删掉，否则每次开机都会弹一次找不到 exe 的报错。
+
+## 升级 / 换版本
+
+1. 先确认 8787 上没人监听：`Get-NetTCPConnection -LocalPort 8787 -State Listen`。
+   有输出说明还有旧进程，用 `OwningProcess` 那一列的 pid 结束它：`Stop-Process -Id <pid>`。
+2. 双击新的安装包装上。覆盖安装会自己 `taskkill` 掉 `nexus-mcp.exe` 和 `nexus-executor.exe`，
+   但**杀不掉开发态起的 `node dist/index.js`**——端口冲突就是这么来的。
+3. 重新启动服务。
+
+装完启动报 `EADDRINUSE: address already in use 127.0.0.1:8787`，就是第 1 步没清干净。
 
 ## 配置
 
@@ -56,7 +82,7 @@ npm run package:smoke  # 拿刚出的产物在最小环境里自检：启动、�
 
 1. 都没有签名，SmartScreen 首次会拦一次（「更多信息 → 仍要运行」），企业策略可能直接拦掉。要正经发就得买代码签名证书。
 2. 两个 exe 必须在同一目录：`nexus-mcp.exe` 找不到 `nexus-executor.exe` 时，只有文件类工具能用，报错里会指出缺哪个文件。
-3. 覆盖安装会先 `taskkill` 掉正在跑的 `nexus-mcp.exe` / `nexus-executor.exe`；卸载只删程序文件，`config.json` 与 `workspace` 留着。
+3. 覆盖安装会先 `taskkill` 掉正在跑的 `nexus-mcp.exe` / `nexus-executor.exe`（杀不掉开发态的 `node dist/index.js`，见「升级 / 换版本」）；卸载只删程序文件，`config.json`、`workspace` 和你自己加的开机自启脚本都留着。
 4. 第一次打包要联网取 NSIS 3.11（2.4MB，脚本里钉了 SHA-256 校验）；内网机器可以用 `NEXUS_NSIS_DIR` 指向已解压的 NSIS 目录跳过下载。
 5. 默认 MCP 端口 8787、面板 8788；目标机器上被占了就改 `config.json` 的 `port` / `panelPort`。
 
