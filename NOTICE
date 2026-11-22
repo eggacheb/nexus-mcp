@@ -1,10 +1,17 @@
+This project includes code derived from Nexus (https://github.com/ysunyang4/Nexus, via the
+forks shixian64/Nexus and eggacheb/Nexus), licensed under the GNU Affero General Public
+License, Version 3. Copyright the Nexus contributors. In accordance with AGPL-3.0, this
+entire project is therefore licensed under AGPL-3.0 (see LICENSE).
+
 This project includes code derived from OpenAI Codex (https://github.com/openai/codex),
 licensed under the Apache License, Version 2.0. Copyright 2025 OpenAI.
 
 This project includes code derived from OpenCode (https://github.com/anomalyco/opencode),
-licensed under the MIT License. Copyright 2025 SST / OpenCode contributors.
+licensed under the MIT License. Copyright (c) 2025 opencode.
 
 Copied or adapted portions (see file headers for details):
+- src/oauth.ts                             (adapted from apps/bridge/src/oauth.ts at commit c8c18a7
+  of the Nexus bridge; adaptation list recorded in .scratch/nexus-mcp/issues/09-oauth.md)
 - crates/executor/src/head_tail_buffer.rs  (from codex-rs/utils/head-tail-buffer)
 - crates/executor/src/string.rs            (take_bytes_at_char_boundary from codex-rs/utils/string)
 - crates/executor/src/command_policy.rs    (wildcard_match from opencode util/wildcard.ts;
