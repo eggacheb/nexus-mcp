@@ -36,9 +36,17 @@ function check(ok: boolean, message: string): void {
   process.exit(1);
 }
 
-/** Windows 上刚被 kill 的进程还会短暂占着 exe，删目录要重试 */
+/**
+ * Windows 上刚被 kill 的进程还会短暂占着 exe，删目录要重试。
+ * 重试仍失败只警告：临时目录残留是环境噪音，不该把冒烟结论带成失败。
+ */
 function cleanup(): void {
-  rmSync(path.dirname(appDir), { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  const target = path.dirname(appDir);
+  try {
+    rmSync(target, { recursive: true, force: true, maxRetries: 30, retryDelay: 200 });
+  } catch (error) {
+    console.error(`  (临时目录没删干净，可手动删 ${target}：${(error as Error).message})`);
+  }
 }
 
 /** 等子进程真的退出，否则紧接着删目录会 EPERM */
@@ -187,7 +195,8 @@ async function smokePanel(): Promise<void> {
     );
 
     const html = await (await fetch(`http://127.0.0.1:${panelPort}/`)).text();
-    check(html.includes(`id="app-version" style="margin:0">v${version}<`), "面板页头印着版本号");
+    check(html.includes(`id="app-version"`) && html.includes(`v${version}`), "面板页头印着版本号");
+    check(html.includes(`id="restart"`) && html.includes("color-scheme: light"), "面板是日间版并带重启按钮");
   } catch (error) {
     console.error(`服务输出：\n${stderr}`);
     throw error;
