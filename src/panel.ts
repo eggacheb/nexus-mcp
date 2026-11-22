@@ -4,7 +4,7 @@ import http from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import path from "node:path";
 import type { AppConfig } from "./config.js";
-import { loadConfig, saveConfig } from "./config.js";
+import { loadConfig, normalizeCommandPolicy, saveConfig, validateShell } from "./config.js";
 import { readBody, sendJson as sendJsonRaw } from "./httpHelpers.js";
 import { log, recentLogs, redactText } from "./log.js";
 import type { McpService } from "./mcpService.js";
@@ -100,12 +100,14 @@ const PAGE = `<!doctype html>
   .row + .row { margin-top: 8px; }
   label { display: block; margin: 12px 0 6px; font-size: 12px; color: var(--muted); }
   label:first-of-type { margin-top: 0; }
-  input {
+  input, select, textarea {
     flex: 1; min-width: 0; background: #fff; color: var(--text);
     border: 1px solid #d0d5dd; border-radius: 8px; padding: 8px 11px; font: inherit;
     font-family: var(--mono); font-size: 13px;
   }
-  input:focus { outline: none; border-color: var(--brand); box-shadow: 0 0 0 3px rgba(37,99,235,.14); }
+  textarea { resize: vertical; }
+  select { flex: none; }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--brand); box-shadow: 0 0 0 3px rgba(37,99,235,.14); }
   input[readonly] { background: #fafbfc; }
   button {
     background: var(--brand); color: #fff; border: 1px solid transparent; border-radius: 8px;
@@ -210,6 +212,40 @@ const PAGE = `<!doctype html>
       <button id="save-root">保存</button>
     </div>
     <p class="hint" id="root-hint">改完立即生效，同时写回 config.json</p>
+  </section>
+
+  <section class="card" data-block="settings">
+    <h2>快捷设置 <small>保存即生效，同时写回 config.json</small></h2>
+    <label>shell（bash 与 job_* 用的 shell）</label>
+    <div class="row">
+      <select id="set-shell">
+        <option value="auto">auto（自动找 Git Bash）</option>
+        <option value="git-bash">git-bash</option>
+        <option value="pwsh">pwsh（PowerShell 7）</option>
+      </select>
+    </div>
+    <label>单工具输出上限 maxOutputBytes（字节）</label>
+    <div class="row"><input id="set-max-output" type="number" min="1" step="1" /></div>
+    <label>单条命令默认超时 defaultTimeoutMs（毫秒）</label>
+    <div class="row"><input id="set-timeout" type="number" min="1" step="1" /></div>
+    <label>隧道公网地址 tunnelUrl（留空清除）</label>
+    <div class="row"><input id="set-tunnel-url" placeholder="https://nexus.example.com/" /></div>
+    <label>命令白名单（一行一条通配模式，留空关闭白名单）</label>
+    <div class="row"><textarea id="set-allow" rows="3" placeholder="git *&#10;npm run *&#10;cargo *"></textarea></div>
+    <label>命令黑名单（一行一条，命中即拒）</label>
+    <div class="row"><textarea id="set-deny" rows="3" placeholder="git push --force*"></textarea></div>
+    <label>白名单未命中时</label>
+    <div class="row">
+      <select id="set-on-unmatched">
+        <option value="deny">deny（默认，拒绝）</option>
+        <option value="allow">allow（放行）</option>
+      </select>
+    </div>
+    <div class="row" style="margin-top: 12px;">
+      <button id="save-settings">保存快捷设置</button>
+    </div>
+    <p class="hint">命令闸门对下一次 bash / job_start 调用立即生效。panelPort、transport、token 不在这里改：
+      直接改 config.json 后点「重载配置」。</p>
   </section>
 
   <section class="card" data-block="tools">
@@ -418,6 +454,25 @@ const PAGE = `<!doctype html>
     }
   }
 
+  function fillSettings(s) {
+    document.getElementById("set-shell").value = s.shell;
+    document.getElementById("set-max-output").value = String(s.maxOutputBytes);
+    document.getElementById("set-timeout").value = String(s.defaultTimeoutMs);
+    document.getElementById("set-tunnel-url").value = s.tunnelUrl || "";
+    document.getElementById("set-allow").value = (s.commandPolicy.allow || []).join("\\n");
+    document.getElementById("set-deny").value = (s.commandPolicy.deny || []).join("\\n");
+    document.getElementById("set-on-unmatched").value = s.commandPolicy.onUnmatched;
+  }
+
+  async function loadSettings() {
+    try {
+      var res = await fetch("/api/settings", { cache: "no-store" });
+      if (res.ok) fillSettings(await res.json());
+    } catch (error) {
+      /* 读不到先保持空值，下一轮再取 */
+    }
+  }
+
   async function post(pathname, body) {
     var res;
     try {
@@ -506,6 +561,32 @@ const PAGE = `<!doctype html>
     }
   });
 
+  document.getElementById("save-settings").addEventListener("click", async function () {
+    var button = this;
+    button.disabled = true;
+    var lines = function (id) {
+      return document.getElementById(id).value.split("\\n")
+        .map(function (line) { return line.trim(); })
+        .filter(function (line) { return line !== ""; });
+    };
+    var data = await post("/api/settings", {
+      shell: document.getElementById("set-shell").value,
+      maxOutputBytes: Number(document.getElementById("set-max-output").value),
+      defaultTimeoutMs: Number(document.getElementById("set-timeout").value),
+      tunnelUrl: document.getElementById("set-tunnel-url").value.trim(),
+      commandPolicy: {
+        allow: lines("set-allow"),
+        deny: lines("set-deny"),
+        onUnmatched: document.getElementById("set-on-unmatched").value
+      }
+    });
+    button.disabled = false;
+    if (data) {
+      fillSettings(data.settings);
+      showAlert("快捷设置已保存，写回 config.json", "ok");
+    }
+  });
+
   document.getElementById("stop").addEventListener("click", function () {
     armConfirm(this, "停止服务", function () { post("/api/service", { action: "stop" }); });
   });
@@ -568,6 +649,7 @@ const PAGE = `<!doctype html>
   });
 
   loadCredentials();
+  loadSettings();
   refresh();
   refreshLogs();
   setInterval(function () {
@@ -750,6 +832,17 @@ export async function startPanel(
     };
   }
 
+  /** 快捷设置卡当前值；只暴露面板能安全修改的字段，token/端口类刻意不含 */
+  function settingsPayload() {
+    return {
+      shell: config.shell,
+      maxOutputBytes: config.maxOutputBytes,
+      defaultTimeoutMs: config.defaultTimeoutMs,
+      tunnelUrl: config.tunnelUrl ?? "",
+      commandPolicy: config.commandPolicy,
+    };
+  }
+
   /** Host 只认本机两个名字：挡掉 DNS rebinding 借道的页面 */
   function hostAllowed(req: IncomingMessage): boolean {
     const host = req.headers.host;
@@ -830,6 +923,75 @@ export async function startPanel(
       saveConfig(config);
       log(`根目录已切换到 ${abs}`);
       sendJson(res, 200, await statusPayload());
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/settings") {
+      sendJson(res, 200, settingsPayload());
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/settings") {
+      const body = await readWriteBody(req, res, panelPort);
+      if (!body) return;
+
+      const patch: {
+        shell?: AppConfig["shell"];
+        maxOutputBytes?: number;
+        defaultTimeoutMs?: number;
+        tunnelUrl?: string;
+        commandPolicy?: AppConfig["commandPolicy"];
+      } = {};
+      try {
+        // 校验规则与 loadConfig 同源：写进 config.json 的值必须能通过下次启动校验
+        const numberField = (value: unknown, name: string): number => {
+          if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
+            throw new Error(`${name} 必须是正整数`);
+          }
+          return value;
+        };
+        if (body.shell !== undefined) {
+          if (body.shell !== "auto" && body.shell !== "git-bash" && body.shell !== "pwsh") {
+            throw new Error(
+              `shell 只支持 "auto" / "git-bash" / "pwsh"，收到 ${JSON.stringify(body.shell)}`,
+            );
+          }
+          validateShell(body.shell);
+          patch.shell = body.shell;
+        }
+        if (body.maxOutputBytes !== undefined) {
+          patch.maxOutputBytes = numberField(body.maxOutputBytes, "maxOutputBytes");
+        }
+        if (body.defaultTimeoutMs !== undefined) {
+          patch.defaultTimeoutMs = numberField(body.defaultTimeoutMs, "defaultTimeoutMs");
+        }
+        if (body.tunnelUrl !== undefined) {
+          if (typeof body.tunnelUrl !== "string") throw new Error("tunnelUrl 必须是字符串");
+          const trimmed = body.tunnelUrl.trim();
+          if (/\s/.test(trimmed)) throw new Error("tunnelUrl 不能包含空白字符");
+          patch.tunnelUrl = trimmed;
+        }
+        if (body.commandPolicy !== undefined) {
+          patch.commandPolicy = normalizeCommandPolicy(body.commandPolicy);
+        }
+      } catch (error) {
+        sendJson(res, 400, { error: (error as Error).message });
+        return;
+      }
+
+      // 工具调用每次都现读这个共享对象，改完即生效，不需要重启
+      if (patch.shell !== undefined) config.shell = patch.shell;
+      if (patch.maxOutputBytes !== undefined) config.maxOutputBytes = patch.maxOutputBytes;
+      if (patch.defaultTimeoutMs !== undefined) config.defaultTimeoutMs = patch.defaultTimeoutMs;
+      if (patch.tunnelUrl !== undefined) {
+        if (patch.tunnelUrl) config.tunnelUrl = patch.tunnelUrl;
+        else delete config.tunnelUrl;
+      }
+      if (patch.commandPolicy !== undefined) config.commandPolicy = patch.commandPolicy;
+
+      saveConfig(config);
+      log("快捷设置已更新并写回 config.json");
+      sendJson(res, 200, { ...(await statusPayload()), settings: settingsPayload() });
       return;
     }
 

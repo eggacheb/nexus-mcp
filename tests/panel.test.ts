@@ -80,7 +80,7 @@ describe("本地控制面板", () => {
     expect(response.headers.get("content-type")).toContain("text/html");
     const html = await response.text();
 
-    for (const block of ["status", "address", "tunnel", "root", "tools", "logs", "controls"]) {
+    for (const block of ["status", "address", "tunnel", "root", "settings", "tools", "logs", "controls"]) {
       expect(html).toContain(`data-block="${block}"`);
     }
     // 日间浅色主题：不再声明 dark color-scheme
@@ -461,4 +461,116 @@ describe("隧道状态以 cloudflared 就绪连接为准", () => {
     },
     20_000,
   );
+});
+
+describe("快捷设置", () => {
+  let server: RunningServer;
+
+  interface SettingsBody {
+    shell: string;
+    maxOutputBytes: number;
+    defaultTimeoutMs: number;
+    tunnelUrl?: string;
+    commandPolicy: { allow: string[]; deny: string[]; onUnmatched: string };
+  }
+
+  async function getSettings(): Promise<SettingsBody> {
+    const response = await fetch(`${server.panelUrl}/api/settings`);
+    expect(response.status).toBe(200);
+    return (await response.json()) as SettingsBody;
+  }
+
+  beforeAll(async () => {
+    server = await startServer({ token: TOKEN });
+  }, 30_000);
+
+  afterAll(async () => {
+    await server?.stop();
+  });
+
+  it("GET /api/settings 返回当前可编辑的配置值", async () => {
+    const settings = await getSettings();
+    expect(settings.shell).toBe("auto");
+    expect(settings.maxOutputBytes).toBe(64 * 1024);
+    expect(settings.defaultTimeoutMs).toBe(120_000);
+    expect(settings.tunnelUrl ?? "").toBe("");
+    expect(settings.commandPolicy).toEqual({ allow: [], deny: [], onUnmatched: "deny" });
+  });
+
+  it(
+    "POST /api/settings 保存后立即生效并写回 config.json",
+    async () => {
+      const saved = await postJson(server, "/api/settings", {
+        maxOutputBytes: 32 * 1024,
+        defaultTimeoutMs: 60_000,
+        tunnelUrl: "https://nexus.example.test/",
+        commandPolicy: { allow: ["git *"], deny: ["git push --force*"], onUnmatched: "deny" },
+      });
+      expect(saved.status).toBe(200);
+
+      const settings = await getSettings();
+      expect(settings.maxOutputBytes).toBe(32 * 1024);
+      expect(settings.defaultTimeoutMs).toBe(60_000);
+      expect(settings.tunnelUrl).toBe("https://nexus.example.test/");
+      expect(settings.commandPolicy).toEqual({
+        allow: ["git *"],
+        deny: ["git push --force*"],
+        onUnmatched: "deny",
+      });
+
+      const disk = JSON.parse(readFileSync(server.configPath, "utf8")) as Record<string, unknown>;
+      expect(disk.maxOutputBytes).toBe(32 * 1024);
+      expect(disk.defaultTimeoutMs).toBe(60_000);
+      expect(disk.tunnelUrl).toBe("https://nexus.example.test/");
+      expect(disk.commandPolicy).toEqual({
+        allow: ["git *"],
+        deny: ["git push --force*"],
+        onUnmatched: "deny",
+      });
+
+      // tunnelUrl 留空 = 清除，磁盘上也不留这个键
+      const cleared = await postJson(server, "/api/settings", { tunnelUrl: "" });
+      expect(cleared.status).toBe(200);
+      expect((await getSettings()).tunnelUrl ?? "").toBe("");
+      const clearedDisk = JSON.parse(readFileSync(server.configPath, "utf8")) as Record<string, unknown>;
+      expect(clearedDisk.tunnelUrl).toBeUndefined();
+
+      // 闸门新配置对运行中的服务立即生效：白名单没接住的 bash 直接被拒，不用重启
+      const { client, transport } = await connectClient(server.mcpUrl);
+      const blocked = await client.callTool({ name: "bash", arguments: { command: "echo hi" } });
+      expect(blocked.isError).toBe(true);
+      expect(JSON.stringify(blocked)).toContain("白名单");
+      await transport.terminateSession();
+      await client.close();
+    },
+    30_000,
+  );
+
+  it("shell 换成 pwsh：保存后接口返回新值（不牵涉命令执行）", async () => {
+    const response = await postJson(server, "/api/settings", { shell: "pwsh" });
+    expect(response.status).toBe(200);
+    expect((await getSettings()).shell).toBe("pwsh");
+
+    const disk = JSON.parse(readFileSync(server.configPath, "utf8")) as { shell: string };
+    expect(disk.shell).toBe("pwsh");
+  });
+
+  it("非法输入一律 400，config.json 原样不动", async () => {
+    const before = readFileSync(server.configPath, "utf8");
+    const cases: Array<[string, Record<string, unknown>]> = [
+      ["shell 是 5.1", { shell: "powershell" }],
+      ["shell 未知值", { shell: "cmd" }],
+      ["maxOutputBytes 为 0", { maxOutputBytes: 0 }],
+      ["maxOutputBytes 是小数", { maxOutputBytes: 1.5 }],
+      ["defaultTimeoutMs 为负", { defaultTimeoutMs: -1 }],
+      ["tunnelUrl 类型不对", { tunnelUrl: 123 }],
+      ["commandPolicy.allow 不是数组", { commandPolicy: { allow: "git *" } }],
+      ["onUnmatched 非法", { commandPolicy: { onUnmatched: "maybe" } }],
+    ];
+    for (const [label, body] of cases) {
+      const response = await postJson(server, "/api/settings", body);
+      expect(response.status, label).toBe(400);
+    }
+    expect(readFileSync(server.configPath, "utf8")).toBe(before);
+  });
 });

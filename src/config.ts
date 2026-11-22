@@ -61,7 +61,7 @@ const DEFAULTS: Omit<AppConfig, "root" | "panelPort" | "commandPolicy"> = {
 };
 
 /** 命令闸门配置校验：形状不对启动即报错，不带着坏配置起服务 */
-function normalizeCommandPolicy(raw: unknown): CommandPolicyConfig {
+export function normalizeCommandPolicy(raw: unknown): CommandPolicyConfig {
   if (raw === undefined || raw === null) {
     return { allow: [], deny: [], onUnmatched: "deny" };
   }
@@ -179,8 +179,8 @@ export function gitBashPath(): string {
   return path.join(programFiles, "Git", "bin", "bash.exe");
 }
 
-/** shell 配置在启动时校验，坏了直接不让服务起来 */
-function validateShell(shell: ShellKind): void {
+/** shell 配置在启动时校验，坏了直接不让服务起来；面板快捷设置保存前也走这道校验 */
+export function validateShell(shell: ShellKind): void {
   if (shell === "powershell") {
     throw new Error(
       "shell 配置为 powershell（Windows PowerShell 5.1）不受支持：5.1 的控制台编码跟随系统代码页，" +
@@ -281,8 +281,11 @@ export function saveConfig(config: AppConfig): void {
     defaultTimeoutMs: config.defaultTimeoutMs,
     commandPolicy: config.commandPolicy,
   };
+  // 可选键：配置里已不存在时要把旧键从文件里清掉，否则 {...raw} 会把它一直带着
   if (config.tunnelUrl) next.tunnelUrl = config.tunnelUrl;
+  else delete next.tunnelUrl;
   if (config.tunnel) next.tunnel = config.tunnel;
+  else delete next.tunnel;
 
   writeFileSync(file, `${JSON.stringify(next, null, 2)}\n`, "utf8");
 }
