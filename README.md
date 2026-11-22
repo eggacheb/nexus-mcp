@@ -193,3 +193,13 @@ npm run package:smoke # 在最小环境下验证打包产物（启动、连上�
 `scripts/` 自检与打包、`docs/research/` 调研笔记。
 
 动手前读 `AGENTS.md`（命令、禁忌、踩过的坑），调研结论在 `docs/research/`。
+
+## 致谢
+
+- **Nexus 项目**——本项目脱胎于它：上上游 [ysunyang4/Nexus](https://github.com/ysunyang4/Nexus)、
+  上游 [shixian64/Nexus](https://github.com/shixian64/Nexus)。OAuth 桥接的实现思路沿用这个系列，
+  工具层按「少而清楚」重写。
+- **[opencode](https://github.com/anomalyco/opencode)**（MIT）——`edit` 的三级匹配、命令闸门的通配匹配、
+  ripgrep 的发现与调用组合从它移植；明细见 `NOTICE` 与 `docs/research/opencode-reusable-parts.md`。
+- **[codex](https://github.com/openai/codex)**（Apache-2.0）——输出有界缓冲、UTF-8 边界截断、
+  命令策略的危险规则与可执行名归一化来自它；明细见 `NOTICE` 与 `docs/research/codex-reusable-parts.md`。
