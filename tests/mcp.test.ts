@@ -60,6 +60,19 @@ describe("工具清单", () => {
     }
   });
 
+  it("纯只读工具携带标准 MCP readOnlyHint 注解，变更与执行类工具不标记为只读", async () => {
+    const { tools } = await client.listTools();
+    const readOnlyNames = new Set(["read", "glob", "grep", "job_output"]);
+    for (const tool of tools) {
+      if (readOnlyNames.has(tool.name)) {
+        expect(tool.annotations?.readOnlyHint).toBe(true);
+        expect(tool.annotations?.destructiveHint).toBe(false);
+      } else {
+        expect(tool.annotations?.readOnlyHint).not.toBe(true);
+      }
+    }
+  });
+
   it("initialize 返回的 serverInfo 携带标准 icons", () => {
     const info = client.getServerVersion();
     expect(info?.name).toBe("nexus-mcp");

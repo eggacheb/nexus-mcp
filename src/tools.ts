@@ -36,6 +36,13 @@ const MAX_PATTERN_LOG_CHARS = 80;
 const MAX_CMD_LOG_CHARS = 120;
 /** 错误原因摘要截断上限 */
 const MAX_ERR_LOG_CHARS = 160;
+/** 标准 MCP 只读工具注解，帮助云端连接器识别无副作用查询 */
+const READ_ONLY_ANNOTATIONS = {
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
+} as const;
 
 export interface RegisterToolsOptions {
   /** HTTP 传输下返回当前会话 id；stdio 下省略，日志记为 stdio */
@@ -140,6 +147,7 @@ export function registerTools(
       title: "Read file",
       description:
         "读取文本文件，返回带行号的内容。用 offset/limit 读取片段，避免一次拉太长。",
+      annotations: READ_ONLY_ANNOTATIONS,
       inputSchema: {
         path: z.string().describe("文件路径，绝对路径或相对根目录"),
         offset: z.number().int().min(1).optional().describe("起始行号，从 1 开始"),
@@ -318,6 +326,7 @@ export function registerTools(
     {
       title: "Find files",
       description: "按通配符查找文件路径，遵循 .gitignore，返回按修改时间倒序的列表。",
+      annotations: READ_ONLY_ANNOTATIONS,
       inputSchema: {
         pattern: z.string().describe("通配符，例如 **/*.ts"),
         path: z.string().optional().describe("搜索起点，默认根目录"),
@@ -362,6 +371,7 @@ export function registerTools(
     {
       title: "Search content",
       description: "在文件内容里搜索正则，返回匹配的文件与行号。底层调用 ripgrep。",
+      annotations: READ_ONLY_ANNOTATIONS,
       inputSchema: {
         pattern: z.string().describe("正则表达式"),
         path: z.string().optional().describe("搜索起点，默认根目录"),
@@ -451,6 +461,7 @@ export function registerTools(
     {
       title: "Read job output",
       description: "读取后台任务的增量输出与退出状态。任务结束后保留结果供反复查看。",
+      annotations: READ_ONLY_ANNOTATIONS,
       inputSchema: {
         job_id: z.string().describe("job_start 返回的 id"),
         offset: z.number().int().min(0).optional().describe("从第几个字节开始读"),
