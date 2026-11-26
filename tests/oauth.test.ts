@@ -78,12 +78,29 @@ beforeEach(async () => {
       res.end();
     }
   });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  let port = 0;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => {
+        server.off("error", reject);
+        resolve();
+      });
+    });
+    const addr = server.address();
+    port = typeof addr === "object" && addr && typeof addr.port === "number" ? addr.port : 0;
+    if (port > 0) break;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+  if (port <= 0) throw new Error("无法为 OAuth 测试分配有效的本机临时端口");
+  base = `http://127.0.0.1:${port}`;
 });
 
 afterEach(async () => {
-  await new Promise<void>((resolve) => server.close(() => resolve()));
+  await new Promise<void>((resolve) => {
+    server.close(() => resolve());
+    server.closeAllConnections?.();
+  });
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 

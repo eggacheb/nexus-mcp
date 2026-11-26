@@ -63,7 +63,16 @@ describe("票 06: 本地一键热切换部署脚本（缝隙 3）", () => {
       (name) => !existsSync(path.join(stageDir, name)),
     );
     if (missing) {
-      execSync("npm run package:stage", { cwd: projectRoot, stdio: "inherit" });
+      // 只做 stage 打包，绝不在 vitest 并发期间重跑 tsc 覆写 dist/（否则会打断其他并发读取 dist/ 的测试）
+      execFileSync(
+        process.execPath,
+        [
+          path.join(projectRoot, "node_modules", "tsx", "dist", "cli.mjs"),
+          path.join(projectRoot, "scripts", "package.ts"),
+          "--stage-only",
+        ],
+        { cwd: projectRoot, stdio: "inherit" },
+      );
     }
   }, 120_000);
 
