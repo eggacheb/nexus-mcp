@@ -24,6 +24,8 @@ export interface TunnelConfig {
   cloudflaredPath?: string;
   /** 隧道配置（ingress）路径，默认 %USERPROFILE%\.cloudflared\config.yml */
   configPath?: string;
+  /** 启动服务时自动拉起隧道，默认开启 */
+  autoStart?: boolean;
   /** 进程异常退出后自动重启（守护），默认开启 */
   autoRestart?: boolean;
   /** cloudflared 本地 metrics 端口，默认 20241（cloudflared 自己的默认监听端口） */
@@ -97,10 +99,10 @@ function normalizeTunnel(raw: unknown): TunnelConfig | undefined {
   if (raw === undefined || raw === null) return undefined;
   if (typeof raw !== "object" || Array.isArray(raw)) {
     throw new Error(
-      "config.json 的 tunnel 应是对象（{ cloudflaredPath?, configPath?, autoRestart?, metricsPort? }）",
+      "config.json 的 tunnel 应是对象（{ cloudflaredPath?, configPath?, autoStart?, autoRestart?, metricsPort? }）",
     );
   }
-  const { cloudflaredPath, configPath, autoRestart, metricsPort } = raw as Record<string, unknown>;
+  const { cloudflaredPath, configPath, autoStart, autoRestart, metricsPort } = raw as Record<string, unknown>;
   for (const [key, value] of [
     ["cloudflaredPath", cloudflaredPath],
     ["configPath", configPath],
@@ -108,6 +110,9 @@ function normalizeTunnel(raw: unknown): TunnelConfig | undefined {
     if (value !== undefined && (typeof value !== "string" || !value.trim())) {
       throw new Error(`config.json 的 tunnel.${key} 必须是非空字符串`);
     }
+  }
+  if (autoStart !== undefined && typeof autoStart !== "boolean") {
+    throw new Error("config.json 的 tunnel.autoStart 必须是布尔值");
   }
   if (autoRestart !== undefined && typeof autoRestart !== "boolean") {
     throw new Error("config.json 的 tunnel.autoRestart 必须是布尔值");
@@ -123,6 +128,7 @@ function normalizeTunnel(raw: unknown): TunnelConfig | undefined {
     result.cloudflaredPath = cloudflaredPath.trim();
   }
   if (typeof configPath === "string" && configPath.trim()) result.configPath = configPath.trim();
+  if (typeof autoStart === "boolean") result.autoStart = autoStart;
   if (typeof autoRestart === "boolean") result.autoRestart = autoRestart;
   if (typeof metricsPort === "number") result.metricsPort = metricsPort;
   return result;

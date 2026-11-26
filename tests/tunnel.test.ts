@@ -269,6 +269,7 @@ describe("面板隧道卡（真实 dist 进程 + stub cloudflared）", () => {
       tunnel: {
         cloudflaredPath: process.execPath,
         configPath: path.join(workDir, "config.yml"),
+        autoStart: false,
         autoRestart: false,
       },
     });
@@ -445,6 +446,157 @@ describe("面板隧道卡（真实 dist 进程 + stub cloudflared）", () => {
       } finally {
         writeFileSync(server.configPath, originalConfig, "utf8");
         await postService("reload");
+      }
+    },
+    25_000,
+  );
+});
+
+describe("隧道随服务自启与协议层优雅全停入口", () => {
+  const isPidAlive = (pid: number): boolean => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  it(
+    "tunnel.autoStart 默认开启：服务启动后自动拉起隧道；POST /api/shutdown(includeTunnel=true) 同步停隧道且不触发守护拉回",
+    async () => {
+      const workDir = mkdtempSync(path.join(os.tmpdir(), "nexus-mcp-autostart-"));
+      const stubPath = path.join(workDir, "tunnel-stub.cjs");
+      const cfgPath = path.join(workDir, "config.yml");
+      writeFileSync(stubPath, STUB_SOURCE, "utf8");
+      writeFileSync(cfgPath, "tunnel: stub\n", "utf8");
+
+      let tunnelPid = 0;
+      const server = await startServer({
+        token: TOKEN,
+        tunnelStubPath: stubPath,
+        tunnel: {
+          cloudflaredPath: process.execPath,
+          configPath: cfgPath,
+          autoRestart: true,
+        },
+      });
+      try {
+        // 1) 未显式传 autoStart，默认应自动拉起隧道
+        await waitFor(async () => {
+          const status = await getStatus(server);
+          if (status.tunnel.process?.running && status.tunnel.process.pid) {
+            tunnelPid = status.tunnel.process.pid;
+            return true;
+          }
+          return false;
+        }, 8_000);
+        expect(tunnelPid).toBeGreaterThan(0);
+        expect(isPidAlive(tunnelPid)).toBe(true);
+
+        // 2) 跨站 Origin 应被 /api/shutdown 拒绝
+        const denied = await fetch(`${server.panelUrl}/api/shutdown`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Origin: "https://evil.example",
+          },
+          body: JSON.stringify({ includeTunnel: true }),
+        });
+        expect(denied.status).toBe(403);
+
+        // 3) 合法本机请求触发彻底退出（includeTunnel=true）：停隧道且停协议层
+        const res = await fetch(`${server.panelUrl}/api/shutdown`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ includeTunnel: true }),
+        });
+        expect(res.status).toBe(200);
+
+        await waitFor(() => !isPidAlive(tunnelPid), 6_000);
+        // 端口也应释放（服务已退出）
+        await waitFor(async () => {
+          try {
+            await fetch(`http://127.0.0.1:${server.port}/health`);
+            return false;
+          } catch {
+            return true;
+          }
+        }, 6_000);
+      } finally {
+        if (tunnelPid > 0 && isPidAlive(tunnelPid)) {
+          try {
+            process.kill(tunnelPid);
+          } catch {
+            // ignore
+          }
+        }
+        await server.stop().catch(() => undefined);
+        rmSync(workDir, { recursive: true, force: true });
+      }
+    },
+    25_000,
+  );
+
+  it(
+    "tunnel.autoStart=false 时不自启；POST /api/shutdown(includeTunnel=false) 停协议层但保留隧道存活",
+    async () => {
+      const workDir = mkdtempSync(path.join(os.tmpdir(), "nexus-mcp-keep-tunnel-"));
+      const stubPath = path.join(workDir, "tunnel-stub.cjs");
+      const cfgPath = path.join(workDir, "config.yml");
+      writeFileSync(stubPath, STUB_SOURCE, "utf8");
+      writeFileSync(cfgPath, "tunnel: stub\n", "utf8");
+
+      let tunnelPid = 0;
+      const server = await startServer({
+        token: TOKEN,
+        tunnelStubPath: stubPath,
+        tunnel: {
+          cloudflaredPath: process.execPath,
+          configPath: cfgPath,
+          autoStart: false,
+          autoRestart: false,
+        },
+      });
+      try {
+        const initial = await getStatus(server);
+        expect(initial.tunnel.process?.running).toBe(false);
+
+        // 手动启动隧道
+        const startRes = await postTunnel(server, "start");
+        expect(startRes.status).toBe(200);
+        const started = (await startRes.json()) as StatusBody;
+        tunnelPid = started.tunnel.process?.pid ?? 0;
+        expect(tunnelPid).toBeGreaterThan(0);
+        expect(isPidAlive(tunnelPid)).toBe(true);
+
+        // includeTunnel=false 关停：服务退出，但隧道继续存活
+        const shutdownRes = await fetch(`${server.panelUrl}/api/shutdown`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ includeTunnel: false }),
+        });
+        expect(shutdownRes.status).toBe(200);
+
+        await waitFor(async () => {
+          try {
+            await fetch(`http://127.0.0.1:${server.port}/health`);
+            return false;
+          } catch {
+            return true;
+          }
+        }, 6_000);
+        expect(isPidAlive(tunnelPid)).toBe(true);
+      } finally {
+        if (tunnelPid > 0 && isPidAlive(tunnelPid)) {
+          try {
+            process.kill(tunnelPid);
+          } catch {
+            // ignore
+          }
+        }
+        await server.stop().catch(() => undefined);
+        rmSync(workDir, { recursive: true, force: true });
       }
     },
     25_000,

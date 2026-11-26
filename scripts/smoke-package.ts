@@ -111,8 +111,8 @@ function waitForPort(port: number, timeoutMs = 20_000): Promise<void> {
 }
 
 async function smokeStdio(): Promise<void> {
-  console.log("\n== stdio：连上并调一次 read");
-  const exe = path.join(appDir, "nexus-mcp.exe");
+  console.log("\n== stdio：协议层 nexus-server.exe --stdio 连上并调一次 read");
+  const exe = path.join(appDir, "nexus-server.exe");
   const transport = new StdioClientTransport({
     command: exe,
     args: ["--stdio"],
@@ -162,8 +162,13 @@ async function smokePanel(): Promise<void> {
 
   const child = spawn(path.join(appDir, "nexus-mcp.exe"), [], {
     cwd: appDir,
-    env: minimalEnv(),
-    stdio: ["ignore", "pipe", "pipe"],
+    env: {
+      ...minimalEnv(),
+      NEXUS_TRAY_HEADLESS: "1",
+      NEXUS_TRAY_MUTEX: `Local\\nexus-pkg-smoke-${process.pid}`,
+      NEXUS_TRAY_NO_BROWSER: "1",
+    },
+    stdio: ["pipe", "pipe", "pipe"],
   });
   let stderr = "";
   child.stdout?.setEncoding("utf8");
@@ -201,15 +206,24 @@ async function smokePanel(): Promise<void> {
     console.error(`服务输出：\n${stderr}`);
     throw error;
   } finally {
+    try {
+      child.stdin?.write("quit\n");
+      child.stdin?.end();
+    } catch {
+      // ignore
+    }
     await stopChild(child);
   }
 }
 
 async function main(): Promise<void> {
-  if (!existsSync(path.join(stageDir, "nexus-mcp.exe"))) {
-    console.error("先跑 npm run package 产出 build/package。");
-    process.exit(1);
+  for (const name of ["nexus-mcp.exe", "nexus-server.exe", "nexus-executor.exe"]) {
+    if (!existsSync(path.join(stageDir, name))) {
+      console.error(`缺少 ${name}，先跑 npm run package:stage 或 npm run package 产出 build/package。`);
+      process.exit(1);
+    }
   }
+  check(!existsSync(path.join(stageDir, "启动.cmd")), "已淘汰旧的 启动.cmd");
 
   // 等同用户解压 zip：拷一份干净目录，不带任何开发文件
   cpSync(stageDir, appDir, { recursive: true });

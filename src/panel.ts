@@ -821,6 +821,7 @@ export async function startPanel(
   config: AppConfig,
   service: McpService,
   tunnel?: TunnelManager,
+  onShutdown?: (options: { includeTunnel: boolean }) => Promise<void> | void,
 ): Promise<PanelHandle> {
   let panelPort = config.panelPort;
   let currentTunnel: TunnelManager | undefined = tunnel;
@@ -1122,6 +1123,31 @@ export async function startPanel(
       }
 
       sendJson(res, 200, await statusPayload());
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/shutdown") {
+      const body = await readWriteBody(req, res, panelPort);
+      if (!body) return;
+      if (body.includeTunnel !== undefined && typeof body.includeTunnel !== "boolean") {
+        sendJson(res, 400, { error: "includeTunnel 必须是布尔值" });
+        return;
+      }
+      const includeTunnel = body.includeTunnel !== false;
+      logInfo("panel.shutdown", { includeTunnel });
+      sendJson(res, 200, { ok: true, includeTunnel });
+      setImmediate(() => {
+        void (async () => {
+          if (includeTunnel && currentTunnel) {
+            await currentTunnel.stop().catch((error: unknown) => {
+              logWarn("panel.shutdown_tunnel_error", { err: (error as Error).message });
+            });
+          } else if (currentTunnel) {
+            currentTunnel.cancelPendingRestart();
+          }
+          await onShutdown?.({ includeTunnel });
+        })();
+      });
       return;
     }
 

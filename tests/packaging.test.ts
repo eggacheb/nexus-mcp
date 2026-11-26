@@ -61,6 +61,14 @@ describe("打包与配置优先级", () => {
     );
     expect(cargoToml).toContain('license = "AGPL-3.0"');
     expect(cargoToml).not.toContain('"Apache-2.0"');
+
+    const trayCargoToml = readFileSync(
+      path.join(projectRoot, "crates", "tray", "Cargo.toml"),
+      "utf8",
+    );
+    expect(trayCargoToml).toContain('license = "AGPL-3.0"');
+    expect(nsi).toContain("nexus-server.exe");
+    expect(nsi).not.toContain("启动.cmd");
   });
 
   it("首次运行缺配置时生成默认配置，不抛错", () => {

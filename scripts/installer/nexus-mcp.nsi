@@ -17,6 +17,7 @@ Unicode true
 
 !define APP_NAME "nexus-mcp"
 !define APP_EXE "nexus-mcp.exe"
+!define APP_SERVER "nexus-server.exe"
 !define APP_EXECUTOR "nexus-executor.exe"
 !define APP_PUBLISHER "nexus-mcp"
 !define APP_ID "nexus-mcp"
@@ -43,8 +44,8 @@ VIAddVersionKey "LegalCopyright" "AGPL-3.0"
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
-!define MUI_FINISHPAGE_RUN "$INSTDIR\启动.cmd"
-!define MUI_FINISHPAGE_RUN_TEXT "现在启动 nexus-mcp（自动打开控制面板）"
+!define MUI_FINISHPAGE_RUN "$INSTDIR\${APP_EXE}"
+!define MUI_FINISHPAGE_RUN_TEXT "现在启动 nexus-mcp（常驻右下角托盘）"
 !insertmacro MUI_PAGE_FINISH
 
 !insertmacro MUI_UNPAGE_CONFIRM
@@ -57,15 +58,16 @@ Section "安装" SecInstall
 
   ; 覆盖安装前先停掉正在跑的进程，否则 exe 被占用写不进去（照 Nexus 的 hook 手法）
   nsExec::Exec 'taskkill /F /IM ${APP_EXE}'
+  nsExec::Exec 'taskkill /F /IM ${APP_SERVER}'
   nsExec::Exec 'taskkill /F /IM ${APP_EXECUTOR}'
 
   SetOutPath "$INSTDIR"
   File /r "${STAGE_DIR}\*.*"
 
   CreateDirectory "$SMPROGRAMS\${APP_NAME}"
-  CreateShortCut "$SMPROGRAMS\${APP_NAME}\${APP_NAME}.lnk" "$INSTDIR\启动.cmd" "" "$INSTDIR\${APP_EXE}" 0
+  CreateShortCut "$SMPROGRAMS\${APP_NAME}\${APP_NAME}.lnk" "$INSTDIR\${APP_EXE}" "" "$INSTDIR\${APP_EXE}" 0
   CreateShortCut "$SMPROGRAMS\${APP_NAME}\卸载 ${APP_NAME}.lnk" "$INSTDIR\uninstall.exe"
-  CreateShortCut "$DESKTOP\${APP_NAME}.lnk" "$INSTDIR\启动.cmd" "" "$INSTDIR\${APP_EXE}" 0
+  CreateShortCut "$DESKTOP\${APP_NAME}.lnk" "$INSTDIR\${APP_EXE}" "" "$INSTDIR\${APP_EXE}" 0
 
   WriteRegStr HKCU "Software\${APP_ID}" "InstallDir" "$INSTDIR"
   WriteUninstaller "$INSTDIR\uninstall.exe"
@@ -84,6 +86,7 @@ Section "Uninstall"
   SetShellVarContext current
 
   nsExec::Exec 'taskkill /F /IM ${APP_EXE}'
+  nsExec::Exec 'taskkill /F /IM ${APP_SERVER}'
   nsExec::Exec 'taskkill /F /IM ${APP_EXECUTOR}'
 
   Delete "$DESKTOP\${APP_NAME}.lnk"
@@ -91,10 +94,10 @@ Section "Uninstall"
   DeleteRegKey HKCU "${UNINST_KEY}"
   DeleteRegKey HKCU "Software\${APP_ID}"
 
-  ; 只删程序文件；config.json 与 workspace 属于用户数据，卸载不碰
+  ; 只删程序文件；config.json、oauth-store.json 与 workspace 属于用户数据，卸载不碰
   Delete "$INSTDIR\${APP_EXE}"
+  Delete "$INSTDIR\${APP_SERVER}"
   Delete "$INSTDIR\${APP_EXECUTOR}"
-  Delete "$INSTDIR\启动.cmd"
   Delete "$INSTDIR\使用说明.txt"
   Delete "$INSTDIR\uninstall.exe"
   RMDir "$INSTDIR"

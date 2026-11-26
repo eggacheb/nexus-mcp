@@ -66,16 +66,28 @@ async function main(): Promise<void> {
 
   const tunnel = resolveTunnelManager(config);
   if (tunnel) logInfo("tunnel.enabled");
-  const panel = await startPanel(config, service, tunnel);
 
   let stopping = false;
+  let panel!: Awaited<ReturnType<typeof startPanel>>;
   const shutdown = async () => {
     if (stopping) return;
     stopping = true;
-    await panel.close();
+    await panel?.close();
     await service.stop();
     process.exit(0);
   };
+
+  panel = await startPanel(config, service, tunnel, () => shutdown());
+
+  if (tunnel && config.tunnel?.autoStart !== false) {
+    try {
+      const result = await tunnel.start();
+      logInfo("tunnel.autostart", { started: result.started, pid: result.pid, reason: result.reason });
+    } catch (error) {
+      logWarn("tunnel.autostart_failed", { err: (error as Error).message });
+    }
+  }
+
   logInfo("service.ready", { version: VERSION, panel: panel.url });
   if (process.argv.includes("--open-panel")) openPanelInBrowser(panel.url);
   process.on("SIGINT", () => void shutdown());

@@ -7,13 +7,15 @@
   "main": "dist/index.js",
   "scripts": {
     "build:executor": "cargo build --release --manifest-path crates/executor/Cargo.toml",
-    "build": "npm run build:executor && tsc -p tsconfig.json",
+    "build:tray": "cargo build --release --manifest-path crates/tray/Cargo.toml",
+    "build": "npm run build:executor && npm run build:tray && tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.tests.json",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
     "test": "npm run build:executor && vitest run --pool=vmThreads",
-    "test:rs": "cargo test --manifest-path crates/executor/Cargo.toml",
+    "test:rs": "cargo test --manifest-path crates/Cargo.toml",
     "smoke": "tsx scripts/smoke.ts",
+    "package:stage": "npm run build && tsx scripts/package.ts --stage-only",
     "package": "npm run build && tsx scripts/package.ts",
     "package:smoke": "tsx scripts/smoke-package.ts",
     "check": "npm run build && npm run test && npm run test:rs && npm run smoke"

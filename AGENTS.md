@@ -16,7 +16,9 @@
 原样对应 `package.json`：
 
 - 类型检查：`npm run typecheck`
-- 编译：`npm run build`（先 `cargo build --release` 构建执行器，再 `tsc`）
+- 编译：`npm run build`（先 `cargo build --release` 构建执行器与托盘宿主，再 `tsc`）
+- 最小三件套打包：`npm run package:stage`（产出 `build/package/` 下的 `nexus-mcp.exe` + `nexus-server.exe` + `nexus-executor.exe`，跳过 NSIS）
+- 本机一键热切换：`node scripts/deploy-local.mjs`（最小打包 → 临时端口 `package:smoke` → 按 `nexus-mcp.exe` 哈希走托盘内无缝换核或脱离进程树切换，保隧道不断、10 秒 `/health` 失败自动回滚，零改动 `config.json` 与 `oauth-store.json`）
 - 测试：`npm run test`（vitest，跨组件验收一律走 MCP 客户端入口）；Rust 侧单独跑 `npm run test:rs`
 - 自检：`npm run smoke`（起服务、列出工具、调一次 `read`）
 - 本地 CI：`npm run check`（build + vitest + cargo test + smoke，提交推送前必须全部通过）

@@ -24,8 +24,9 @@ const seaDir = path.join(buildDir, "sea");
 const releaseDir = path.join(root, "release");
 
 const APP_NAME = "nexus-mcp";
+const TRAY_EXE = `${APP_NAME}.exe`;
+const SERVER_EXE = "nexus-server.exe";
 const EXECUTOR = "nexus-executor.exe";
-const START_SCRIPT = "启动.cmd";
 const GUIDE = "使用说明.txt";
 const ZIP_NAME = `${APP_NAME}-${VERSION}-win64.zip`;
 const SETUP_NAME = `${APP_NAME}_${VERSION}_x64-setup.exe`;
@@ -120,8 +121,8 @@ async function buildSingleExe(bundle: string): Promise<string> {
   execFileSync(process.execPath, ["--experimental-sea-config", seaConfig], { stdio: "inherit" });
   requireFile(blob, "SEA blob 没有生成，当前 Node 可能不支持 SEA。");
 
-  step("注入 blob，产出 nexus-mcp.exe");
-  const exePath = path.join(stageDir, `${APP_NAME}.exe`);
+  step(`注入 blob，产出 ${SERVER_EXE}`);
+  const exePath = path.join(stageDir, SERVER_EXE);
   copyFileSync(process.execPath, exePath);
 
   const { inject } = await import("postject");
@@ -132,34 +133,20 @@ async function buildSingleExe(bundle: string): Promise<string> {
 }
 
 function writeRuntimeFiles(): void {
-  step("写启动脚本与说明");
-  // chcp 65001 保证 cmd 窗口里的中文日志不乱码；--open-panel 由程序自己拉面板
-  writeFileSync(
-    path.join(stageDir, START_SCRIPT),
-    [
-      "@echo off",
-      "chcp 65001 > nul",
-      'cd /d "%~dp0"',
-      "echo nexus-mcp 启动中，控制面板稍后自动打开……",
-      `${APP_NAME}.exe --open-panel`,
-      "if errorlevel 1 pause",
-      "",
-    ].join("\r\n"),
-    "utf8",
-  );
-
+  step("写使用说明");
   writeFileSync(
     path.join(stageDir, GUIDE),
     [
       `${APP_NAME} ${VERSION} —— 三步上手`,
       "",
-      `1. 双击「${START_SCRIPT}」，等控制面板在浏览器里打开。`,
-      "2. 面板「连接信息」里直接显示云端要填的 MCP 地址和令牌，点「复制地址+令牌」一次带走。",
+      `1. 双击「${TRAY_EXE}」，程序无黑框驻留到右下角系统托盘（再次双击直接打开控制面板）。`,
+      "2. 双击托盘图标或右键选「打开控制面板」，复制「连接信息」里的 MCP 地址和令牌。",
       "3. 把地址和令牌填进 Gemini 自定义 MCP / ChatGPT 连接器，就能调 read / write / edit /",
       "   bash / glob / grep / job_start / job_output / job_kill 这 9 个工具。",
       "",
+      "快捷操作：右键右下角托盘图标可重启服务、启停隧道、打开日志目录、勾选「开机自启」或安全退出（连同隧道一并停止）。",
       "改沙箱根目录：面板「根目录」点「选择…」挑文件夹，或直接改 config.json 的 root。默认是 exe 同目录的 workspace。",
-      "卸载：设置 → 应用 → nexus-mcp。config.json 与 workspace 不会被删。",
+      "卸载：设置 → 应用 → nexus-mcp。config.json、oauth-store.json 与 workspace 不会被删。",
       "",
     ].join("\r\n"),
     "utf8",
@@ -211,8 +198,13 @@ function buildInstaller(nsis: string): string {
 async function main(): Promise<void> {
   if (process.platform !== "win32") fail("当前只做 Windows 发布包。");
 
+  const stageOnly = process.argv.includes("--stage-only");
+  const traySrc = path.join(root, "crates", "target", "release", TRAY_EXE);
+  const execSrc = path.join(root, "crates", "target", "release", EXECUTOR);
+
   requireFile(path.join(root, "dist", "index.js"), "先运行 npm run build。");
-  requireFile(path.join(root, "crates", "target", "release", EXECUTOR), "先运行 npm run build。");
+  requireFile(execSrc, "先运行 npm run build。");
+  requireFile(traySrc, "先运行 npm run build（含 build:tray）。");
 
   rmSync(stageDir, { recursive: true, force: true });
   rmSync(seaDir, { recursive: true, force: true });
@@ -223,10 +215,17 @@ async function main(): Promise<void> {
   const bundle = await bundleToCjs();
   await buildSingleExe(bundle);
 
-  step("拷入执行器");
-  copyFileSync(path.join(root, "crates", "target", "release", EXECUTOR), path.join(stageDir, EXECUTOR));
+  step("拷入托盘宿主与执行器");
+  copyFileSync(traySrc, path.join(stageDir, TRAY_EXE));
+  copyFileSync(execSrc, path.join(stageDir, EXECUTOR));
 
   writeRuntimeFiles();
+
+  if (stageOnly) {
+    console.log(`\n最小三件套构建完成：${stageDir}`);
+    console.log(`- 产物: ${[TRAY_EXE, SERVER_EXE, EXECUTOR, GUIDE].join("、")}`);
+    return;
+  }
 
   const nsis = await ensureNsis();
   const zipPath = zipStage();
@@ -236,7 +235,7 @@ async function main(): Promise<void> {
   console.log(`\n完成，版本 ${VERSION}`);
   console.log(`- zip:   ${zipPath} (${mb(zipPath)})`);
   console.log(`- 安装包: ${setupPath} (${mb(setupPath)})`);
-  console.log(`- 安装包内文件: ${[`${APP_NAME}.exe`, EXECUTOR, START_SCRIPT, GUIDE].join("、")}`);
+  console.log(`- 安装包内文件: ${[TRAY_EXE, SERVER_EXE, EXECUTOR, GUIDE].join("、")}`);
 }
 
 main().catch((error: unknown) => {
