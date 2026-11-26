@@ -59,6 +59,20 @@ describe("工具清单", () => {
       expect(tool.description?.trim().length ?? 0).toBeGreaterThan(0);
     }
   });
+
+  it("initialize 返回的 serverInfo 携带标准 icons", () => {
+    const info = client.getServerVersion();
+    expect(info?.name).toBe("nexus-mcp");
+    const icons = info?.icons ?? [];
+    expect(icons.length).toBeGreaterThanOrEqual(2);
+    // src 必须是可公网抓取的 URL，不允许 data URI（Gemini 连接器会拒绝整个连接）
+    expect(icons.some((i) => i.mimeType === "image/png" && i.src.endsWith("/icon.png") && !i.src.startsWith("data:"))).toBe(
+      true,
+    );
+    expect(icons.some((i) => i.mimeType === "image/svg+xml" && i.src.endsWith("/favicon.svg") && !i.src.startsWith("data:"))).toBe(
+      true,
+    );
+  });
 });
 
 describe("沙箱边界", () => {

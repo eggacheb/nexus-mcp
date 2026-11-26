@@ -8,6 +8,7 @@ import type { AppConfig } from "./config.js";
 import { configFilePath } from "./config.js";
 import { closeExecutor } from "./executor.js";
 import { readBody, sendJson } from "./httpHelpers.js";
+import { handleIconRequest } from "./icon.js";
 import { logDebug, logError, logInfo, logWarn, redactText } from "./log.js";
 import { OAuthProvider, safeEqual } from "./oauth.js";
 import { createServer } from "./server.js";
@@ -228,7 +229,7 @@ async function releaseSession(
   }
 }
 
-function createSession(config: AppConfig, sessions: Map<string, Session>): Session {
+function createSession(config: AppConfig, sessions: Map<string, Session>, baseUrl: string): Session {
   let session!: Session;
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => randomUUID(),
@@ -250,7 +251,7 @@ function createSession(config: AppConfig, sessions: Map<string, Session>): Sessi
     });
   };
   session = {
-    server: createServer(config, { sessionId: () => session.id }),
+    server: createServer(config, { sessionId: () => session.id, baseUrl }),
     transport,
     closed: false,
     lastSeen: Date.now(),
@@ -312,6 +313,11 @@ export function createMcpService(config: AppConfig): McpService {
     // 健康检查在鉴权之前：只暴露服务存活，不带任何敏感信息
     if (requestUrl.pathname === HEALTH_PATH) {
       sendJson(res, 200, { ok: true, service: "nexus-mcp" });
+      return;
+    }
+
+    // 静态图标在鉴权之前：供云端连接器与浏览器抓取 /favicon.ico 等路径，不刷日志
+    if (handleIconRequest(req, res, requestUrl.pathname)) {
       return;
     }
 
@@ -379,7 +385,7 @@ export function createMcpService(config: AppConfig): McpService {
       for (const rpcMethod of rpcControlMethods(parsed)) {
         logDebug("mcp.rpc", { sid: "init", method: rpcMethod });
       }
-      const session = createSession(config, sessions);
+      const session = createSession(config, sessions, publicBaseUrl());
       await session.server.connect(session.transport);
       await session.transport.handleRequest(req, res, parsed);
       if (session.id) {

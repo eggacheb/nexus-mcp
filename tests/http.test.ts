@@ -117,6 +117,37 @@ describe("HTTP 传输（配置了令牌）", () => {
   );
 
   it(
+    "免鉴权提供 /favicon.ico、/favicon.svg 与 /icon.png 供连接器展示图标",
+    async () => {
+      const base = `http://127.0.0.1:${server.port}`;
+
+      const ico = await fetch(`${base}/favicon.ico`);
+      expect(ico.status).toBe(200);
+      expect(ico.headers.get("content-type")).toContain("image/x-icon");
+      const icoBuf = Buffer.from(await ico.arrayBuffer());
+      expect(icoBuf.subarray(0, 4)).toEqual(Buffer.from([0x00, 0x00, 0x01, 0x00]));
+
+      const icoHead = await fetch(`${base}/favicon.ico`, { method: "HEAD" });
+      expect(icoHead.status).toBe(200);
+      expect((await icoHead.arrayBuffer()).byteLength).toBe(0);
+
+      for (const pngPath of ["/icon.png", "/apple-touch-icon.png"]) {
+        const png = await fetch(`${base}${pngPath}`);
+        expect(png.status, pngPath).toBe(200);
+        expect(png.headers.get("content-type")).toContain("image/png");
+        const pngBuf = Buffer.from(await png.arrayBuffer());
+        expect(pngBuf.subarray(0, 4)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+      }
+
+      const svg = await fetch(`${base}/favicon.svg`);
+      expect(svg.status).toBe(200);
+      expect(svg.headers.get("content-type")).toContain("image/svg+xml");
+      expect(await svg.text()).toContain("<svg");
+    },
+    20_000,
+  );
+
+  it(
     "缺少 Authorization 头返回 401，并说明缺什么",
     async () => {
       const error = await connectError(server.mcpUrl);

@@ -40,6 +40,8 @@ const MAX_ERR_LOG_CHARS = 160;
 export interface RegisterToolsOptions {
   /** HTTP 传输下返回当前会话 id；stdio 下省略，日志记为 stdio */
   sessionId?: () => string | undefined;
+  /** 对外公网地址（隧道地址优先），用于拼 serverInfo.icons 的可访问 URL */
+  baseUrl?: string;
 }
 
 /**

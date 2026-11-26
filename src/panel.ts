@@ -15,6 +15,7 @@ import {
   validateShell,
 } from "./config.js";
 import { readBody, sendJson as sendJsonRaw } from "./httpHelpers.js";
+import { ICON_DATA_URI_SVG } from "./icon.js";
 import { logError, logInfo, logWarn, recentLogs, redactText, setLogLevel } from "./log.js";
 import type { McpService } from "./mcpService.js";
 import type { ComponentStatus, TunnelStatus } from "./status.js";
@@ -57,6 +58,7 @@ const PAGE = `<!doctype html>
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="icon" type="image/svg+xml" href="${ICON_DATA_URI_SVG}" />
 <title>nexus-mcp 控制面板</title>
 <style>
   :root {
