@@ -5,9 +5,10 @@
 //! 2. 黑名单（config deny 模式，命中即拒绝并说明规则）
 //! 3. 白名单（config allow 模式，非空时未命中的子命令按 onUnmatched 处理，默认拒绝）
 //!
-//! 命令先拆成简单命令段再逐段判定：顶层运算符（`;` `&&` `||` `|` `&`）切段、
-//! `$()`/反引号/进程替换内部递归一层检查、sudo/env 前导剥离、`VAR=value` 赋值剥离、
-//! trap 的 action 当 shell 源码递归。引号不闭合或命令名是变量时按 fail-closed 拒绝。
+//! 命令先拆成简单命令段再逐段判定：顶层运算符（`;` `\n` `&&` `||` `|` `&`）切段、
+//! 子 shell `( ... )` 与 `$()`/反引号/进程替换内部递归检查、花括号组与控制流前导词剥离、
+//! sudo/env 前导剥离、`VAR=value` 赋值剥离、trap 的 action 当 shell 源码递归。
+//! 引号/括号不闭合或命令名是变量时按 fail-closed 拒绝。
 //!
 //! 已知局限（与 codex 的字面匹配哲学一致）：字面量判定看不见动态展开后的命令内容，
 //! 动态命令名（首词含 `$`）一律 fail-closed；复杂数据流（管道输入喂给 rm 等）不在字面判定范围内。
@@ -138,20 +139,139 @@ pub fn executable_lookup_key(raw: &str) -> Option<String> {
 
 // ── 命令拆分 ─────────────────────────────────────────────────────────────────
 
-/// 引号感知地把一行命令拆成简单命令段。
-/// `Err(reason)` 表示解析失败（引号/括号未闭合、动态命令名、嵌套过深），fail-closed。
-fn collect_segments(text: &str, depth: usize, out: &mut Vec<Segment>) -> Result<(), String> {
-    if depth > MAX_WRAPPER_DEPTH {
-        return Err("wrapper 或替换体嵌套过深（超过 8 层）".to_string());
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShellKind {
+    GitBash,
+    Pwsh,
+    Other,
+}
+
+impl ShellKind {
+    fn parse(raw: &str) -> Self {
+        match raw {
+            "git-bash" => Self::GitBash,
+            "pwsh" => Self::Pwsh,
+            _ => Self::Other,
+        }
     }
-    let chars: Vec<char> = text.chars().collect();
-    let mut seg_start = 0usize;
-    let mut i = 0usize;
-    while i < chars.len() {
+}
+
+struct SegmentCollector<'a> {
+    shell: ShellKind,
+    out: &'a mut Vec<Segment>,
+}
+
+impl<'a> SegmentCollector<'a> {
+    /// 引号感知地把命令文本拆成简单命令段。
+    /// `Err(reason)` 表示解析失败（引号/括号未闭合、动态命令名、嵌套过深），fail-closed。
+    fn collect_segments(&mut self, text: &str, depth: usize) -> Result<(), String> {
+        if depth > MAX_WRAPPER_DEPTH {
+            return Err("wrapper 或替换体嵌套过深（超过 8 层）".to_string());
+        }
+        let chars: Vec<char> = text.chars().collect();
+        let mut current = String::new();
+        let mut i = 0usize;
+        while i < chars.len() {
+            if let Some(next) = self.step_quoted_or_substitution(&chars, i, depth)? {
+                current.extend(&chars[i..next]);
+                i = next;
+                continue;
+            }
+            match chars[i] {
+                '(' => {
+                    let (body, end) = extract_delimited(&chars, i + 1, '(', ')', "括号未闭合")?;
+                    if self.shell != ShellKind::Pwsh && is_trailing_array_assignment(&current) {
+                        // bash 数组赋值 VAR=(a b $(cmd))：元素本身不是命令，只递归扫描内部的命令替换
+                        let before_last = current
+                            .trim_end()
+                            .rsplit_once(char::is_whitespace)
+                            .map(|(head, _)| head)
+                            .unwrap_or("");
+                        self.flush_segment(before_last, depth)?;
+                        current.clear();
+                        self.collect_substitutions(&body, depth + 1)?;
+                    } else if self.shell == ShellKind::Pwsh && is_pwsh_condition_header(&current) {
+                        // pwsh 控制流条件 `if ($true)` / `while ($x -lt 1)`：剥除控制流头，
+                        // 先扫内部替换，若条件首词像命令字面量（如 `if (rm -Force x)`）也按命令段检查
+                        current.clear();
+                        self.collect_substitutions(&body, depth + 1)?;
+                        if pwsh_condition_looks_like_command(&body) {
+                            self.collect_segments(&body, depth + 1)?;
+                        }
+                    } else if self.shell == ShellKind::Pwsh && !current.trim().is_empty() {
+                        // pwsh 非段首括号子表达式（如 `echo (git push ...)` 或 `$x = (curl ...)`）：
+                        // 括号内管道会直接执行，必须递归按命令段检查；外层用字面占位保留主命令匹配
+                        if is_pwsh_var_assignment_prefix(&current) {
+                            current.clear();
+                        } else {
+                            current.push_str("__subexpr__");
+                        }
+                        self.collect_segments(&body, depth + 1)?;
+                    } else {
+                        // git-bash 任意未引号 '('（子 shell / 函数头）与 pwsh 段首 '(...)'
+                        self.flush_segment(&current, depth)?;
+                        current.clear();
+                        self.collect_segments(&body, depth + 1)?;
+                    }
+                    i = end;
+                }
+                ')' => return Err("括号未闭合".to_string()),
+                '{' if self.shell == ShellKind::Pwsh => {
+                    // pwsh 脚本块 `{ ... }`（含 `if (...) { ... }`、`& { ... }`、`. { ... }`、`ForEach-Object { ... }`）
+                    let before_block = strip_pwsh_block_prefix(&current);
+                    self.flush_segment(before_block, depth)?;
+                    current.clear();
+                    let (body, end) = extract_delimited(&chars, i + 1, '{', '}', "花括号未闭合")?;
+                    self.collect_segments(&body, depth + 1)?;
+                    i = end;
+                }
+                '}' if self.shell == ShellKind::Pwsh => {
+                    return Err("花括号未闭合".to_string());
+                }
+                '&' | '|' | ';' | '\n' if is_separator(&chars, i) => {
+                    self.flush_segment(&current, depth)?;
+                    current.clear();
+                    i = separator_end(&chars, i);
+                }
+                ch => {
+                    current.push(ch);
+                    i += 1;
+                }
+            }
+        }
+        self.flush_segment(&current, depth)?;
+        Ok(())
+    }
+
+    /// 扫描非命令上下文（如数组字面量或纯变量条件括号）中潜藏的 `$(...)` / 反引号 / 进程替换。
+    fn collect_substitutions(&mut self, text: &str, depth: usize) -> Result<(), String> {
+        if depth > MAX_WRAPPER_DEPTH {
+            return Err("wrapper 或替换体嵌套过深（超过 8 层）".to_string());
+        }
+        let chars: Vec<char> = text.chars().collect();
+        let mut i = 0usize;
+        while i < chars.len() {
+            if let Some(next) = self.step_quoted_or_substitution(&chars, i, depth)? {
+                i = next;
+            } else {
+                i += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// 共用词法步进：处理转义、单/双引号（含双引号内替换）以及未引号的 `$()` / 反引号 / `<()`。
+    /// 命中时递归收集内部替换体并返回消费后的新下标；未命中返回 `Ok(None)`。
+    fn step_quoted_or_substitution(
+        &mut self,
+        chars: &[char],
+        i: usize,
+        depth: usize,
+    ) -> Result<Option<usize>, String> {
         match chars[i] {
             '\'' => {
-                let end = find_closing(&chars, i + 1, '\'')?;
-                i = end + 1;
+                let end = find_closing(chars, i + 1, '\'')?;
+                Ok(Some(end + 1))
             }
             '"' => {
                 let mut j = i + 1;
@@ -163,15 +283,15 @@ fn collect_segments(text: &str, depth: usize, out: &mut Vec<Segment>) -> Result<
                             closed = true;
                             break;
                         }
-                        // 双引号内的命令替换同样会执行，递归检查替换体
                         '$' if j + 1 < chars.len() && chars[j + 1] == '(' => {
-                            let (body, end) = extract_paren(&chars, j + 2)?;
-                            collect_segments(&body, depth + 1, out)?;
+                            let (body, end) =
+                                extract_delimited(chars, j + 2, '(', ')', "括号未闭合")?;
+                            self.collect_segments(&body, depth + 1)?;
                             j = end;
                         }
-                        '`' => {
-                            let (body, end) = extract_backtick(&chars, j + 1)?;
-                            collect_segments(&body, depth + 1, out)?;
+                        '`' if self.shell != ShellKind::Pwsh => {
+                            let (body, end) = extract_backtick(chars, j + 1)?;
+                            self.collect_segments(&body, depth + 1)?;
                             j = end;
                         }
                         _ => j += 1,
@@ -180,49 +300,210 @@ fn collect_segments(text: &str, depth: usize, out: &mut Vec<Segment>) -> Result<
                 if !closed {
                     return Err("引号未闭合".to_string());
                 }
-                i = j + 1;
+                Ok(Some(j + 1))
             }
-            '\\' if i + 1 < chars.len() => i += 2,
+            '\\' if i + 1 < chars.len() => Ok(Some(i + 2)),
             '$' if i + 1 < chars.len() && chars[i + 1] == '(' => {
-                let (body, end) = extract_paren(&chars, i + 2)?;
-                collect_segments(&body, depth + 1, out)?;
-                i = end;
+                let (body, end) = extract_delimited(chars, i + 2, '(', ')', "括号未闭合")?;
+                self.collect_segments(&body, depth + 1)?;
+                Ok(Some(end))
             }
-            '`' => {
-                let (body, end) = extract_backtick(&chars, i + 1)?;
-                collect_segments(&body, depth + 1, out)?;
-                i = end;
+            '`' if self.shell != ShellKind::Pwsh => {
+                let (body, end) = extract_backtick(chars, i + 1)?;
+                self.collect_segments(&body, depth + 1)?;
+                Ok(Some(end))
             }
             '<' | '>' if i + 1 < chars.len() && chars[i + 1] == '(' => {
-                let (body, end) = extract_paren(&chars, i + 2)?;
-                collect_segments(&body, depth + 1, out)?;
-                i = end;
+                let (body, end) = extract_delimited(chars, i + 2, '(', ')', "括号未闭合")?;
+                self.collect_segments(&body, depth + 1)?;
+                Ok(Some(end))
             }
-            '&' | '|' | ';' | '\n' => {
-                if is_separator(&chars, i) {
-                    let piece: String = chars[seg_start..i].iter().collect();
-                    flush_segment(&piece, depth, out)?;
-                    let end = separator_end(&chars, i);
-                    seg_start = end;
-                    i = end;
-                } else {
-                    i += 1;
-                }
-            }
-            _ => i += 1,
+            _ => Ok(None),
         }
     }
-    let piece: String = chars[seg_start..].iter().collect();
-    flush_segment(&piece, depth, out)?;
-    Ok(())
+
+    /// 处理一个顶层片段：shlex 分词 → wrapper/控制流前导词剥离 → 动态命令名检查 → 收集。
+    fn flush_segment(&mut self, piece: &str, depth: usize) -> Result<(), String> {
+        let trimmed = piece.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+        let words = shlex::split(trimmed).ok_or_else(|| "引号未闭合".to_string())?;
+        if words.is_empty() {
+            return Ok(());
+        }
+        let words = self.strip_wrappers(words, depth)?;
+
+        // trap 的 action 是 shell 源码，递归检查后再继续判定剩余词
+        if words.first().map(|w| w == "trap").unwrap_or(false) {
+            let mut idx = 1;
+            if words.get(idx).map(|w| w == "--").unwrap_or(false) {
+                idx += 1;
+            }
+            if let Some(action) = words.get(idx).filter(|w| !w.starts_with('-')) {
+                self.collect_segments(action, depth + 1)?;
+            }
+        }
+
+        let Some(first) = words.first() else {
+            return Ok(());
+        };
+        if first.contains('$') || first.contains('`') {
+            return Err(format!("命令名含变量或命令替换（{first}），无法判定将要执行什么"));
+        }
+        self.out.push(Segment { words });
+        Ok(())
+    }
+
+    /// 剥离 sudo / env wrapper 及各 shell 的花括号组与控制流前导关键字（深度计数防炸）。
+    fn strip_wrappers(&self, words: Vec<String>, depth: usize) -> Result<Vec<String>, String> {
+        if depth > MAX_WRAPPER_DEPTH {
+            return Err("wrapper 嵌套过深（超过 8 层）".to_string());
+        }
+        let mut words = strip_assignments(words);
+        if self.shell == ShellKind::Pwsh {
+            loop {
+                let Some(head) = words.first().map(String::as_str) else {
+                    return Ok(words);
+                };
+                if head.eq_ignore_ascii_case("else")
+                    || head.eq_ignore_ascii_case("try")
+                    || head.eq_ignore_ascii_case("finally")
+                    || head.eq_ignore_ascii_case("do")
+                    || (head == "." && words.len() > 1)
+                {
+                    words.remove(0);
+                } else {
+                    break;
+                }
+            }
+        } else {
+            // 花括号组与控制流关键字不消耗 wrapper 递归预算，循环剥离紧随其后的真实子命令
+            loop {
+                while matches!(words.last().map(String::as_str), Some("}")) && words.len() == 1 {
+                    words.pop();
+                }
+                let Some(head) = words.first().map(String::as_str) else {
+                    return Ok(words);
+                };
+                match head {
+                    "}" | "fi" | "done" | "esac" if words.len() == 1 => {
+                        words.clear();
+                        return Ok(words);
+                    }
+                    "{" | "then" | "else" | "do" | "if" | "elif" | "while" | "until" | "!" => {
+                        words.remove(0);
+                        words = strip_assignments(words);
+                    }
+                    "time" => {
+                        words.remove(0);
+                        while matches!(words.first().map(String::as_str), Some("-p" | "--")) {
+                            words.remove(0);
+                        }
+                        words = strip_assignments(words);
+                    }
+                    _ => break,
+                }
+            }
+        }
+        let Some(first) = words.first().cloned() else {
+            return Ok(words);
+        };
+        match first.as_str() {
+            "sudo" => self.strip_wrappers(words[1..].to_vec(), depth + 1),
+            "env" => {
+                let mut rest = words[1..].to_vec();
+                while let Some(arg) = rest.first().cloned() {
+                    if arg == "-i" || arg == "--ignore-environment" || is_assignment(&arg) {
+                        rest.remove(0);
+                    } else if arg == "--" {
+                        rest.remove(0);
+                        break;
+                    } else {
+                        break;
+                    }
+                }
+                self.strip_wrappers(rest, depth + 1)
+            }
+            _ => Ok(words),
+        }
+    }
 }
 
-/// 判断 chars[i] 处的 `&`/`|`/`;` 是否是命令分隔符：
+/// 判断 `'('` 紧邻的前缀末尾是否是 `VAR=` 形态的数组赋值头。
+fn is_trailing_array_assignment(prefix: &str) -> bool {
+    if !prefix.ends_with('=') {
+        return false;
+    }
+    let last_token = prefix.rsplit(char::is_whitespace).next().unwrap_or("");
+    is_assignment(last_token)
+}
+
+/// 判断 pwsh 中紧邻 `'('` 之前的前缀是否为控制流条件头（如 `if` / `elseif` / `while` / `switch`）。
+fn is_pwsh_condition_header(prefix: &str) -> bool {
+    let mut tokens = prefix.split_whitespace().peekable();
+    while let Some(&tok) = tokens.peek() {
+        if tok.eq_ignore_ascii_case("else") || tok.eq_ignore_ascii_case("do") {
+            tokens.next();
+        } else {
+            break;
+        }
+    }
+    let rest: Vec<&str> = tokens.collect();
+    matches!(rest.as_slice(), [kw] if matches!(
+        kw.to_ascii_lowercase().as_str(),
+        "if" | "elseif" | "while" | "until" | "switch" | "for" | "foreach"
+    ))
+}
+
+/// 判断 pwsh 条件括号体是否以字面命令而非纯变量/字面量表达式开头（如 `if (rm -Force x)`）。
+fn pwsh_condition_looks_like_command(body: &str) -> bool {
+    let trimmed = body.trim_start().trim_start_matches('!').trim_start();
+    let Some(first_ch) = trimmed.chars().next() else {
+        return false;
+    };
+    !matches!(first_ch, '$' | '\'' | '"' | '(' | '@' | '[' | '-' | '0'..='9')
+}
+
+/// 判断 pwsh 中紧邻 `'('` 之前是否为 `$var =` 赋值前缀。
+fn is_pwsh_var_assignment_prefix(prefix: &str) -> bool {
+    let Some(lhs) = prefix.trim_end().strip_suffix('=') else {
+        return false;
+    };
+    let lhs = lhs.trim();
+    lhs.starts_with('$') && !lhs.chars().any(char::is_whitespace)
+}
+
+/// 剥离 pwsh `{ ... }` 脚本块之前的控制流关键字与 `.` 调用算子，保留真实前置命令（如 `ForEach-Object`）。
+fn strip_pwsh_block_prefix(prefix: &str) -> &str {
+    let mut rest = prefix.trim();
+    loop {
+        if let Some(after_dot) = rest.strip_prefix('.')
+            && (after_dot.is_empty() || after_dot.starts_with(char::is_whitespace))
+        {
+            rest = after_dot.trim_start();
+            continue;
+        }
+        let first_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let first = &rest[..first_end];
+        if matches!(
+            first.to_ascii_lowercase().as_str(),
+            "else" | "try" | "finally" | "do" | "begin" | "process" | "end"
+        ) {
+            rest = rest[first_end..].trim_start();
+        } else {
+            break;
+        }
+    }
+    rest
+}
+
+/// 判断 chars[i] 处的 `&`/`|`/`;`/`\n` 是否是命令分隔符：
 /// `&&`/`||` 是；`&>`、`>&`、`|&` 的黏连形态不是纯分隔或按分隔处理（`|&` 切在 `|`）。
 fn is_separator(chars: &[char], i: usize) -> bool {
     let c = chars[i];
     match c {
-        ';' => true,
+        ';' | '\n' => true,
         '&' => {
             let next = chars.get(i + 1).copied();
             let prev = if i > 0 { Some(chars[i - 1]) } else { None };
@@ -262,13 +543,22 @@ fn find_closing(chars: &[char], from: usize, quote: char) -> Result<usize, Strin
     Err("引号未闭合".to_string())
 }
 
-/// 提取 `$( ... )` / `<( ... )` 的替换体：配对扫描（引号内不计括号，括号平衡计数）。
-/// 返回 (体文本, 右括号之后的位置)。
-fn extract_paren(chars: &[char], from: usize) -> Result<(String, usize), String> {
+/// 提取成对定界符体（`( ... )` 或 `{ ... }`）：配对扫描，跳过转义与引号内定界符。
+/// 返回 (体文本, 右定界符之后的位置)。
+fn extract_delimited(
+    chars: &[char],
+    from: usize,
+    open: char,
+    close: char,
+    unclosed_reason: &'static str,
+) -> Result<(String, usize), String> {
     let mut depth = 1usize;
     let mut j = from;
     while j < chars.len() {
         match chars[j] {
+            '\\' if j + 1 < chars.len() => {
+                j += 2;
+            }
             '\'' => {
                 let end = find_closing(chars, j + 1, '\'')?;
                 j = end + 1;
@@ -277,11 +567,11 @@ fn extract_paren(chars: &[char], from: usize) -> Result<(String, usize), String>
                 let end = find_closing(chars, j + 1, '"')?;
                 j = end + 1;
             }
-            '(' => {
+            ch if ch == open => {
                 depth += 1;
                 j += 1;
             }
-            ')' => {
+            ch if ch == close => {
                 depth -= 1;
                 if depth == 0 {
                     return Ok((chars[from..j].iter().collect(), j + 1));
@@ -291,7 +581,7 @@ fn extract_paren(chars: &[char], from: usize) -> Result<(String, usize), String>
             _ => j += 1,
         }
     }
-    Err("括号未闭合".to_string())
+    Err(unclosed_reason.to_string())
 }
 
 /// 提取反引号替换体。返回 (体文本, 反引号之后的位置)。
@@ -308,39 +598,6 @@ fn extract_backtick(chars: &[char], from: usize) -> Result<(String, usize), Stri
         j += 1;
     }
     Err("反引号未闭合".to_string())
-}
-
-/// 处理一个顶层片段：shlex 分词 → wrapper 剥离 → 动态命令名检查 → 收集。
-fn flush_segment(piece: &str, depth: usize, out: &mut Vec<Segment>) -> Result<(), String> {
-    let trimmed = piece.trim();
-    if trimmed.is_empty() {
-        return Ok(());
-    }
-    let words = shlex::split(trimmed).ok_or_else(|| "引号未闭合".to_string())?;
-    if words.is_empty() {
-        return Ok(());
-    }
-    let words = strip_wrappers(words, depth)?;
-
-    // trap 的 action 是 shell 源码，递归检查后再继续判定剩余词
-    if words.first().map(|w| w == "trap").unwrap_or(false) {
-        let mut idx = 1;
-        if words.get(idx).map(|w| w == "--").unwrap_or(false) {
-            idx += 1;
-        }
-        if let Some(action) = words.get(idx).filter(|w| !w.starts_with('-')) {
-            collect_segments(action, depth + 1, out)?;
-        }
-    }
-
-    let Some(first) = words.first() else {
-        return Ok(());
-    };
-    if first.contains('$') || first.contains('`') {
-        return Err(format!("命令名含变量或命令替换（{first}），无法判定将要执行什么"));
-    }
-    out.push(Segment { words });
-    Ok(())
 }
 
 /// 剥离前导 `VAR=value` 赋值。
@@ -365,45 +622,16 @@ fn is_assignment(word: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// 剥离 sudo / env wrapper（照 codex command_safety 的 wrapper 语义，深度计数防炸）。
-fn strip_wrappers(words: Vec<String>, depth: usize) -> Result<Vec<String>, String> {
-    if depth > MAX_WRAPPER_DEPTH {
-        return Err("wrapper 嵌套过深（超过 8 层）".to_string());
-    }
-    let words = strip_assignments(words);
-    let Some(first) = words.first().cloned() else {
-        return Ok(words);
-    };
-    match first.as_str() {
-        "sudo" => strip_wrappers(words[1..].to_vec(), depth + 1),
-        "env" => {
-            let mut rest = words[1..].to_vec();
-            while let Some(arg) = rest.first().cloned() {
-                if arg == "-i" || arg == "--ignore-environment" || is_assignment(&arg) {
-                    rest.remove(0);
-                } else if arg == "--" {
-                    rest.remove(0);
-                    break;
-                } else {
-                    break;
-                }
-            }
-            strip_wrappers(rest, depth + 1)
-        }
-        _ => Ok(words),
-    }
-}
-
 // ── 内置危险表 ───────────────────────────────────────────────────────────────
 
 /// 内置危险规则判定（兜底 deny，不依赖用户配置）。
-/// shell_kind 是本请求的 shell（"git-bash" | "pwsh"），决定 PowerShell 规则的适用面；
+/// shell 是本请求的 shell（GitBash | Pwsh），决定 PowerShell 规则的适用面；
 /// cmd.exe / pwsh 显式包裹的规则在任何 shell 下都生效。
-fn builtin_danger(words: &[String], shell_kind: &str) -> Option<(&'static str, &'static str, &'static str)> {
+fn builtin_danger(words: &[String], shell: ShellKind) -> Option<(&'static str, &'static str, &'static str)> {
     let first = words.first()?;
     let exec = executable_lookup_key(first).unwrap_or_else(|| first.clone());
     match exec.as_str() {
-        "rm" if shell_kind == "git-bash"
+        "rm" if shell == ShellKind::GitBash
             && rm_has_flag(&words[1..], &['r', 'R'], "--recursive")
             && rm_has_flag(&words[1..], &['f'], "--force") => {
             Some((
@@ -435,7 +663,7 @@ fn builtin_danger(words: &[String], shell_kind: &str) -> Option<(&'static str, &
             let (rule, why, alt) = powershell_wrapper_danger(words)?;
             Some((rule, why, alt))
         }
-        _ if shell_kind == "pwsh" => {
+        _ if shell == ShellKind::Pwsh => {
             let (rule, why, alt) = powershell_force_delete(words)?;
             Some((rule, why, alt))
         }
@@ -643,14 +871,19 @@ const MAX_ALLOW_PATTERNS_SHOWN: usize = 8;
 /// 闸门入口：对一条 shell 命令行做内置危险检查与白/黑名单判定。
 /// shell_kind 为 "git-bash" 或 "pwsh"（与 ShellSpec.kind 一致）。
 pub fn evaluate(spec: &CommandPolicySpec, command: &str, shell_kind: &str) -> Decision {
+    let shell = ShellKind::parse(shell_kind);
     let mut segments: Vec<Segment> = Vec::new();
-    if let Err(reason) = collect_segments(command, 0, &mut segments) {
+    let mut collector = SegmentCollector {
+        shell,
+        out: &mut segments,
+    };
+    if let Err(reason) = collector.collect_segments(command, 0) {
         return Decision::Deny(fail_closed_message(command, &reason));
     }
 
     // 1. 内置危险表：兜底 deny，优先于任何用户配置
     for segment in &segments {
-        if let Some((rule, why, alternative)) = builtin_danger(&segment.words, shell_kind) {
+        if let Some((rule, why, alternative)) = builtin_danger(&segment.words, shell) {
             return Decision::Deny(danger_message(command, rule, why, alternative));
         }
     }

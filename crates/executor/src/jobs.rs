@@ -16,7 +16,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::head_tail_buffer::{HeadTailBuffer, format_output_omission_marker};
-use crate::string::{aligned_tail, truncated_prefix};
+use crate::string::{aligned_tail, decode_lossy_stream, utf8_straddle_skip};
 
 /// job 输出缓冲与单次读取的缺省字节上限，与配置 maxOutputBytes 默认一致
 const DEFAULT_JOB_MAX_OUTPUT_BYTES: u64 = 64 * 1024;
@@ -35,6 +35,8 @@ fn default_job_max_output_bytes() -> u64 {
 pub struct JobStartRequest {
     pub id: u64,
     pub command: String,
+    pub root: String,
+    #[serde(default)]
     pub cwd: String,
     pub max_output_bytes: u64,
     pub shell: crate::ShellSpec,
@@ -140,11 +142,15 @@ impl JobRegistry {
         ) {
             return response;
         }
+        let work_dir = match crate::resolve_work_dir(&request.root, &request.cwd, id) {
+            Ok(dir) => dir,
+            Err(response) => return response,
+        };
         let command = match crate::build_shell_command(
             &request.shell.kind,
             &request.shell.program,
             &request.command,
-            &request.cwd,
+            &work_dir,
         ) {
             Ok(command) => command,
             Err(message) => return crate::error_response(id, message),
@@ -210,6 +216,15 @@ impl JobRegistry {
             Err(response) => return response,
         };
 
+        // 先读任务状态再拍输出快照：若已 Exited 则缓冲已最终落定，末尾残缺 UTF-8 序列不再挂起等待
+        let (is_running, status, exit_code) = {
+            let state = job.state.lock().expect("任务状态锁不应中毒");
+            match *state {
+                JobState::Running => (true, "running", None),
+                JobState::Exited { exit_code } => (false, "exited", Some(exit_code)),
+            }
+        };
+
         // 快照缓冲：head 在前 tail 在后（omitted>0 时中间隔着丢弃段），拷贝一次
         // 便于按原始字节坐标切片；上限 = max_output_bytes，快照本身不超缓冲上限
         let max_bytes = request.max_output_bytes.max(1) as usize;
@@ -255,22 +270,55 @@ impl JobRegistry {
                 raw_end
             };
             let chunk = &snapshot[snapshot_start..snapshot_end];
-            // UTF-8 边界对齐：开头跳过不完整的续字节（模型乱传 offset 时），
-            // 结尾丢掉不完整的序列（多字节字符被泵的读边界切开时），这些字节
-            // 留在缓冲里，下次从同一偏移补读，内容不会重复也不会丢
-            let aligned = aligned_tail(chunk);
-            let skip = chunk.len() - aligned.len();
-            output = truncated_prefix(aligned, aligned.len());
-            next_offset = (offset + skip + output.len()) as u64;
-        }
+            // 开头对齐：尾部滚动切点跳过孤立续字节；调用方手传半字符 offset 时跳到该合法字符末尾；
+            // 真正的非 UTF-8 字节（如 0x80/GBK）不跳过，交给 decode_lossy_stream 转成 U+FFFD 并计入消费量
+            let skip = if omitted > 0 && offset == tail_start {
+                chunk.len() - aligned_tail(chunk).len()
+            } else {
+                utf8_straddle_skip(&snapshot[..snapshot_end], snapshot_start)
+            };
+            let aligned_start = snapshot_start + skip;
+            let aligned = &snapshot[aligned_start..snapshot_end];
+            let stream_limit = if omitted > 0 && offset < head_len {
+                head_len
+            } else {
+                snapshot.len()
+            };
+            let (mut decoded, mut consumed) = decode_lossy_stream(aligned, true);
+            if consumed < aligned.len() {
+                let tail_lead = aligned_start + consumed;
+                let lookahead_end = stream_limit.min(tail_lead + 4);
+                let next_valid_char = if snapshot_end < stream_limit {
+                    match std::str::from_utf8(&snapshot[tail_lead..lookahead_end]) {
+                        Ok(s) => s.chars().next(),
+                        Err(err) if err.valid_up_to() > 0 => {
+                            std::str::from_utf8(&snapshot[tail_lead..tail_lead + err.valid_up_to()])
+                                .ok()
+                                .and_then(|s| s.chars().next())
+                        }
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                };
 
-        let (status, exit_code) = {
-            let state = job.state.lock().expect("任务状态锁不应中毒");
-            match *state {
-                JobState::Running => ("running", None),
-                JobState::Exited { exit_code } => ("exited", Some(exit_code)),
+                if let Some(ch) = next_valid_char {
+                    // 快照内已存在完整合法的多字节字符：若 skip+consumed 已能推进偏移则留给下次读；
+                    // 若 max_output_bytes 小于单字符字节数（1~3），直接补齐该完整字符推进偏移，绝不打碎成 U+FFFD
+                    if skip + consumed == 0 {
+                        decoded.push(ch);
+                        consumed = ch.len_utf8();
+                    }
+                } else if !(is_running && raw_end == total) {
+                    // 非运行期实时末尾，且后续字节证明并非被切开的合法字符：按 lossy 消费到底防卡死
+                    let (lossy_text, lossy_consumed) = decode_lossy_stream(aligned, false);
+                    decoded = lossy_text;
+                    consumed = lossy_consumed;
+                }
             }
-        };
+            output = decoded;
+            next_offset = (offset + skip + consumed) as u64;
+        }
         json!({
             "id": request.id, "ok": true,
             "job_id": request.job_id,

@@ -276,4 +276,21 @@ describe("edit 工具", () => {
       expect(readRaw("empty.txt")).toBe("keep me\n");
     },
   );
+
+  it(
+    "文件含空行且 old_string 为纯空白时不会产生零长匹配崩溃或误插入",
+    { timeout: 15_000 },
+    async () => {
+      write("leading-blank.txt", "\nsecond line\n");
+      const result = await callEdit(session.client, {
+        path: "leading-blank.txt",
+        old_string: "   ",
+        new_string: "header",
+      });
+      expect(result.isError).toBe(true);
+      expect(textOf(result)).toContain("找不到");
+      expect(textOf(result)).not.toContain("意外退出");
+      expect(readRaw("leading-blank.txt")).toBe("\nsecond line\n");
+    },
+  );
 });

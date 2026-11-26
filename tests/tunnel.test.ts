@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -198,6 +198,49 @@ describe("TunnelManager（进程级）", () => {
     external = false;
     await expect(manager.stop()).resolves.toBeUndefined();
   });
+
+  it("自动重启触发时若外部进程已接管或配置缺失，autoRestarting 归零不卡死", async () => {
+    const flagFile = path.join(workDir, "exit-flag-stuck");
+    writeFileSync(flagFile, "7", "utf8");
+    process.env.NEXUS_STUB_EXIT_FILE = flagFile;
+    let external = false;
+    try {
+      const opts = stubOptions(workDir, {
+        autoRestart: true,
+        restartDelayMs: 150,
+        isRunningExternal: async () => external,
+      });
+      const manager = new TunnelManager(opts);
+      await manager.start();
+      await waitFor(() => manager.status().then((s) => s.autoRestarting === true));
+
+      // 外部隧道在倒计时期间拉起：到点触发 start() 早退后，autoRestarting 必须清回 false
+      external = true;
+      await waitFor(() => manager.status().then((s) => s.autoRestarting === false), 3_000);
+      expect((await manager.status()).running).toBe(true);
+
+      // 再次验证配置缺失导致自动重启抛错时，autoRestarting 同样清回 false
+      external = false;
+      const missingDir = mkdtempSync(path.join(os.tmpdir(), "nexus-tunnel-missing-"));
+      try {
+        const opts2 = stubOptions(missingDir, {
+          autoRestart: true,
+          restartDelayMs: 150,
+          isRunningExternal: async () => false,
+        });
+        writeFileSync(path.join(missingDir, "tunnel-stub.cjs"), STUB_SOURCE, "utf8");
+        const manager2 = new TunnelManager(opts2);
+        await manager2.start();
+        await waitFor(() => manager2.status().then((s) => s.autoRestarting === true));
+        rmSync(opts2.configPath, { force: true });
+        await waitFor(() => manager2.status().then((s) => s.autoRestarting === false), 3_000);
+      } finally {
+        rmSync(missingDir, { recursive: true, force: true });
+      }
+    } finally {
+      delete process.env.NEXUS_STUB_EXIT_FILE;
+    }
+  });
 });
 
 describe("面板隧道卡（真实 dist 进程 + stub cloudflared）", () => {
@@ -329,4 +372,81 @@ describe("面板隧道卡（真实 dist 进程 + stub cloudflared）", () => {
     const response = await postTunnel(server, "start", { Origin: "https://evil.example" });
     expect(response.status).toBe(403);
   });
+
+  it(
+    "受管隧道运行中重载修改或删除 tunnel 配置时，旧子进程同步重启或回收不留孤儿",
+    async () => {
+      const isPidAlive = (pid: number): boolean => {
+        try {
+          process.kill(pid, 0);
+          return true;
+        } catch {
+          return false;
+        }
+      };
+      const postService = (action: string) =>
+        fetch(`${server.panelUrl}/api/service`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Origin: server.panelUrl,
+          },
+          body: JSON.stringify({ action }),
+        });
+
+      const originalConfig = readFileSync(server.configPath, "utf8");
+      try {
+        const started = await postTunnel(server, "start");
+        expect(started.status).toBe(200);
+        const startedBody = (await started.json()) as StatusBody;
+        const firstPid = startedBody.tunnel.process?.pid ?? 0;
+        expect(firstPid).toBeGreaterThan(0);
+        expect(isPidAlive(firstPid)).toBe(true);
+
+        // 1) 修改 tunnel.configPath 后重载：旧受管子进程应重启切换到新配置
+        const configV2 = path.join(workDir, "config-v2.yml");
+        writeFileSync(configV2, "tunnel: stub-v2\n", "utf8");
+        const parsed = JSON.parse(originalConfig) as Record<string, unknown>;
+        writeFileSync(
+          server.configPath,
+          JSON.stringify(
+            {
+              ...parsed,
+              tunnel: {
+                ...(parsed.tunnel as Record<string, unknown>),
+                configPath: configV2,
+              },
+            },
+            null,
+            2,
+          ),
+          "utf8",
+        );
+
+        const reloaded = await postService("reload");
+        expect(reloaded.status).toBe(200);
+        await waitFor(() => !isPidAlive(firstPid), 5_000);
+        const afterModify = await getStatus(server);
+        const secondPid = afterModify.tunnel.process?.pid ?? 0;
+        expect(afterModify.tunnel.process?.running).toBe(true);
+        expect(afterModify.tunnel.process?.managed).toBe(true);
+        expect(secondPid).toBeGreaterThan(0);
+        expect(secondPid).not.toBe(firstPid);
+
+        // 2) 删除 tunnel 段后重载：面板自拉起的受管子进程应同步停掉，不遗留失控进程
+        const withoutTunnel = { ...parsed };
+        delete withoutTunnel.tunnel;
+        writeFileSync(server.configPath, JSON.stringify(withoutTunnel, null, 2), "utf8");
+        const cleared = await postService("reload");
+        expect(cleared.status).toBe(200);
+        await waitFor(() => !isPidAlive(secondPid), 5_000);
+        const afterClear = await getStatus(server);
+        expect(afterClear.tunnel.state).toBe("unconfigured");
+      } finally {
+        writeFileSync(server.configPath, originalConfig, "utf8");
+        await postService("reload");
+      }
+    },
+    25_000,
+  );
 });

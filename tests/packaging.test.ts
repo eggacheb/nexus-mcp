@@ -47,6 +47,22 @@ describe("打包与配置优先级", () => {
     expect(VERSION).toBe(pkg.version);
   });
 
+  it("NSIS 安装脚本与 Rust 执行器包的许可证元数据均与仓库整体 AGPL-3.0 一致", () => {
+    const nsi = readFileSync(
+      path.join(projectRoot, "scripts", "installer", "nexus-mcp.nsi"),
+      "utf8",
+    );
+    expect(nsi).toContain('VIAddVersionKey "LegalCopyright" "AGPL-3.0"');
+    expect(nsi).not.toContain('"Apache-2.0"');
+
+    const cargoToml = readFileSync(
+      path.join(projectRoot, "crates", "executor", "Cargo.toml"),
+      "utf8",
+    );
+    expect(cargoToml).toContain('license = "AGPL-3.0"');
+    expect(cargoToml).not.toContain('"Apache-2.0"');
+  });
+
   it("首次运行缺配置时生成默认配置，不抛错", () => {
     expect(existsSync(configFile())).toBe(false);
 
@@ -110,6 +126,32 @@ describe("打包与配置优先级", () => {
     expect(config.maxOutputBytes).toBe(64 * 1024);
     expect(config.defaultTimeoutMs).toBe(120_000);
     expect(config.commandPolicy).toEqual({ allow: [], deny: [], onUnmatched: "deny" });
+  });
+
+  it("loadConfig 拒绝端口推导越界、同端口冲突、非法 NEXUS_MCP_PORT 与含空白的 token", () => {
+    // 1) port=65535 且未显式指定 panelPort 时，默认推导 65536 越界应报错
+    writeConfig({ root: projectRoot, port: 65535, shell: "auto" });
+    expect(() => loadConfig()).toThrow(/panelPort|65535/);
+
+    // 显式指定合法 panelPort 时允许 port=65535
+    writeConfig({ root: projectRoot, port: 65535, panelPort: 65534, shell: "auto" });
+    expect(loadConfig().panelPort).toBe(65534);
+
+    // 2) port 与 panelPort 相同时拒绝
+    writeConfig({ root: projectRoot, port: 8788, panelPort: 8788, shell: "auto" });
+    expect(() => loadConfig()).toThrow(/相同|冲突|panelPort/);
+
+    // 3) 非空但非法的 NEXUS_MCP_PORT 不静默吞错
+    writeConfig({ root: projectRoot, port: 8787, shell: "auto" });
+    process.env.NEXUS_MCP_PORT = "70000";
+    expect(() => loadConfig()).toThrow(/NEXUS_MCP_PORT/);
+    delete process.env.NEXUS_MCP_PORT;
+
+    // 4) 纯空白或含空白字符的 token 拒绝（避免开启 OAuth 却令 Bearer 恒失败）
+    writeConfig({ root: projectRoot, token: "   ", shell: "auto" });
+    expect(() => loadConfig()).toThrow(/token/);
+    writeConfig({ root: projectRoot, token: "bad token", shell: "auto" });
+    expect(() => loadConfig()).toThrow(/token/);
   });
 
   it("NEXUS_MCP_CONFIG 指定的路径优先于程序根目录", () => {

@@ -4,14 +4,22 @@ import http from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import path from "node:path";
 import type { AppConfig } from "./config.js";
-import { loadConfig, normalizeCommandPolicy, saveConfig, validateShell } from "./config.js";
+import {
+  loadConfig,
+  normalizeCommandPolicy,
+  normalizePositiveInt,
+  normalizeTunnelUrl,
+  replaceConfigInPlace,
+  saveConfig,
+  validateShell,
+} from "./config.js";
 import { readBody, sendJson as sendJsonRaw } from "./httpHelpers.js";
 import { log, recentLogs, redactText } from "./log.js";
 import type { McpService } from "./mcpService.js";
 import type { ComponentStatus, TunnelStatus } from "./status.js";
 import { executorStatus, probePublicTunnel, tunnelStatus } from "./status.js";
 import { TOOL_SUMMARY } from "./tools.js";
-import type { TunnelManager } from "./tunnel.js";
+import { TunnelManager, resolveTunnelOptions } from "./tunnel.js";
 import { VERSION } from "./version.js";
 
 const LISTEN_HOST = "127.0.0.1";
@@ -795,6 +803,23 @@ export async function startPanel(
   tunnel?: TunnelManager,
 ): Promise<PanelHandle> {
   let panelPort = config.panelPort;
+  let currentTunnel: TunnelManager | undefined = tunnel;
+
+  async function syncTunnelManager(nextConfig: AppConfig): Promise<void> {
+    const options = resolveTunnelOptions(nextConfig);
+    if (!options) {
+      if (currentTunnel) {
+        await currentTunnel.stopManaged();
+        currentTunnel = undefined;
+      }
+      return;
+    }
+    if (currentTunnel) {
+      await currentTunnel.syncOptions(options);
+    } else {
+      currentTunnel = new TunnelManager(options);
+    }
+  }
 
   async function statusPayload(): Promise<PanelStatus> {
     const running = service.isRunning();
@@ -807,7 +832,7 @@ export async function startPanel(
         sessions: service.sessionCount(),
       },
       executor: await executorStatus(),
-      tunnel: await tunnelStatus(config, tunnel),
+      tunnel: await tunnelStatus(config, currentTunnel),
       root: config.root,
       panelPort,
       version: VERSION,
@@ -943,33 +968,19 @@ export async function startPanel(
         commandPolicy?: AppConfig["commandPolicy"];
       } = {};
       try {
-        // 校验规则与 loadConfig 同源：写进 config.json 的值必须能通过下次启动校验
-        const numberField = (value: unknown, name: string): number => {
-          if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
-            throw new Error(`${name} 必须是正整数`);
-          }
-          return value;
-        };
+        // 校验规则与 loadConfig 完全同源：写进 config.json 的值必须能通过下次启动校验
         if (body.shell !== undefined) {
-          if (body.shell !== "auto" && body.shell !== "git-bash" && body.shell !== "pwsh") {
-            throw new Error(
-              `shell 只支持 "auto" / "git-bash" / "pwsh"，收到 ${JSON.stringify(body.shell)}`,
-            );
-          }
           validateShell(body.shell);
           patch.shell = body.shell;
         }
         if (body.maxOutputBytes !== undefined) {
-          patch.maxOutputBytes = numberField(body.maxOutputBytes, "maxOutputBytes");
+          patch.maxOutputBytes = normalizePositiveInt(body.maxOutputBytes, "maxOutputBytes");
         }
         if (body.defaultTimeoutMs !== undefined) {
-          patch.defaultTimeoutMs = numberField(body.defaultTimeoutMs, "defaultTimeoutMs");
+          patch.defaultTimeoutMs = normalizePositiveInt(body.defaultTimeoutMs, "defaultTimeoutMs");
         }
         if (body.tunnelUrl !== undefined) {
-          if (typeof body.tunnelUrl !== "string") throw new Error("tunnelUrl 必须是字符串");
-          const trimmed = body.tunnelUrl.trim();
-          if (/\s/.test(trimmed)) throw new Error("tunnelUrl 不能包含空白字符");
-          patch.tunnelUrl = trimmed;
+          patch.tunnelUrl = normalizeTunnelUrl(body.tunnelUrl) ?? "";
         }
         if (body.commandPolicy !== undefined) {
           patch.commandPolicy = normalizeCommandPolicy(body.commandPolicy);
@@ -1014,7 +1025,8 @@ export async function startPanel(
           log("面板操作: 重启 MCP 服务");
         } else if (action === "reload") {
           const next = loadConfig();
-          Object.assign(config, next);
+          replaceConfigInPlace(config, next);
+          await syncTunnelManager(config);
           log(`配置已重载，根目录 ${config.root}`);
           if (next.panelPort !== panelPort) {
             log(`panelPort 改成 ${next.panelPort}，面板需要重启进程才生效`);
@@ -1037,7 +1049,7 @@ export async function startPanel(
     }
 
     if (req.method === "POST" && url.pathname === "/api/tunnel") {
-      if (!tunnel) {
+      if (!currentTunnel) {
         sendJson(res, 400, { error: "未启用隧道管理（config.json 里没有 tunnel 段）" });
         return;
       }
@@ -1047,10 +1059,10 @@ export async function startPanel(
 
       try {
         if (action === "start") {
-          const result = await tunnel.start();
+          const result = await currentTunnel.start();
           log(`面板操作: 启动隧道 ${result.started ? `pid=${result.pid}` : (result.reason ?? "未拉起")}`);
         } else if (action === "stop") {
-          await tunnel.stop();
+          await currentTunnel.stop();
           log("面板操作: 停止隧道");
         } else if (action === "probe") {
           // 手动探测：真的往外打一次，把状态码和往返耗时报给面板。
@@ -1109,6 +1121,7 @@ export async function startPanel(
     port: panelPort,
     url: `http://${LISTEN_HOST}:${panelPort}`,
     async close() {
+      currentTunnel?.cancelPendingRestart();
       await new Promise<void>((resolve) => {
         server.close(() => resolve());
         server.closeAllConnections();

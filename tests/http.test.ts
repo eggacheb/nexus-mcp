@@ -2,6 +2,7 @@ import { expectOk } from "./support/tool.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import { projectRoot, startServer } from "./support/server.js";
@@ -271,6 +272,78 @@ describe("HTTP 传输（没有配置令牌）", () => {
       const error = await connectError(new URL(`http://${lan}:${server.port}/mcp`));
       // 连不上是网络层拒绝，不是服务端返回的 401/403
       expect(error.code).toBeUndefined();
+    },
+    20_000,
+  );
+
+  it(
+    "未配置令牌时关闭全部 OAuth 端点，且拒绝带隧道/代理转发头的请求绕过本机校验",
+    async () => {
+      const base = `http://127.0.0.1:${server.port}`;
+
+      for (const [method, endpoint] of [
+        ["GET", "/.well-known/oauth-protected-resource"],
+        ["GET", "/.well-known/oauth-authorization-server"],
+        ["GET", "/oauth/authorize"],
+        ["POST", "/oauth/register"],
+        ["POST", "/oauth/token"],
+      ] as const) {
+        const res = await fetch(`${base}${endpoint}`, {
+          method,
+          headers: method === "POST" ? { "Content-Type": "application/json" } : undefined,
+          body:
+            method === "POST"
+              ? JSON.stringify({ redirect_uris: ["https://example.com/cb"] })
+              : undefined,
+        });
+        expect(res.status, `${method} ${endpoint} 应被拒绝`).toBe(403);
+      }
+
+      const proxyCases: Array<Record<string, string>> = [
+        { "CF-Connecting-IP": "203.0.113.10" },
+        { "X-Forwarded-For": "198.51.100.7" },
+      ];
+      for (const proxyHeaders of proxyCases) {
+        const error = await connectError(server.mcpUrl, {
+          requestInit: { headers: proxyHeaders },
+        });
+        expect(error.code).toBe(403);
+      }
+
+      // 非本机 Host 头（模拟 DNS Rebinding 或不注入转发头的 TCP 隧道转发）同样拒绝 403
+      const nonLoopbackHostStatus = await new Promise<number>((resolve, reject) => {
+        const payload = JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: "2025-03-26",
+            capabilities: {},
+            clientInfo: { name: "rebind-probe", version: "0.1.0" },
+          },
+        });
+        const req = http.request(
+          {
+            host: "127.0.0.1",
+            port: server.port,
+            path: "/mcp",
+            method: "POST",
+            headers: {
+              Host: "evil-rebind.example.com",
+              "Content-Type": "application/json",
+              Accept: "application/json, text/event-stream",
+              "Content-Length": Buffer.byteLength(payload),
+            },
+          },
+          (res) => {
+            res.resume();
+            resolve(res.statusCode ?? 0);
+          },
+        );
+        req.on("error", reject);
+        req.end(payload);
+      });
+      expect(nonLoopbackHostStatus).toBe(403);
     },
     20_000,
   );

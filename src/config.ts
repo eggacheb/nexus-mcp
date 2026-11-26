@@ -179,13 +179,48 @@ export function gitBashPath(): string {
   return path.join(programFiles, "Git", "bin", "bash.exe");
 }
 
+/** 正整数配置字段校验（loadConfig 与面板快捷设置同源复用） */
+export function normalizePositiveInt(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
+    throw new Error(`config.json 的 ${field} 必须是正整数`);
+  }
+  return value;
+}
+
+/** 隧道公网地址校验：允许省略或置空，非空时不得包含空白字符 */
+export function normalizeTunnelUrl(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string") {
+    throw new Error("config.json 的 tunnelUrl 必须是字符串");
+  }
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  if (/\s/.test(trimmed)) {
+    throw new Error("config.json 的 tunnelUrl 不能包含空白字符");
+  }
+  return trimmed;
+}
+
+/** 原地替换共享 AppConfig 的全部键，清理磁盘配置中已删除的可选字段（如 tunnelUrl / tunnel） */
+export function replaceConfigInPlace(target: AppConfig, next: AppConfig): void {
+  for (const key of Object.keys(target) as Array<keyof AppConfig>) {
+    delete target[key];
+  }
+  Object.assign(target, next);
+}
+
 /** shell 配置在启动时校验，坏了直接不让服务起来；面板快捷设置保存前也走这道校验 */
-export function validateShell(shell: ShellKind): void {
+export function validateShell(shell: unknown): asserts shell is "auto" | "git-bash" | "pwsh" {
   if (shell === "powershell") {
     throw new Error(
       "shell 配置为 powershell（Windows PowerShell 5.1）不受支持：5.1 的控制台编码跟随系统代码页，" +
         "中文系统下子进程输出会乱码，无法满足工具输出一律 UTF-8 的约定。" +
         "请把 config.json 里的 shell 改成 pwsh（PowerShell 7）或 git-bash。",
+    );
+  }
+  if (shell !== "auto" && shell !== "git-bash" && shell !== "pwsh") {
+    throw new Error(
+      `config.json 的 shell 只支持 "auto" / "git-bash" / "pwsh"，收到 ${JSON.stringify(shell)}`,
     );
   }
   if (shell === "auto" || shell === "git-bash") {
@@ -207,52 +242,103 @@ export function validateShell(shell: ShellKind): void {
   }
 }
 
+function normalizePort(value: unknown, field: string, fallback: number): number {
+  if (value === undefined) return fallback;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > 65535) {
+    throw new Error(`config.json 的 ${field} 必须是 1-65535 的整数`);
+  }
+  return value;
+}
+
+function normalizeToken(value: unknown, sourceLabel: string): string {
+  if (typeof value !== "string") {
+    throw new Error(`${sourceLabel} 的 token 必须是字符串`);
+  }
+  if (value === "") return "";
+  if (/\s/.test(value)) {
+    throw new Error(`${sourceLabel} 的 token 不能包含空白字符（本机免鉴权请设为空字符串 ""）`);
+  }
+  return value;
+}
+
 /**
  * 读配置。优先级：环境变量 > 可执行文件同目录的 config.json > 内置默认。
  * 文件不存在时先按默认值生成一份，不让首次运行直接崩。
  */
 export function loadConfig(): AppConfig {
   const file = configFilePath();
-  let raw: Partial<AppConfig> = {};
+  let raw: Record<string, unknown> = {};
 
   if (existsSync(file)) {
+    let parsed: unknown;
     try {
-      raw = JSON.parse(readFileSync(file, "utf8")) as Partial<AppConfig>;
+      parsed = JSON.parse(readFileSync(file, "utf8"));
     } catch (err) {
       throw new Error(`config.json 解析失败 (${file}): ${(err as Error).message}`);
     }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error(`config.json 顶层必须是 JSON 对象 (${file})`);
+    }
+    raw = parsed as Record<string, unknown>;
   } else {
-    raw = writeInitialConfig(file);
+    raw = writeInitialConfig(file) as Record<string, unknown>;
   }
+
+  if (raw.root !== undefined && (typeof raw.root !== "string" || !raw.root.trim())) {
+    throw new Error("config.json 的 root 必须是非空字符串");
+  }
+  if (raw.transport !== undefined && raw.transport !== "http" && raw.transport !== "stdio") {
+    throw new Error(`config.json 的 transport 只支持 "http" 或 "stdio"，收到 ${JSON.stringify(raw.transport)}`);
+  }
+  const fileToken =
+    raw.token !== undefined ? normalizeToken(raw.token, "config.json") : DEFAULTS.token;
 
   // 环境变量只认非空值：空串按未设置处理，避免 PowerShell 里 `$env:X=""` 的误伤
   const envRoot = process.env.NEXUS_MCP_ROOT?.trim();
-  const envToken = process.env.NEXUS_MCP_TOKEN;
-  const envPort = Number(process.env.NEXUS_MCP_PORT);
+  const rawEnvToken = process.env.NEXUS_MCP_TOKEN;
+  const token =
+    rawEnvToken !== undefined && rawEnvToken !== ""
+      ? normalizeToken(rawEnvToken, "环境变量 NEXUS_MCP_TOKEN")
+      : fileToken;
+  const rawEnvPort = process.env.NEXUS_MCP_PORT?.trim();
 
-  const root = path.resolve(envRoot || raw.root || defaultRoot());
-  const port = Number.isInteger(envPort) && envPort > 0
-    ? envPort
-    : Number.isInteger(raw.port)
-      ? (raw.port as number)
-      : DEFAULTS.port;
+  const root = path.resolve(envRoot || (raw.root as string | undefined) || defaultRoot());
+  const port = rawEnvPort
+    ? normalizePort(Number(rawEnvPort), "NEXUS_MCP_PORT", DEFAULTS.port)
+    : normalizePort(raw.port, "port", DEFAULTS.port);
+  if (raw.panelPort === undefined && port >= 65535) {
+    throw new Error(
+      "config.json 的 port 为 65535 时无法自动推导 panelPort（port + 1 越界），请显式指定 1-65534 的 panelPort",
+    );
+  }
+  const panelPort = normalizePort(raw.panelPort, "panelPort", port + 1);
+  if (panelPort === port) {
+    throw new Error(`config.json 的 port 与 panelPort 不能相同（均为 ${port}）`);
+  }
   const shell = raw.shell ?? DEFAULTS.shell;
   validateShell(shell);
+  const maxOutputBytes =
+    raw.maxOutputBytes !== undefined
+      ? normalizePositiveInt(raw.maxOutputBytes, "maxOutputBytes")
+      : DEFAULTS.maxOutputBytes;
+  const defaultTimeoutMs =
+    raw.defaultTimeoutMs !== undefined
+      ? normalizePositiveInt(raw.defaultTimeoutMs, "defaultTimeoutMs")
+      : DEFAULTS.defaultTimeoutMs;
+  const tunnelUrl = normalizeTunnelUrl(raw.tunnelUrl);
   const tunnel = normalizeTunnel(raw.tunnel);
 
   return {
     root,
     transport: raw.transport === "stdio" ? "stdio" : DEFAULTS.transport,
     port,
-    panelPort: Number.isInteger(raw.panelPort) ? (raw.panelPort as number) : port + 1,
-    token: envToken ? envToken : typeof raw.token === "string" ? raw.token : DEFAULTS.token,
+    panelPort,
+    token,
     shell,
-    maxOutputBytes: raw.maxOutputBytes ?? DEFAULTS.maxOutputBytes,
-    defaultTimeoutMs: raw.defaultTimeoutMs ?? DEFAULTS.defaultTimeoutMs,
+    maxOutputBytes,
+    defaultTimeoutMs,
     commandPolicy: normalizeCommandPolicy(raw.commandPolicy),
-    ...(typeof raw.tunnelUrl === "string" && raw.tunnelUrl.trim()
-      ? { tunnelUrl: raw.tunnelUrl.trim() }
-      : {}),
+    ...(tunnelUrl ? { tunnelUrl } : {}),
     ...(tunnel ? { tunnel } : {}),
   };
 }
@@ -288,21 +374,4 @@ export function saveConfig(config: AppConfig): void {
   else delete next.tunnel;
 
   writeFileSync(file, `${JSON.stringify(next, null, 2)}\n`, "utf8");
-}
-
-/** 把用户传入的路径解析成根目录内的绝对路径，越界直接拒绝 */
-export function resolveInRoot(root: string, input: string): string {
-  if (!input || input.trim() === "") throw new Error("path 不能为空");
-  const abs = path.isAbsolute(input) ? path.normalize(input) : path.resolve(root, input);
-  const rel = path.relative(root, abs);
-  if (rel.startsWith("..") || path.isAbsolute(rel)) {
-    throw new Error(`路径越界，只允许访问 ${root} 以内的文件: ${input}`);
-  }
-  return abs;
-}
-
-/** 相对根目录展示，便于把结果喂给模型时更短 */
-export function displayPath(root: string, abs: string): string {
-  const rel = path.relative(root, abs);
-  return rel === "" ? "." : rel.split(path.sep).join("/");
 }

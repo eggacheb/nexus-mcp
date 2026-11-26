@@ -6,6 +6,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { AppConfig } from "./config.js";
 import { configFilePath } from "./config.js";
+import { closeExecutor } from "./executor.js";
 import { readBody, sendJson } from "./httpHelpers.js";
 import { log, redactText } from "./log.js";
 import { OAuthProvider, safeEqual } from "./oauth.js";
@@ -54,6 +55,56 @@ function isLoopback(address: string | undefined): boolean {
   return address === "127.0.0.1" || address.startsWith("127.") || address.startsWith("::ffff:127.");
 }
 
+/**
+ * 校验 Host 请求头是否指向本机回环地址，防止 token 为空时被 DNS Rebinding
+ * 或不带转发头的原始 TCP 隧道（如 ssh -R / frp tcp）绕过本机直连限制。
+ */
+function isLoopbackHostHeader(hostHeader: string | undefined): boolean {
+  if (!hostHeader) return false;
+  const trimmed = hostHeader.trim();
+  if (!trimmed || /[\s/\\@]/.test(trimmed)) return false;
+
+  let hostname: string;
+  if (trimmed.startsWith("[")) {
+    const closeBracket = trimmed.indexOf("]");
+    if (closeBracket < 0) return false;
+    const rest = trimmed.slice(closeBracket + 1);
+    if (rest !== "" && !/^:\d+$/.test(rest)) return false;
+    hostname = trimmed.slice(1, closeBracket).toLowerCase();
+    return hostname === "::1";
+  }
+
+  const colonIdx = trimmed.indexOf(":");
+  if (colonIdx >= 0) {
+    const portPart = trimmed.slice(colonIdx + 1);
+    if (!/^\d+$/.test(portPart)) return false;
+    hostname = trimmed.slice(0, colonIdx).toLowerCase();
+  } else {
+    hostname = trimmed.toLowerCase();
+  }
+
+  if (hostname === "localhost") return true;
+  if (/^127(?:\.\d{1,3}){3}$/.test(hostname)) {
+    return hostname.split(".").every((octet) => Number(octet) <= 255);
+  }
+  return false;
+}
+
+/**
+ * 识别经 cloudflared 隧道或反向代理转发进本机回环端口的请求。
+ * token 为空时仅允许本机进程直连，一旦带了代理转发头就说明流量可能来自外部入口，必须拒绝。
+ */
+function hasProxyForwardingHeaders(req: IncomingMessage): boolean {
+  for (const name of ["cf-connecting-ip", "cf-ray", "x-forwarded-for", "x-real-ip", "forwarded"]) {
+    const raw = req.headers[name];
+    const text = Array.isArray(raw) ? raw.join(",") : raw;
+    if (typeof text === "string" && text.trim() !== "") {
+      return true;
+    }
+  }
+  return false;
+}
+
 interface AuthFailure {
   status: number;
   message: string;
@@ -70,6 +121,18 @@ function checkAuth(req: IncomingMessage, config: AppConfig, oauth: OAuthProvider
       return {
         status: 403,
         message: `配置里没有令牌，只接受本机连接；拒绝来自 ${remote ?? "未知地址"} 的请求。`,
+      };
+    }
+    if (hasProxyForwardingHeaders(req)) {
+      return {
+        status: 403,
+        message: "配置里没有令牌，只接受本机直连；拒绝经隧道或反向代理转发的请求。",
+      };
+    }
+    if (!isLoopbackHostHeader(req.headers.host)) {
+      return {
+        status: 403,
+        message: "配置里没有令牌，只接受本机直连；拒绝非本机 Host 头的请求。",
       };
     }
     return null;
@@ -357,6 +420,7 @@ export function createMcpService(config: AppConfig): McpService {
       await releaseSession(session, sessions);
     }
     sessions.clear();
+    await closeExecutor();
 
     if (current) log("MCP 端点已停止");
   }

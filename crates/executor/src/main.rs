@@ -18,6 +18,7 @@ use std::fs;
 use std::io::{BufRead, Read, Write, stdin, stdout};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -34,6 +35,8 @@ use edit_match::{
 
 const MAX_TIMEOUT_MS: u64 = 600_000;
 const POLL_INTERVAL_MS: u64 = 10;
+/// 协议层关闭 stdin 或父进程退出时由读线程置位，让阻塞中的同步 bash 立即感知并树杀收尾
+static STDIN_CLOSED: AtomicBool = AtomicBool::new(false);
 /// read 单次返回行数上限，与工具 schema 的 limit 上限一致（防御性重复）
 const MAX_READ_LINES: u64 = 2_000;
 /// read 的 max_output_bytes 缺省值，与配置 maxOutputBytes 的默认值一致
@@ -51,6 +54,8 @@ pub struct ShellSpec {
 struct BashRequest {
     id: u64,
     command: String,
+    root: String,
+    #[serde(default)]
     cwd: String,
     timeout_ms: u64,
     max_output_bytes: usize,
@@ -161,18 +166,15 @@ fn handle_request(line: &str) -> Value {
     }
 }
 
-/// bash 与 job_start 共用：校验 command/cwd/shell kind 并组装 Command（不含 stdio）。
+/// bash 与 job_start 共用：校验 command/shell kind 并组装 Command（cwd 已由 resolve_work_dir 验根并还原为真实目录）。
 fn build_shell_command(
     kind: &str,
     program: &str,
     command_line: &str,
-    cwd: &str,
+    cwd: &Path,
 ) -> Result<Command, String> {
     if command_line.trim().is_empty() {
         return Err("command 不能为空".into());
-    }
-    if !Path::new(cwd).is_dir() {
-        return Err(format!("工作目录不存在或不是目录: {cwd}"));
     }
     let mut command = Command::new(program);
     match kind {
@@ -200,6 +202,31 @@ fn build_shell_command(
     Ok(command)
 }
 
+/// bash 与 job_start 共用的工作目录沙箱校验（词法 + canonicalize 真实路径两道），
+/// 返回剥除 `\\?\` 前缀后的真实目录路径（避免 Windows 下 cmd/工具链拒绝 UNC verbatim 当前目录）。
+pub(crate) fn resolve_work_dir(
+    root_str: &str,
+    cwd_str: &str,
+    id: Option<u64>,
+) -> Result<PathBuf, Value> {
+    let root = resolve_root(root_str, id)?;
+    let trimmed = cwd_str.trim();
+    if trimmed.is_empty() {
+        return Ok(PathBuf::from(display_path(&root.canonical)));
+    }
+    let canonical = resolve_existing_within_sandbox(
+        &root,
+        trimmed,
+        SandboxEntryKind::Directory {
+            missing_prefix: "工作目录不存在或不是目录",
+            wrong_kind_prefix: "工作目录是文件不是目录",
+            canonicalize_prefix: "工作目录解析失败",
+        },
+        id,
+    )?;
+    Ok(PathBuf::from(display_path(&canonical)))
+}
+
 fn run_bash(request: &BashRequest) -> Value {
     let max_bytes = request.max_output_bytes.max(1);
     let timeout_ms = request.timeout_ms.clamp(1, MAX_TIMEOUT_MS);
@@ -214,11 +241,16 @@ fn run_bash(request: &BashRequest) -> Value {
         return response;
     }
 
+    let work_dir = match resolve_work_dir(&request.root, &request.cwd, Some(request.id)) {
+        Ok(dir) => dir,
+        Err(response) => return response,
+    };
+
     let mut command = match build_shell_command(
         &request.shell.kind,
         &request.shell.program,
         &request.command,
-        &request.cwd,
+        &work_dir,
     ) {
         Ok(command) => command,
         Err(message) => return error_response(Some(request.id), message),
@@ -247,7 +279,7 @@ fn run_bash(request: &BashRequest) -> Value {
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) => {
-                if Instant::now() >= deadline {
+                if STDIN_CLOSED.load(Ordering::Acquire) || Instant::now() >= deadline {
                     timed_out = true;
                     kill_process_tree(&mut child);
                     break;
@@ -409,6 +441,74 @@ fn default_max_results() -> u64 {
     100
 }
 
+enum SandboxEntryKind {
+    File,
+    Directory {
+        missing_prefix: &'static str,
+        wrong_kind_prefix: &'static str,
+        canonicalize_prefix: &'static str,
+    },
+}
+
+/// 已存在路径的统一沙箱双道校验（词法越界检查 + metadata 类型核对 + canonicalize 真实路径验根）。
+fn resolve_existing_within_sandbox(
+    root: &SandboxRoot,
+    input: &str,
+    expected: SandboxEntryKind,
+    id: Option<u64>,
+) -> Result<PathBuf, Value> {
+    let raw_target = Path::new(input);
+    let target = if raw_target.is_absolute() {
+        raw_target.to_path_buf()
+    } else {
+        root.lexical.join(raw_target)
+    };
+    if let Err(message) = ensure_lexically_within(&root.lexical, input, &target) {
+        return Err(error_response(id, message));
+    }
+    let metadata = match fs::metadata(&target) {
+        Ok(meta) => meta,
+        Err(_) => {
+            let prefix = match expected {
+                SandboxEntryKind::File => "文件不存在",
+                SandboxEntryKind::Directory { missing_prefix, .. } => missing_prefix,
+            };
+            return Err(error_response(id, format!("{prefix}: {input}")));
+        }
+    };
+    let canonicalize_prefix = match expected {
+        SandboxEntryKind::File => {
+            if metadata.is_dir() {
+                return Err(error_response(id, format!("路径是目录，不是文件: {input}")));
+            }
+            "路径解析失败"
+        }
+        SandboxEntryKind::Directory {
+            wrong_kind_prefix,
+            canonicalize_prefix,
+            ..
+        } => {
+            if !metadata.is_dir() {
+                return Err(error_response(id, format!("{wrong_kind_prefix}: {input}")));
+            }
+            canonicalize_prefix
+        }
+    };
+    let canonical = match fs::canonicalize(&target) {
+        Ok(path) => path,
+        Err(err) => {
+            return Err(error_response(
+                id,
+                format!("{canonicalize_prefix}: {input} ({err})"),
+            ));
+        }
+    };
+    if let Containment::Outside = classify(&root.canonical, &canonical) {
+        return Err(error_response(id, escape_error(input, &canonical, &root.canonical)));
+    }
+    Ok(canonical)
+}
+
 /// glob/grep 共用：解析搜索起点（根目录或根内子目录），返回
 /// (canonical 根目录, canonical 起点目录)。起点不存在或指向根外时给出可读错误。
 /// 与 read/write 不同，起点允许是目录本身；但越界判定与文件操作同一套规矩。
@@ -421,28 +521,16 @@ fn resolve_search_dir(
     let Some(input) = path_str.map(str::trim).filter(|input| !input.is_empty()) else {
         return Ok((root.canonical.clone(), root.canonical));
     };
-    let target = Path::new(input);
-    if let Err(message) = ensure_lexically_within(&root.lexical, input, target) {
-        return Err(error_response(id, message));
-    }
-    let metadata = match fs::metadata(target) {
-        Ok(meta) => meta,
-        Err(_) => return Err(error_response(id, format!("搜索起点不存在或不是目录: {input}"))),
-    };
-    if !metadata.is_dir() {
-        return Err(error_response(
-            id,
-            format!("搜索起点是文件不是目录，glob/grep 需要目录起点: {input}"),
-        ));
-    }
-    // 真实路径校验：起点若是链接，按解析结果判定，指向根外一律拒绝
-    let canonical = match fs::canonicalize(target) {
-        Ok(path) => path,
-        Err(err) => return Err(error_response(id, format!("路径解析失败: {input} ({err})"))),
-    };
-    if let Containment::Outside = classify(&root.canonical, &canonical) {
-        return Err(error_response(id, escape_error(input, &canonical, &root.canonical)));
-    }
+    let canonical = resolve_existing_within_sandbox(
+        &root,
+        input,
+        SandboxEntryKind::Directory {
+            missing_prefix: "搜索起点不存在或不是目录",
+            wrong_kind_prefix: "搜索起点是文件不是目录，glob/grep 需要目录起点",
+            canonicalize_prefix: "路径解析失败",
+        },
+        id,
+    )?;
     Ok((root.canonical, canonical))
 }
 
@@ -461,26 +549,7 @@ fn open_within_sandbox(root_str: &str, path_str: &str, id: Option<u64>) -> Resul
         return Err(error_response(id, "path 不能为空"));
     }
     let root = resolve_root(root_str, id)?;
-    let target = Path::new(path_str);
-    if let Err(message) = ensure_lexically_within(&root.lexical, path_str, target) {
-        return Err(error_response(id, message));
-    }
-    let metadata = match fs::metadata(target) {
-        Ok(m) => m,
-        Err(_) => return Err(error_response(id, format!("文件不存在: {path_str}"))),
-    };
-    if metadata.is_dir() {
-        return Err(error_response(id, format!("路径是目录，不是文件: {path_str}")));
-    }
-    // 真实路径校验：符号链接按解析结果判定，指向根外一律拒绝
-    let canonical = match fs::canonicalize(target) {
-        Ok(p) => p,
-        Err(err) => return Err(error_response(id, format!("路径解析失败: {path_str} ({err})"))),
-    };
-    if let Containment::Outside = classify(&root.canonical, &canonical) {
-        return Err(error_response(id, escape_error(path_str, &canonical, &root.canonical)));
-    }
-    Ok(canonical)
+    resolve_existing_within_sandbox(&root, path_str, SandboxEntryKind::File, id)
 }
 
 fn run_read(request: &ReadRequest) -> Value {
@@ -513,10 +582,11 @@ fn run_read(request: &ReadRequest) -> Value {
     let selected_start = (offset - 1) as usize;
     let selected_end = (offset - 1).saturating_add(limit).min(total) as usize;
 
-    // 逐行渲染行号；套字节上限：整行放得下就放，放不下先在字符边界截断当前行再停
+    // 逐行渲染行号；套字节上限：整行放得下就放，放不下先在字符边界截断首行并报告被裁字节数再停
     let max_bytes = request.max_output_bytes.max(1) as usize;
     let mut content = String::new();
     let mut rendered = 0usize;
+    let mut truncated_line_bytes: u64 = 0;
     for (index, line) in lines[selected_start..selected_end].iter().enumerate() {
         let number = selected_start + index + 1;
         let piece = format!("{number:>6}\t{line}\n");
@@ -527,7 +597,9 @@ fn run_read(request: &ReadRequest) -> Value {
                 let budget = max_bytes
                     .saturating_sub(content.len())
                     .saturating_sub(prefix.len() + 1);
-                content.push_str(&format!("{prefix}{}\n", truncated_prefix(line.as_bytes(), budget)));
+                let shown = truncated_prefix(line.as_bytes(), budget);
+                truncated_line_bytes = line.len().saturating_sub(shown.len()) as u64;
+                content.push_str(&format!("{prefix}{shown}\n"));
                 rendered = 1;
             }
             break;
@@ -542,7 +614,8 @@ fn run_read(request: &ReadRequest) -> Value {
         "content": content.trim_end_matches('\n').to_string(),
         "total_lines": total,
         "start_line": offset, "end_line": end_line,
-        "omitted_lines": omitted
+        "omitted_lines": omitted,
+        "truncated_line_bytes": truncated_line_bytes
     })
 }
 
@@ -741,7 +814,7 @@ fn run_edit(request: &EditRequest) -> Value {
     // 改动位置：首处匹配在原文件里的行号（与 read 的行号一致）
     let first = &matches[0];
     let mut end_line = line_number_at(&source, first.end);
-    if source.as_bytes()[first.end - 1] == b'\n' {
+    if source[first.start..first.end].ends_with('\n') {
         end_line -= 1;
     }
     json!({
@@ -827,20 +900,35 @@ fn render_output(buffer: &mut HeadTailBuffer) -> String {
 }
 
 fn main() {
-    let stdin = stdin();
+    let (tx, rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        let stdin = stdin();
+        for line in stdin.lock().lines() {
+            match line {
+                Ok(line) => {
+                    if tx.send(line).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        STDIN_CLOSED.store(true, Ordering::Release);
+    });
+
     let stdout = stdout();
     let mut out = stdout.lock();
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(line) => line,
-            Err(_) => break,
-        };
+    while let Ok(line) = rx.recv() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
         let response = handle_request(trimmed);
+        if STDIN_CLOSED.load(Ordering::Acquire) {
+            break;
+        }
         if writeln!(out, "{response}").and_then(|_| out.flush()).is_err() {
+            STDIN_CLOSED.store(true, Ordering::Release);
             break;
         }
     }

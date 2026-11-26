@@ -130,11 +130,13 @@ pub fn find_line_occurrences(content: &str, search: &str) -> Vec<Match> {
         if trailing_newline && !last.newline {
             continue;
         }
+        let start = window[0].start;
         let end = if trailing_newline { last.end } else { last.content_end };
-        candidates.push(Match {
-            start: window[0].start,
-            end,
-        });
+        // 非空 search 绝不能退化成零长匹配（如纯空白 old_string 命中完全空行）
+        if end <= start {
+            continue;
+        }
+        candidates.push(Match { start, end });
     }
     // 与已保留候选重叠的丢弃（先到先得），与 opencode 一致
     let mut result: Vec<Match> = Vec::new();
@@ -631,5 +633,14 @@ mod tests {
     #[test]
     fn miss_hint_returns_none_when_nothing_lines_up() {
         assert!(miss_hint("a\nb\n", "完全不同的一行\n", "x\n").is_none());
+    }
+
+    #[test]
+    fn whitespace_only_search_never_produces_zero_length_match_on_blank_line() {
+        assert!(match_view("\nsecond\n", "   ").is_empty());
+        assert!(match_view("first\n\nthird\n", "\t ").is_empty());
+        // 原行确实含空白时（非零长）仍可正常行级匹配
+        let non_empty = match_view("  \nsecond\n", "    ");
+        assert_eq!(non_empty, vec![Match { start: 0, end: 2 }]);
     }
 }

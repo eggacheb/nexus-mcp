@@ -3,7 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { projectRoot } from "./support/server.js";
@@ -118,6 +118,56 @@ describe("bash 工具", () => {
   );
 
   it(
+    "cwd 通过目录链接指向沙箱根外时被拒绝，且盘符大小写差异不误拒合法根内目录",
+    { timeout: 20_000 },
+    async (t) => {
+      const sandboxRoot = mkdtempSync(path.join(os.tmpdir(), "nexus-bash-root-"));
+      const outsideDir = mkdtempSync(path.join(os.tmpdir(), "nexus-bash-out-"));
+      const subDir = path.join(sandboxRoot, "sub");
+      mkdirSync(subDir, { recursive: true });
+      const linkPath = path.join(sandboxRoot, "escape-link");
+      let linked = false;
+      try {
+        symlinkSync(outsideDir, linkPath, "junction");
+        linked = true;
+      } catch {
+        // 极端受限环境无法建 junction 时跳过
+      }
+      const cfg = writeTempConfig({ root: sandboxRoot });
+      const isolated = await connectStdio({ NEXUS_MCP_CONFIG: cfg.path });
+      try {
+        if (!linked) {
+          t.skip();
+          return;
+        }
+        const escaped = await callBash(isolated.client, { command: "pwd", cwd: "escape-link" });
+        expect(escaped.isError).toBe(true);
+        expect(textOf(escaped)).toContain("路径越界");
+
+        if (process.platform === "win32" && /^[A-Za-z]:/.test(subDir)) {
+          const flippedDrive =
+            (subDir[0] === subDir[0]!.toUpperCase()
+              ? subDir[0]!.toLowerCase()
+              : subDir[0]!.toUpperCase()) + subDir.slice(1);
+          const valid = await callBash(isolated.client, { command: "pwd", cwd: flippedDrive });
+          expectOk(valid);
+        }
+
+        // 纯空白 cwd 应与空串一致回退到沙箱根，不得误报 "path 不能为空"
+        const blankCwd = await callBash(isolated.client, { command: "echo blank-cwd-ok", cwd: "   " });
+        expectOk(blankCwd);
+        expect(textOf(blankCwd)).toContain("blank-cwd-ok");
+      } finally {
+        await isolated.close();
+        rmSync(linkPath, { recursive: true, force: true });
+        rmSync(sandboxRoot, { recursive: true, force: true });
+        rmSync(outsideDir, { recursive: true, force: true });
+        rmSync(cfg.dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it(
     "合并标准错误，退出码非零仍正常返回",
     { timeout: 15_000 },
     async () => {
@@ -194,6 +244,21 @@ describe("bash 工具", () => {
       expect(text).not.toContain("\uFFFD");
     },
   );
+
+  it(
+    "非 UTF-8 字节出现在超长输出头部时不丢弃后续头部内容",
+    { timeout: 15_000 },
+    async () => {
+      const result = await callBash(session.client, {
+        command: "printf 'HEAD_BEFORE\\xff\\xfeHEAD_AFTER\\n'; seq 1 20000",
+      });
+      expectOk(result);
+      const text = textOf(result);
+      expect(text).toContain("bytes omitted");
+      expect(text).toContain("HEAD_BEFORE");
+      expect(text).toContain("HEAD_AFTER");
+    },
+  );
 });
 
 describe("执行器意外退出", () => {
@@ -201,7 +266,11 @@ describe("执行器意外退出", () => {
     "协议层返回可读错误而不是挂起",
     { timeout: 20_000 },
     async () => {
-      const session = await connectStdio({ NEXUS_MCP_EXECUTOR: crashHelperBinaryPath() });
+      const cfg = writeTempConfig();
+      const session = await connectStdio({
+        NEXUS_MCP_CONFIG: cfg.path,
+        NEXUS_MCP_EXECUTOR: crashHelperBinaryPath(),
+      });
       try {
         const result = await callBash(session.client, { command: "echo hi" });
         expect(result.isError).toBe(true);
@@ -210,6 +279,7 @@ describe("执行器意外退出", () => {
         expect(text).toContain("意外退出");
       } finally {
         await session.close();
+        rmSync(cfg.dir, { recursive: true, force: true });
       }
     },
   );

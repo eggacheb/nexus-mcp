@@ -191,6 +191,24 @@ describe("read/write 工具", () => {
   );
 
   it(
+    "单行超长文件触发字节上限时明确提示该行被截断及省略字节数，且不输出矛盾的 limit 缩小提示",
+    { timeout: 15_000 },
+    async () => {
+      const file = path.join(root, "minified-single-line.js");
+      writeFileSync(file, "var x = '" + "a".repeat(80_000) + "';\nconst secondLine = 2;\n", "utf8");
+      const result = await callRead(session.client, { path: "minified-single-line.js" });
+      expectOk(result);
+      const text = textOf(result);
+      expect(text).toContain("1\tvar x = '");
+      expect(text).not.toContain("';");
+      expect(text).toContain("超过字节上限");
+      expect(text).toContain("字节");
+      expect(text).toContain("offset=2");
+      expect(text).not.toContain("用 limit 缩小范围");
+    },
+  );
+
+  it(
     "非 UTF-8 文件返回可读错误，不返回乱码",
     { timeout: 15_000 },
     async () => {

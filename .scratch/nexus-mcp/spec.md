@@ -70,7 +70,7 @@ Gemini 网页版（`gemini.google.com` → 设置 → 关联应用 → 自定义
 - HTTP 模式默认监听 `8787`，与本机已有的 cloudflared 隧道配置（`nexus.maliy.top` → `127.0.0.1:8787`）一致，接管时隧道配置不需要改动。
 - HTTP 模式用 Bearer 令牌校验，令牌为空时仅允许 loopback 访问。
 - OAuth 2.1 授权服务自 Nexus 桥接层移植（`apps/bridge/src/oauth.ts` @ commit `c8c18a7`，移植后适配，明细见票 09）：RFC 9728/8414 元数据、动态客户端注册、PKCE S256、refresh token 轮换、令牌哈希后落盘。授权页要求输入本地令牌才能批准。移植来自 AGPL-3.0 项目，本仓库因此整体以 AGPL-3.0 发布。
-- 会话按 `Mcp-Session-Id` 隔离，一个会话对应一个独立的 server 实例，会话关闭时释放关联的后台任务引用。
+- 会话按 `Mcp-Session-Id` 隔离，一个会话对应一个独立的 server 实例；普通会话断开或空闲超时回收只释放该协议实例，不终止正在运行的后台任务；服务停止、重启或进程退出时关闭执行器并树杀所有运行中的后台任务。
 
 ### 工具语义
 
@@ -94,7 +94,7 @@ Gemini 网页版（`gemini.google.com` → 设置 → 关联应用 → 自定义
 - 默认 Git Bash：启动时设 `LANG=zh_CN.UTF-8`、`LC_ALL=C.UTF-8`、`MSYS_NO_PATHCONV=1`。
 - 备选 PowerShell 7：启动时设 `[Console]::OutputEncoding` 为 UTF-8，使用 `-NoProfile -NonInteractive`。
 - 显式拒绝 PowerShell 5.1。
-- 子进程输出按 UTF-8 解码，解码失败时回退 GBK 再试一次。
+- 子进程输出统一按 UTF-8 lossy 解码（非法字节序列替换为 U+FFFD，不引入 GBK 解码依赖；增量流式读取按实际消费的原始字节数推进偏移，运行期末尾不完整的多字节 UTF-8 序列留待后续字节补齐）。
 - 输出缓冲采用有界环形结构：保留头部与尾部，中间以「省略 N 字节」标记。
 
 ### 复用决策

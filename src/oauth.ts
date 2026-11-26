@@ -232,6 +232,7 @@ export class OAuthProvider {
   // ---------------------------------------------------------------- 对外 API
 
   validateAccessToken(token: string): boolean {
+    if (!this.oauthEnabled()) return false;
     const entry = this.store.accessTokens[sha256(token)];
     return Boolean(entry && entry.exp > this.now() && this.store.clients[entry.client_id]);
   }
@@ -249,6 +250,17 @@ export class OAuthProvider {
 
   /** 处理 OAuth 相关请求；返回 false 表示不是 OAuth 路径，交给调用方 */
   async handle(req: IncomingMessage, res: ServerResponse, pathname: string, url: URL): Promise<boolean> {
+    const isOAuthPath =
+      pathname === "/oauth" ||
+      pathname.startsWith("/oauth/") ||
+      pathname.startsWith("/.well-known/oauth");
+    if (!isOAuthPath) return false;
+
+    if (!this.oauthEnabled()) {
+      sendOAuthError(res, 403, "access_denied", "当前未配置本地 token，OAuth 2.1 端点已关闭。");
+      return true;
+    }
+
     const method = req.method ?? "GET";
 
     if (method === "GET" && (pathname === "/.well-known/oauth-protected-resource" || pathname.startsWith("/.well-known/oauth-protected-resource/"))) {

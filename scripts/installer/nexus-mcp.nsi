@@ -36,7 +36,7 @@ VIAddVersionKey "ProductVersion" "${APP_VERSION}"
 VIAddVersionKey "FileVersion" "${APP_VERSION}"
 VIAddVersionKey "FileDescription" "${APP_NAME} 安装程序"
 VIAddVersionKey "CompanyName" "${APP_PUBLISHER}"
-VIAddVersionKey "LegalCopyright" "Apache-2.0"
+VIAddVersionKey "LegalCopyright" "AGPL-3.0"
 
 !define MUI_ABORTWARNING
 !define MUI_WELCOMEPAGE_TEXT "nexus-mcp 是给云端 AI 用的本地 MCP 服务。$\r$\n$\r$\n只装到当前用户目录，不需要管理员权限。首次启动会在安装目录生成 config.json 与 workspace。"

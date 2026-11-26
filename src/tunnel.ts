@@ -122,7 +122,60 @@ export class TunnelManager {
   private lastExitCode?: number;
   private lastExitAt?: string;
 
-  constructor(private readonly options: TunnelManagerOptions) {}
+  constructor(private options: TunnelManagerOptions) {}
+
+  /** 取消挂起的自动重启定时器与状态位（不触碰正在运行的隧道进程） */
+  cancelPendingRestart(): void {
+    if (this.restartTimer) {
+      clearTimeout(this.restartTimer);
+      this.restartTimer = undefined;
+    }
+    this.restarting = false;
+  }
+
+  /** 仅停止本面板实例自己拉起的受管子进程（绝不误杀外部已运行的 cloudflared） */
+  async stopManaged(): Promise<void> {
+    this.cancelPendingRestart();
+    if (!isAlive(this.child)) {
+      this.child = undefined;
+      return;
+    }
+    this.stopping = true;
+    const child = this.child;
+    child.kill();
+    await new Promise<void>((resolve) => {
+      if (child.exitCode !== null || child.signalCode !== null) {
+        resolve();
+        return;
+      }
+      const timer = setTimeout(resolve, STOP_WAIT_MS);
+      child.once("exit", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+    this.child = undefined;
+    log("受管隧道进程已随配置变更停止");
+  }
+
+  /** 重载配置时同步隧道参数：若启动参数变了且受管子进程在跑，重启切换到新参数 */
+  async syncOptions(options: TunnelManagerOptions): Promise<void> {
+    const launchChanged =
+      this.options.cloudflaredPath !== options.cloudflaredPath ||
+      this.options.configPath !== options.configPath ||
+      this.options.logfilePath !== options.logfilePath;
+    const wasRunningManaged = isAlive(this.child);
+    this.options = options;
+    if (!options.autoRestart) {
+      this.cancelPendingRestart();
+    }
+    if (launchChanged && wasRunningManaged) {
+      await this.stopManaged();
+      if (existsSync(options.cloudflaredPath) && existsSync(options.configPath)) {
+        await this.start();
+      }
+    }
+  }
 
   async status(): Promise<TunnelProcessInfo> {
     const alive = isAlive(this.child);
@@ -150,6 +203,9 @@ export class TunnelManager {
 
   /** 返回 started=false 时 reason 说明为什么没拉起（已在运行等），不抛错 */
   async start(): Promise<{ started: boolean; reason?: string; pid?: number }> {
+    // 无论后续早退或抛错，先清掉挂起的自动重启计划与状态位，避免 autoRestarting 卡死为 true
+    this.cancelPendingRestart();
+
     if (!existsSync(this.options.cloudflaredPath)) {
       throw new Error(`找不到 cloudflared: ${this.options.cloudflaredPath}`);
     }
@@ -163,12 +219,6 @@ export class TunnelManager {
       return { started: false, reason: "已在运行（外部进程，可能是启动文件夹拉起）" };
     }
 
-    // 清掉上一次异常退出留下的重启计划，避免与新启动叠加
-    if (this.restartTimer) {
-      clearTimeout(this.restartTimer);
-      this.restartTimer = undefined;
-    }
-    this.restarting = false;
     this.stopping = false;
 
     const args = [
@@ -198,11 +248,7 @@ export class TunnelManager {
 
   async stop(): Promise<void> {
     this.stopping = true;
-    this.restarting = false;
-    if (this.restartTimer) {
-      clearTimeout(this.restartTimer);
-      this.restartTimer = undefined;
-    }
+    this.cancelPendingRestart();
     if (isAlive(this.child)) {
       this.child.kill();
       await new Promise<void>((resolve) => {
@@ -236,6 +282,7 @@ export class TunnelManager {
     log(`隧道异常退出，${Math.round(delay / 1000)} 秒后自动重启`);
     const timer = setTimeout(() => {
       this.restartTimer = undefined;
+      this.restarting = false;
       void this.start()
         .then((result) => {
           if (!result.started) log(`自动重启未执行: ${result.reason ?? ""}`);
@@ -254,17 +301,23 @@ export class TunnelManager {
   }
 }
 
-/** 从 AppConfig 解析隧道管理器；config.json 没有 tunnel 段时返回 undefined（不启用启停按钮） */
-export function resolveTunnelManager(config: AppConfig): TunnelManager | undefined {
+/** 从 AppConfig 提取 TunnelManagerOptions；没有 tunnel 段时返回 undefined */
+export function resolveTunnelOptions(config: AppConfig): TunnelManagerOptions | undefined {
   const tunnel: TunnelConfig | undefined = config.tunnel;
   if (!tunnel) return undefined;
   // 测试缝（对齐 NEXUS_GIT_BASH 的先例）：stub 脚本路径插在 cloudflared 参数最前面
   const stub = process.env.NEXUS_TUNNEL_STUB?.trim();
-  return new TunnelManager({
+  return {
     cloudflaredPath: tunnel.cloudflaredPath ?? defaultCloudflaredPath(),
     configPath: tunnel.configPath ?? defaultTunnelConfigPath(),
     logfilePath: path.join(path.dirname(configFilePath()), "tunnel.log"),
     autoRestart: tunnel.autoRestart ?? true,
     ...(stub ? { argsPrefix: [stub] } : {}),
-  });
+  };
+}
+
+/** 从 AppConfig 解析隧道管理器；config.json 没有 tunnel 段时返回 undefined（不启用启停按钮） */
+export function resolveTunnelManager(config: AppConfig): TunnelManager | undefined {
+  const options = resolveTunnelOptions(config);
+  return options ? new TunnelManager(options) : undefined;
 }

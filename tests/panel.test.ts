@@ -104,6 +104,8 @@ describe("本地控制面板", () => {
     for (const tool of TOOL_SUMMARY) {
       expect(html).toContain(`<b>${tool.name}</b>`);
     }
+    expect(html).not.toContain("写文件，自动建目录");
+    expect(html).toContain("不自动建目录");
 
     const { client, transport } = await connectClient(server.mcpUrl);
     const listed = await client.listTools();
@@ -254,6 +256,72 @@ describe("本地控制面板", () => {
   );
 
   it(
+    "普通会话断开保留后台任务，面板停止或重启服务则关闭执行器并树杀后台任务",
+    async () => {
+      const isPidAlive = (pid: number): boolean => {
+        try {
+          process.kill(pid, 0);
+          return true;
+        } catch {
+          return false;
+        }
+      };
+
+      const first = await connectClient(server.mcpUrl);
+      const startedJob = (await first.client.callTool({
+        name: "job_start",
+        arguments: { command: "sleep 30" },
+      })) as { content: Array<{ type: string; text: string }>; isError?: boolean };
+      expectOk(startedJob);
+      const startText = startedJob.content[0]?.text ?? "";
+      const jobId = /job-\d+/.exec(startText)?.[0] ?? "";
+      const pid = Number(/pid (\d+)/.exec(startText)?.[1] ?? "0");
+      expect(jobId).toMatch(/^job-\d+$/);
+      expect(pid).toBeGreaterThan(0);
+      expect(isPidAlive(pid)).toBe(true);
+
+      // 1) 普通会话断开：后台任务不受影响，新会话仍能查到 running
+      await first.transport.terminateSession();
+      await first.client.close();
+
+      const second = await connectClient(server.mcpUrl);
+      const stillRunning = (await second.client.callTool({
+        name: "job_output",
+        arguments: { job_id: jobId },
+      })) as { content: Array<{ type: string; text: string }>; isError?: boolean };
+      expectOk(stillRunning);
+      expect(stillRunning.content[0]?.text ?? "").toContain("status: running");
+      await second.transport.terminateSession();
+      await second.client.close();
+
+      // 2) 面板停止服务：关闭执行器并树杀后台任务
+      const stopped = await postJson(server, "/api/service", { action: "stop" });
+      expect(stopped.status).toBe(200);
+
+      const deadline = Date.now() + 8_000;
+      while (isPidAlive(pid) && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      expect(isPidAlive(pid)).toBe(false);
+
+      // 重新启动服务后，旧后台任务记录已随旧执行器清空
+      const restarted = await postJson(server, "/api/service", { action: "start" });
+      expect(restarted.status).toBe(200);
+
+      const third = await connectClient(server.mcpUrl);
+      const gone = (await third.client.callTool({
+        name: "job_output",
+        arguments: { job_id: jobId },
+      })) as { content: Array<{ type: string; text: string }>; isError?: boolean };
+      expect(gone.isError).toBe(true);
+      expect(gone.content[0]?.text ?? "").toContain("不存在");
+      await third.transport.terminateSession();
+      await third.client.close();
+    },
+    45_000,
+  );
+
+  it(
     "重载配置把磁盘上的改动带进运行中的服务",
     async () => {
       const before = await getStatus(server);
@@ -280,17 +348,75 @@ describe("本地控制面板", () => {
         expect(after.root).toBe(path.resolve(altRoot));
         expect(after.root).not.toBe(before.root);
 
-        // 重载真的重启了端点：旧会话不再可用
+        // 重载真的重启了端点：旧会话不再可用（不用 toBeInstanceOf，避免 vmThreads 跨 realm 假阴性）
         const stale = await client.listTools().then(
           () => null,
           (error: unknown) => error as Error,
         );
-        expect(stale).toBeInstanceOf(Error);
+        expect(stale?.message.length ?? 0).toBeGreaterThan(0);
       } finally {
         writeFileSync(server.configPath, original, "utf8");
         await postJson(server, "/api/service", { action: "reload" });
         rmSync(altRoot, { recursive: true, force: true });
         await client.close();
+      }
+    },
+    40_000,
+  );
+
+  it(
+    "重载配置校验与快捷设置同严，且清除已删可选字段并同步 TunnelManager",
+    async () => {
+      const original = readFileSync(server.configPath, "utf8");
+      const base = JSON.parse(original) as Record<string, unknown>;
+
+      try {
+        // 1) loadConfig 严格校验：未知 shell / 非正整数 / 含空白 tunnelUrl 重载必须报错拒绝
+        for (const badPatch of [
+          { shell: "cmd" },
+          { maxOutputBytes: 0 },
+          { defaultTimeoutMs: -10 },
+          { tunnelUrl: "https://has space.example" },
+        ]) {
+          writeFileSync(server.configPath, JSON.stringify({ ...base, ...badPatch }, null, 2), "utf8");
+          const rejected = await postJson(server, "/api/service", { action: "reload" });
+          expect(rejected.status).toBe(500);
+        }
+
+        // 2) 动态加上 tunnelUrl 与 tunnel 段后重载：TunnelManager 同步启用
+        writeFileSync(
+          server.configPath,
+          JSON.stringify(
+            {
+              ...base,
+              tunnelUrl: "https://reload-sync.example.test",
+              tunnel: {
+                cloudflaredPath: path.join(projectRoot, "nonexistent-cloudflared.exe"),
+                configPath: path.join(projectRoot, "package.json"),
+                metricsPort: 1,
+              },
+            },
+            null,
+            2,
+          ),
+          "utf8",
+        );
+        const enabled = await postJson(server, "/api/service", { action: "reload" });
+        expect(enabled.status).toBe(200);
+        const withTunnel = await getStatus(server);
+        expect(withTunnel.tunnel.url).toBe("https://reload-sync.example.test");
+        expect(withTunnel.tunnel.state).toBe("unavailable");
+
+        // 3) 从 config.json 删除 tunnelUrl 与 tunnel 后重载：无字段残留，回到 unconfigured
+        writeFileSync(server.configPath, original, "utf8");
+        const cleared = await postJson(server, "/api/service", { action: "reload" });
+        expect(cleared.status).toBe(200);
+        const afterClear = await getStatus(server);
+        expect(afterClear.tunnel.url).toBeUndefined();
+        expect(afterClear.tunnel.state).toBe("unconfigured");
+      } finally {
+        writeFileSync(server.configPath, original, "utf8");
+        await postJson(server, "/api/service", { action: "reload" });
       }
     },
     40_000,

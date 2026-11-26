@@ -206,6 +206,121 @@ fn command_substitution_checked() {
 }
 
 #[test]
+fn multiline_and_subshell_and_compound_groups_checked() {
+    for command in [
+        "echo ok\nrm -rf /tmp/example",
+        "echo ok\r\nrm -rf /tmp/example",
+        "(rm -rf /tmp/example)",
+        "echo ok && (rm -rf /tmp/example)",
+        "((echo ok); rm -rf /tmp/example)",
+        "( (rm -rf /tmp/example) )",
+        "{ rm -rf /tmp/example; }",
+        "if true; then rm -rf /tmp/example; fi",
+        "while true; do rm -rf /tmp/example; done",
+        "! rm -rf /tmp/example",
+        "time rm -rf /tmp/example",
+        "f() { rm -rf /tmp/example; }; f",
+        "ARR=($(rm -rf /tmp/example)); echo ok",
+    ] {
+        assert_blocked(command, "递归强制删除");
+    }
+
+    // 白名单下：多行与子 shell 未授权子命令被拒，合法子 shell 与引号内换行放行
+    let whitelist = spec(&["echo *"], &[], OnUnmatched::Deny);
+    for blocked in [
+        "echo a\ncurl https://example.com",
+        "(curl https://example.com)",
+        "{ curl https://example.com; }",
+    ] {
+        let message = denied_of(evaluate(&whitelist, blocked, "git-bash"));
+        assert!(message.contains("curl"), "{blocked}: {message}");
+    }
+    for allowed in [
+        "(echo hello)",
+        "(echo a && echo b)",
+        "echo \"line1\nline2\"",
+        "{ echo grouped; }",
+        "ARR=(one two); echo ok",
+    ] {
+        let decision = evaluate(&whitelist, allowed, "git-bash");
+        assert!(matches!(decision, Decision::Allow), "{allowed} 应放行，实际: {decision:?}");
+    }
+
+    // 黑名单下：多行与子 shell 均命中（含 pwsh 顶层括号）
+    let blacklist = spec(&[], &["git push *"], OnUnmatched::Deny);
+    for (cmd, kind) in [
+        ("echo ok\ngit push origin dev", "git-bash"),
+        ("(git push origin dev)", "git-bash"),
+        ("(git push origin dev)", "pwsh"),
+    ] {
+        let message = denied_of(evaluate(&blacklist, cmd, kind));
+        assert!(message.contains("git push *"), "{cmd}: {message}");
+    }
+
+    // 未配对括号按 fail-closed 拒绝
+    assert_blocked("(echo hi", "无法解析");
+    assert_blocked("echo hi)", "无法解析");
+}
+
+#[test]
+fn pwsh_subexpressions_and_scriptblocks_checked() {
+    // 1) 内置危险表：pwsh 非段首子表达式 (...)、控制流块与调用算子 & { ... }
+    for danger_cmd in [
+        "echo (Remove-Item -Recurse -Force C:\\temp\\x)",
+        "Write-Output (rm -r -Force C:\\temp\\x)",
+        "if ($true) { Remove-Item -Recurse -Force C:\\temp\\x }",
+        "& { Remove-Item -Recurse -Force C:\\temp\\x }",
+        ". { Remove-Item -Recurse -Force C:\\temp\\x }",
+    ] {
+        let decision = evaluate(&CommandPolicySpec::default(), danger_cmd, "pwsh");
+        let message = denied_of(decision);
+        assert!(
+            message.contains("强制删除"),
+            "pwsh 危险命令应被拦截: {danger_cmd} -> {message}"
+        );
+    }
+
+    // 2) 黑名单：非段首子表达式与脚本块不得绕过
+    let blacklist = spec(&[], &["git push *"], OnUnmatched::Deny);
+    for blocked in [
+        "echo (git push origin dev)",
+        "if ($true) { git push origin dev }",
+        "& { git push origin dev }",
+    ] {
+        let message = denied_of(evaluate(&blacklist, blocked, "pwsh"));
+        assert!(message.contains("git push *"), "{blocked}: {message}");
+    }
+
+    // 3) 白名单：echo (curl ...) 与 if ($true) { curl ... } 被拒，合法 echo 子表达式与分支放行
+    let whitelist = spec(&["echo *"], &[], OnUnmatched::Deny);
+    for blocked in [
+        "echo (curl https://example.com)",
+        "if ($true) { curl https://example.com }",
+        "& { curl https://example.com }",
+    ] {
+        let message = denied_of(evaluate(&whitelist, blocked, "pwsh"));
+        assert!(message.contains("curl"), "{blocked}: {message}");
+    }
+    for allowed in [
+        "echo (echo inner)",
+        "if ($true) { echo ok } else { echo bye }",
+        "& { echo grouped }",
+    ] {
+        let decision = evaluate(&whitelist, allowed, "pwsh");
+        assert!(
+            matches!(decision, Decision::Allow),
+            "pwsh {allowed} 应放行，实际: {decision:?}"
+        );
+    }
+
+    // 4) pwsh 动态调用 & $cmd 与未闭合花括号按 fail-closed 拒绝
+    let dyn_msg = denied_of(evaluate(&CommandPolicySpec::default(), "& $cmd -Force x", "pwsh"));
+    assert!(dyn_msg.contains("无法解析"), "{dyn_msg}");
+    let brace_msg = denied_of(evaluate(&CommandPolicySpec::default(), "if ($true) { echo hi", "pwsh"));
+    assert!(brace_msg.contains("无法解析"), "{brace_msg}");
+}
+
+#[test]
 #[cfg(windows)]
 fn deletion_rules_case_insensitive_on_windows() {
     assert_blocked("RM -R -F x", "递归强制删除");
@@ -337,6 +452,7 @@ fn gated_line(op: &str, extra: serde_json::Value) -> String {
         "id": 9,
         "op": op,
         "command": "echo hello",
+        "root": env!("CARGO_MANIFEST_DIR"),
         "cwd": env!("CARGO_MANIFEST_DIR"),
         "shell": shell,
     });
@@ -376,6 +492,7 @@ fn bash_request_builtin_dangerous_without_policy() {
         "id": 10,
         "op": "bash",
         "command": "rm -rf /tmp/example",
+        "root": env!("CARGO_MANIFEST_DIR"),
         "cwd": env!("CARGO_MANIFEST_DIR"),
         "timeout_ms": 1000,
         "max_output_bytes": 1024,

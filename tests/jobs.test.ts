@@ -3,7 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { projectRoot } from "./support/server.js";
@@ -300,6 +300,48 @@ describe("job_start / job_output 工具", () => {
   );
 
   it(
+    "job_start 的 cwd 通过目录链接指向沙箱根外时被拒绝",
+    { timeout: 25_000 },
+    async (t) => {
+      const sandboxRoot = mkdtempSync(path.join(os.tmpdir(), "nexus-job-root-"));
+      const outsideDir = mkdtempSync(path.join(os.tmpdir(), "nexus-job-out-"));
+      const linkPath = path.join(sandboxRoot, "escape-link");
+      let linked = false;
+      try {
+        symlinkSync(outsideDir, linkPath, "junction");
+        linked = true;
+      } catch {
+        // ignore
+      }
+      const cfg = writeTempConfig();
+      writeFileSync(
+        cfg.path,
+        JSON.stringify({ root: sandboxRoot, transport: "stdio", shell: "auto" }, null, 2),
+        "utf8",
+      );
+      const isolated = await connectStdio({ NEXUS_MCP_CONFIG: cfg.path });
+      try {
+        if (!linked) {
+          t.skip();
+          return;
+        }
+        const escaped = await callTool(isolated.client, "job_start", {
+          command: "pwd",
+          cwd: "escape-link",
+        });
+        expect(escaped.isError).toBe(true);
+        expect(textOf(escaped)).toContain("路径越界");
+      } finally {
+        await isolated.close();
+        rmSync(linkPath, { recursive: true, force: true });
+        rmSync(sandboxRoot, { recursive: true, force: true });
+        rmSync(outsideDir, { recursive: true, force: true });
+        rmSync(cfg.dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it(
     "超长输出采用有界缓冲：保留头尾并标注省略量",
     { timeout: 30_000 },
     async () => {
@@ -342,6 +384,41 @@ describe("job_start / job_output 工具", () => {
   );
 
   it(
+    "非 UTF-8 输出在 job_output 中按 lossy 推进偏移，不卡死且不漏后续文本",
+    { timeout: 20_000 },
+    async () => {
+      const start = await callTool(session.client, "job_start", {
+        command: "printf 'JOB_BEFORE\\x80\\xff\\xc4\\xe3JOB_AFTER\\n'",
+      });
+      expectOk(start);
+      const jobId = jobIdOf(textOf(start));
+
+      await waitFor(async () => {
+        const probe = await callTool(session.client, "job_output", { job_id: jobId });
+        expectOk(probe);
+        return statusOf(textOf(probe)) === "exited";
+      }, 10_000);
+
+      let offset = 0;
+      let combined = "";
+      let lastRaw = "";
+      for (let step = 0; step < 5; step++) {
+        const page = await callTool(session.client, "job_output", { job_id: jobId, offset });
+        expectOk(page);
+        lastRaw = textOf(page);
+        combined += bodyOf(lastRaw);
+        if (!lastRaw.includes("下次调用用 offset=")) break;
+        const next = nextOffsetOf(lastRaw);
+        expect(next).toBeGreaterThan(offset);
+        offset = next;
+      }
+      expect(combined).toContain("JOB_BEFORE");
+      expect(combined).toContain("JOB_AFTER");
+      expect(lastRaw).not.toContain("下次调用用 offset=");
+    },
+  );
+
+  it(
     "服务退出时终止所有后台任务，不残留子进程",
     { timeout: 60_000 },
     async () => {
@@ -369,9 +446,15 @@ describe("job_start / job_output 工具", () => {
         expectOk(start);
         await waitFor(async () => sentryProcessCount() === baseline + 1, 10_000);
 
-        // 服务退出（transport close 会终止 dist 进程 → 执行器 stdin 收到 EOF → 清理后台任务）
+        // 服务退出（即便此刻执行器正阻塞在同步长耗时 bash，stdio 退出也必须经 closeExecutor 树杀后台任务，不等 60 秒）
+        const blockingBash = callTool(orphanSession.client, "bash", {
+          command: "sleep 60",
+          timeout_ms: 60_000,
+        }).catch(() => undefined);
+        await new Promise((r) => setTimeout(r, 300));
         await orphanSession.close();
-        await waitFor(async () => sentryProcessCount() === baseline, 15_000, 250);
+        await blockingBash;
+        await waitFor(async () => sentryProcessCount() === baseline, 8_000, 200);
       } finally {
         await orphanSession?.close().catch(() => {});
         rmSync(orphanRoot, { recursive: true, force: true });

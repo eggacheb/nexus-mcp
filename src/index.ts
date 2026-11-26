@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { loadConfig } from "./config.js";
+import { closeExecutor } from "./executor.js";
 import { log } from "./log.js";
 import { createMcpService } from "./mcpService.js";
 import { startPanel } from "./panel.js";
@@ -34,7 +35,22 @@ async function main(): Promise<void> {
 
   if (useStdio) {
     const server = createServer(config);
-    await server.connect(new StdioServerTransport());
+    const transport = new StdioServerTransport();
+    let stdioStopping = false;
+    const shutdownStdio = async (): Promise<void> => {
+      if (stdioStopping) return;
+      stdioStopping = true;
+      await closeExecutor();
+      process.exit(0);
+    };
+    transport.onclose = () => {
+      void shutdownStdio();
+    };
+    process.stdin.once("end", () => void shutdownStdio());
+    process.stdin.once("close", () => void shutdownStdio());
+    process.on("SIGINT", () => void shutdownStdio());
+    process.on("SIGTERM", () => void shutdownStdio());
+    await server.connect(transport);
     // stdio 模式下 stdout 属于协议通道，日志一律走 stderr
     console.error(`[nexus-mcp] v${VERSION} stdio 已就绪，根目录: ${config.root}`);
     return;

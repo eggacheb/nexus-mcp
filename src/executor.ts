@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
@@ -44,6 +44,8 @@ export interface ReadSuccess {
   end_line: number;
   /** 因字节上限未显示的行数 */
   omitted_lines: number;
+  /** 首行单行超过字节上限被截断时，该行末尾省略的字节数 */
+  truncated_line_bytes?: number;
 }
 
 export interface WriteSuccess {
@@ -215,7 +217,7 @@ export class ExecutorClient {
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        this.terminate();
+        void this.close();
         reject(new Error(`执行器在 ${deadlineMs}ms 内没有响应请求 ${id}，已终止执行器进程`));
       }, deadlineMs);
       this.pending.set(id, {
@@ -294,19 +296,79 @@ export class ExecutorClient {
     }
   }
 
-  private terminate(): void {
+  /**
+   * 关闭执行器并树杀其持有的全部后台任务：
+   * 先关 stdin 让执行器主循环走优雅退出（调 kill_all_running），
+   * 超时未退（如正阻塞在同步 bash）则用 taskkill /T /F + kill 强行收尾。
+   */
+  async close(): Promise<void> {
     const child = this.child;
     this.child = null;
-    child?.kill();
+    this.lineBuffer = "";
+    this.stderrTail = "";
+    this.failAll("MCP 服务已停止，执行器已关闭");
+    if (!child || child.exitCode !== null || child.signalCode !== null) {
+      return;
+    }
+
+    const waitForExit = (timeoutMs: number): Promise<boolean> =>
+      new Promise((resolve) => {
+        if (child.exitCode !== null || child.signalCode !== null) {
+          resolve(true);
+          return;
+        }
+        const timer = setTimeout(() => {
+          child.off("exit", onExit);
+          resolve(false);
+        }, timeoutMs);
+        const onExit = (): void => {
+          clearTimeout(timer);
+          resolve(true);
+        };
+        child.once("exit", onExit);
+      });
+
+    try {
+      child.stdin?.end();
+    } catch {
+      // ignore broken pipe
+    }
+    if (await waitForExit(500)) return;
+
+    if (process.platform === "win32" && typeof child.pid === "number") {
+      await new Promise<void>((resolve) => {
+        execFile(
+          "taskkill",
+          ["/PID", String(child.pid), "/T", "/F"],
+          { windowsHide: true },
+          () => resolve(),
+        );
+      });
+    }
+    try {
+      child.kill();
+    } catch {
+      // ignore
+    }
+    await waitForExit(2_000);
   }
 }
 
 let shared: ExecutorClient | undefined;
 
-/** 进程级共享一个执行器：无状态、常驻，进程退出时随 stdin 关闭自然结束 */
+/** 进程级共享一个执行器：无状态、常驻，服务停止/重启时经 closeExecutor 显式关闭 */
 export function getExecutor(): ExecutorClient {
   shared ??= new ExecutorClient();
   return shared;
+}
+
+/** 关闭当前共享执行器实例（下次调用 getExecutor 时按需拉起新实例） */
+export async function closeExecutor(): Promise<void> {
+  const current = shared;
+  shared = undefined;
+  if (current) {
+    await current.close();
+  }
 }
 
 export interface ExecutorProbe {

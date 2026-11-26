@@ -80,13 +80,16 @@ async function callTool(
 
 describe("命令闸门（默认配置：仅内置危险表）", () => {
   let session: StdioSession;
+  let mainConfig: { path: string; dir: string };
 
   beforeAll(async () => {
-    session = await connectStdio();
+    mainConfig = writeTempConfig();
+    session = await connectStdio({ NEXUS_MCP_CONFIG: mainConfig.path });
   }, 30_000);
 
   afterAll(async () => {
     await session?.close();
+    if (mainConfig) rmSync(mainConfig.dir, { recursive: true, force: true });
   });
 
   it(
@@ -120,6 +123,41 @@ describe("命令闸门（默认配置：仅内置危险表）", () => {
     expect(result.isError).toBe(true);
     expect(textOf(result)).toContain("无法解析");
   });
+
+  it("多行命令中的危险子命令在 bash 与 job_start 下均被拦截", { timeout: 15_000 }, async () => {
+    const cmd = "echo safe\nrm -rf /tmp/nexus-policy-probe-should-not-exist";
+    const bashRes = await callTool(session.client, "bash", { command: cmd });
+    expect(bashRes.isError).toBe(true);
+    expect(textOf(bashRes)).toContain("递归强制删除");
+    expect(textOf(bashRes)).toContain("替代方案");
+
+    const jobRes = await callTool(session.client, "job_start", { command: cmd });
+    expect(jobRes.isError).toBe(true);
+    expect(textOf(jobRes)).toContain("递归强制删除");
+  });
+
+  it("子 shell、花括号组与控制流分支中的危险命令被拦截，未闭合括号 fail-closed", { timeout: 20_000 }, async () => {
+    for (const cmd of [
+      "(rm -rf /tmp/nexus-policy-probe-should-not-exist)",
+      "echo safe && (rm -rf /tmp/nexus-policy-probe-should-not-exist)",
+      "{ rm -rf /tmp/nexus-policy-probe-should-not-exist; }",
+      "if true; then rm -rf /tmp/nexus-policy-probe-should-not-exist; fi",
+    ]) {
+      const res = await callTool(session.client, "bash", { command: cmd });
+      expect(res.isError, `${cmd} 应被拦截`).toBe(true);
+      expect(textOf(res)).toContain("递归强制删除");
+    }
+
+    const jobSubshell = await callTool(session.client, "job_start", {
+      command: "(rm -rf /tmp/nexus-policy-probe-should-not-exist)",
+    });
+    expect(jobSubshell.isError).toBe(true);
+    expect(textOf(jobSubshell)).toContain("递归强制删除");
+
+    const unclosed = await callTool(session.client, "bash", { command: "(echo unclosed" });
+    expect(unclosed.isError).toBe(true);
+    expect(textOf(unclosed)).toContain("无法解析");
+  });
 });
 
 describe("命令闸门（白名单）", () => {
@@ -142,6 +180,26 @@ describe("命令闸门（白名单）", () => {
         expect(text).toContain("白名单");
         expect(text).toContain("echo *");
         expect(text).toContain("curl");
+
+        const multilineDenied = await callTool(session.client, "bash", {
+          command: "echo whitelisted\ncurl https://example.com",
+        });
+        expect(multilineDenied.isError).toBe(true);
+        expect(textOf(multilineDenied)).toContain("白名单");
+        expect(textOf(multilineDenied)).toContain("curl");
+
+        const subshellDenied = await callTool(session.client, "bash", {
+          command: "(curl https://example.com)",
+        });
+        expect(subshellDenied.isError).toBe(true);
+        expect(textOf(subshellDenied)).toContain("白名单");
+        expect(textOf(subshellDenied)).toContain("curl");
+
+        const subshellAllowed = await callTool(session.client, "bash", {
+          command: "(echo subshell-ok)",
+        });
+        expectOk(subshellAllowed);
+        expect(textOf(subshellAllowed)).toContain("subshell-ok");
       } finally {
         await session.close();
         rmSync(config.dir, { recursive: true, force: true });
@@ -207,6 +265,13 @@ describe("命令闸门（黑名单与归一化）", () => {
         expect(text).toContain("git push *");
         expect(text).toContain("git push origin dev");
         expect(text).toContain("替代方案");
+
+        for (const bypass of ["echo ok\ngit push origin dev", "(git push origin dev)"]) {
+          const bypassed = await callTool(session.client, "bash", { command: bypass });
+          expect(bypassed.isError, `${bypass} 应被黑名单拦截`).toBe(true);
+          expect(textOf(bypassed)).toContain("git push *");
+          expect(textOf(bypassed)).toContain("替代方案");
+        }
       } finally {
         await session.close();
         rmSync(config.dir, { recursive: true, force: true });
@@ -226,6 +291,46 @@ describe("命令闸门（黑名单与归一化）", () => {
         const result = await callTool(session.client, "bash", { command: "RM.EXE -RF x" });
         expect(result.isError).toBe(true);
         expect(textOf(result)).toContain("递归强制删除");
+      } finally {
+        await session.close();
+        rmSync(config.dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it(
+    "pwsh 模式下非段首括号子表达式与花括号脚本块同样受危险表与白/黑名单约束",
+    { timeout: 25_000 },
+    async () => {
+      const config = writeTempConfig({
+        shell: "pwsh",
+        commandPolicy: { allow: ["echo *"], deny: ["git push *"], onUnmatched: "deny" },
+      });
+      const session = await connectStdio({ NEXUS_MCP_CONFIG: config.path });
+      try {
+        const subexprDanger = await callTool(session.client, "bash", {
+          command: "echo (Remove-Item -Recurse -Force C:\\temp\\nexus-probe-never)",
+        });
+        expect(subexprDanger.isError).toBe(true);
+        expect(textOf(subexprDanger)).toContain("强制删除");
+
+        const blockDeny = await callTool(session.client, "bash", {
+          command: "if ($true) { git push origin dev }",
+        });
+        expect(blockDeny.isError).toBe(true);
+        expect(textOf(blockDeny)).toContain("git push *");
+
+        const subexprUnmatched = await callTool(session.client, "bash", {
+          command: "echo (curl https://example.com)",
+        });
+        expect(subexprUnmatched.isError).toBe(true);
+        expect(textOf(subexprUnmatched)).toContain("curl");
+
+        const blockAllowed = await callTool(session.client, "bash", {
+          command: "if ($true) { echo pwsh-block-ok }",
+        });
+        expectOk(blockAllowed);
+        expect(textOf(blockAllowed)).toContain("pwsh-block-ok");
       } finally {
         await session.close();
         rmSync(config.dir, { recursive: true, force: true });

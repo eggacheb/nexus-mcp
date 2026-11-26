@@ -1,8 +1,12 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { AppConfig } from "./config.js";
-import { displayPath, resolveInRoot } from "./config.js";
 import { getExecutor, resolveShell } from "./executor.js";
+import {
+  displayPath,
+  resolveOptionalDir,
+  resolveRequiredFileTarget,
+} from "./sandboxPath.js";
 import type {
   BashResponse,
   EditResponse,
@@ -31,7 +35,7 @@ const GREP_TIMEOUT_MS = 300_000;
  */
 export const TOOL_SUMMARY: ReadonlyArray<{ name: string; summary: string }> = [
   { name: "read", summary: "读文件，支持行范围" },
-  { name: "write", summary: "写文件，自动建目录" },
+  { name: "write", summary: "覆盖写文件，不自动建目录" },
   { name: "edit", summary: "按上下文替换文件片段" },
   { name: "bash", summary: "在沙箱里跑命令" },
   { name: "glob", summary: "按通配符找文件" },
@@ -66,11 +70,10 @@ export function registerTools(server: McpServer, config: AppConfig): void {
     },
     async ({ path: filePath, offset, limit }) => {
       try {
-        const abs = resolveInRoot(config.root, filePath);
+        const target = resolveRequiredFileTarget(config.root, filePath);
         const response = await getExecutor().request<ReadResponse>({
           op: "read",
-          path: abs,
-          root: config.root,
+          ...target,
           offset: offset ?? 1,
           limit: limit ?? MAX_READ_LINES,
           max_output_bytes: config.maxOutputBytes,
@@ -83,10 +86,14 @@ export function registerTools(server: McpServer, config: AppConfig): void {
           );
         }
         let text = response.content;
+        const singleLineTruncated = (response.truncated_line_bytes ?? 0) > 0;
+        if (singleLineTruncated) {
+          text += `\n[第 ${response.start_line} 行单行超过字节上限，行尾已省略 ${response.truncated_line_bytes} 字节]`;
+        }
         if (response.end_line < response.total_lines) {
           text += `\n[已显示 ${response.start_line}-${response.end_line} 行，文件共 ${response.total_lines} 行；用 offset=${response.end_line + 1} 继续读取]`;
         }
-        if (response.omitted_lines > 0) {
+        if (response.omitted_lines > 0 && !singleLineTruncated) {
           text += `\n[输出超过字节上限，还有 ${response.omitted_lines} 行未显示；用 limit 缩小范围分次读取]`;
         }
         return ok(text);
@@ -108,15 +115,14 @@ export function registerTools(server: McpServer, config: AppConfig): void {
     },
     async ({ path: filePath, content }) => {
       try {
-        const abs = resolveInRoot(config.root, filePath);
+        const target = resolveRequiredFileTarget(config.root, filePath);
         const response = await getExecutor().request<WriteResponse>({
           op: "write",
-          path: abs,
-          root: config.root,
+          ...target,
           content,
         });
         if (!response.ok) return fail(response.error);
-        return ok(`已写入 ${displayPath(config.root, abs)}（${response.bytes_written} 字节）`);
+        return ok(`已写入 ${displayPath(config.root, target.path)}（${response.bytes_written} 字节）`);
       } catch (err) {
         return fail((err as Error).message);
       }
@@ -138,11 +144,10 @@ export function registerTools(server: McpServer, config: AppConfig): void {
     },
     async ({ path: filePath, old_string, new_string, replace_all }) => {
       try {
-        const abs = resolveInRoot(config.root, filePath);
+        const target = resolveRequiredFileTarget(config.root, filePath);
         const response = await getExecutor().request<EditResponse>({
           op: "edit",
-          path: abs,
-          root: config.root,
+          ...target,
           old_string,
           new_string,
           replace_all: replace_all ?? false,
@@ -156,7 +161,7 @@ export function registerTools(server: McpServer, config: AppConfig): void {
           response.replacements === 1
             ? where
             : `替换 ${response.replacements} 处，首处${where}`;
-        return ok(`已编辑 ${displayPath(config.root, abs)}（${detail}）`);
+        return ok(`已编辑 ${displayPath(config.root, target.path)}（${detail}）`);
       } catch (err) {
         return fail((err as Error).message);
       }
@@ -177,11 +182,12 @@ export function registerTools(server: McpServer, config: AppConfig): void {
     },
     async ({ command, cwd, timeout_ms }) => {
       try {
-        const dir = cwd ? resolveInRoot(config.root, cwd) : config.root;
+        const dir = resolveOptionalDir(config.root, cwd);
         const timeout = timeout_ms ?? config.defaultTimeoutMs;
         const response = await getExecutor().request<BashResponse>({
           op: "bash",
           command,
+          root: config.root,
           cwd: dir,
           timeout_ms: timeout,
           max_output_bytes: config.maxOutputBytes,
@@ -212,7 +218,7 @@ export function registerTools(server: McpServer, config: AppConfig): void {
     },
     async ({ pattern, path: searchPath }) => {
       try {
-        const dir = searchPath ? resolveInRoot(config.root, searchPath) : config.root;
+        const dir = resolveOptionalDir(config.root, searchPath);
         const response = await getExecutor().request<GlobResponse>({
           op: "glob",
           root: config.root,
@@ -251,7 +257,7 @@ export function registerTools(server: McpServer, config: AppConfig): void {
     },
     async ({ pattern, path: searchPath, glob, ignore_case }) => {
       try {
-        const dir = searchPath ? resolveInRoot(config.root, searchPath) : config.root;
+        const dir = resolveOptionalDir(config.root, searchPath);
         const response = await getExecutor().request<GrepResponse>({
           op: "grep",
           root: config.root,
@@ -292,10 +298,11 @@ export function registerTools(server: McpServer, config: AppConfig): void {
     },
     async ({ command, cwd }) => {
       try {
-        const dir = cwd ? resolveInRoot(config.root, cwd) : config.root;
+        const dir = resolveOptionalDir(config.root, cwd);
         const response = await getExecutor().request<JobStartResponse>({
           op: "job_start",
           command,
+          root: config.root,
           cwd: dir,
           max_output_bytes: config.maxOutputBytes,
           shell: resolveShell(config),

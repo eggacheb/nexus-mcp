@@ -34,6 +34,7 @@ fn start_request(command: &str, max_output_bytes: u64) -> JobStartRequest {
     JobStartRequest {
         id: 1,
         command: command.into(),
+        root: env!("CARGO_MANIFEST_DIR").into(),
         cwd: env!("CARGO_MANIFEST_DIR").into(),
         max_output_bytes,
         shell: ShellSpec {
@@ -244,6 +245,38 @@ fn multibyte_output_stays_valid_across_read_boundaries() {
     assert!(merged.contains("第300行"), "尾部要保留末行");
     // 页与页之间不重复、不跳跃：页数多于 1（内容量超过单次上限）
     assert!(pages.len() > 1, "内容应跨多页读取");
+}
+
+#[test]
+fn multibyte_output_small_window_and_straddle_offset_never_corrupt() {
+    let _guard = spawn_lock();
+    let mut registry = JobRegistry::new();
+    let start = registry.start(&start_request("printf '中文测试'", 1024));
+    let job_id = start["job_id"].as_str().unwrap().to_string();
+    wait_exited(&mut registry, &job_id, 1024, 10_000);
+
+    // 1) 调用方从半字符 offset=1 起读且 max_output_bytes=4（skip=2 后仅剩 2 字节，小于 3 字节中文字符）
+    let mut offset = 1u64;
+    let mut straddle_text = String::new();
+    for _ in 0..8 {
+        let page = registry.output(&output_request(&job_id, Some(offset), 4));
+        straddle_text.push_str(page["output"].as_str().unwrap());
+        let next = page["next_offset"].as_u64().unwrap();
+        let total = page["total_bytes"].as_u64().unwrap();
+        assert!(next > offset, "next_offset 必须严格前进: {offset} -> {next}");
+        offset = next;
+        if offset >= total {
+            break;
+        }
+    }
+    assert_eq!(straddle_text, "文测试");
+    assert!(!straddle_text.contains('\u{FFFD}'));
+
+    // 2) 极小单次读取预算 max_output_bytes=2（小于单个 UTF-8 汉字字节数）也能完整无损读完
+    let tiny_pages = read_to_end(&mut registry, &job_id, 2);
+    let tiny_merged: String = tiny_pages.concat();
+    assert_eq!(tiny_merged, "中文测试");
+    assert!(!tiny_merged.contains('\u{FFFD}'));
 }
 
 #[test]

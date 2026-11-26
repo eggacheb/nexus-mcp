@@ -23,6 +23,7 @@ fn bash_line(command: &str, timeout_ms: u64, max_output_bytes: usize) -> String 
         "id": 7,
         "op": "bash",
         "command": command,
+        "root": env!("CARGO_MANIFEST_DIR"),
         "cwd": env!("CARGO_MANIFEST_DIR"),
         "timeout_ms": timeout_ms,
         "max_output_bytes": max_output_bytes,
@@ -91,11 +92,13 @@ fn oversized_output_gets_omission_marker() {
 
 #[test]
 fn missing_cwd_is_a_clean_error() {
+    let missing_inside = Path::new(env!("CARGO_MANIFEST_DIR")).join("不存在的子目录");
     let line = json!({
         "id": 8,
         "op": "bash",
         "command": "echo hi",
-        "cwd": "X:\\不存在的目录",
+        "root": env!("CARGO_MANIFEST_DIR"),
+        "cwd": missing_inside.to_string_lossy(),
         "timeout_ms": 1000,
         "max_output_bytes": 1024,
         "shell": { "kind": "git-bash", "program": git_bash().unwrap_or_default() }
@@ -104,6 +107,21 @@ fn missing_cwd_is_a_clean_error() {
     let response = handle_request(&line);
     assert_eq!(response["ok"], json!(false));
     assert!(response["error"].as_str().unwrap().contains("工作目录"));
+
+    let outside_line = json!({
+        "id": 9,
+        "op": "bash",
+        "command": "echo hi",
+        "root": env!("CARGO_MANIFEST_DIR"),
+        "cwd": "X:\\越界目录",
+        "timeout_ms": 1000,
+        "max_output_bytes": 1024,
+        "shell": { "kind": "git-bash", "program": git_bash().unwrap_or_default() }
+    })
+    .to_string();
+    let outside_resp = handle_request(&outside_line);
+    assert_eq!(outside_resp["ok"], json!(false));
+    assert!(outside_resp["error"].as_str().unwrap().contains("路径越界"));
 }
 
 #[test]
