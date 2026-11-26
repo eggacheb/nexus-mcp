@@ -479,4 +479,4 @@ fn monitor(job: Arc<Job>) {
 
 #[cfg(test)]
 #[path = "jobs_tests.rs"]
-mod tests;
+pub(crate) mod tests;

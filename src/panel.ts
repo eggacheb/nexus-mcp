@@ -7,6 +7,7 @@ import type { AppConfig } from "./config.js";
 import {
   loadConfig,
   normalizeCommandPolicy,
+  normalizeLogLevel,
   normalizePositiveInt,
   normalizeTunnelUrl,
   replaceConfigInPlace,
@@ -14,7 +15,7 @@ import {
   validateShell,
 } from "./config.js";
 import { readBody, sendJson as sendJsonRaw } from "./httpHelpers.js";
-import { log, recentLogs, redactText } from "./log.js";
+import { logError, logInfo, logWarn, recentLogs, redactText, setLogLevel } from "./log.js";
 import type { McpService } from "./mcpService.js";
 import type { ComponentStatus, TunnelStatus } from "./status.js";
 import { executorStatus, probePublicTunnel, tunnelStatus } from "./status.js";
@@ -140,6 +141,7 @@ const PAGE = `<!doctype html>
   pre .ts { color: #98a2b3; }
   pre .lv-error { color: #b91c1c; }
   pre .lv-warn { color: #b45309; }
+  pre .lv-debug { color: #98a2b3; }
   .tools { list-style: none; margin: 0; padding: 0; display: grid; gap: 7px; }
   .tools li { display: flex; gap: 10px; align-items: baseline; font-size: 13px; }
   .tools b { font-family: var(--mono); font-size: 12px; color: var(--brand); min-width: 82px; }
@@ -236,6 +238,15 @@ const PAGE = `<!doctype html>
     <div class="row"><input id="set-max-output" type="number" min="1" step="1" /></div>
     <label>单条命令默认超时 defaultTimeoutMs（毫秒）</label>
     <div class="row"><input id="set-timeout" type="number" min="1" step="1" /></div>
+    <label>日志等级 logLevel（免重启即时生效）</label>
+    <div class="row">
+      <select id="set-log-level">
+        <option value="debug">debug（排障详情，含 tool.start / ipc.done）</option>
+        <option value="info">info（默认，工具摘要与管控事件）</option>
+        <option value="warn">warn（仅告警与错误）</option>
+        <option value="error">error（仅严重错误）</option>
+      </select>
+    </div>
     <label>隧道公网地址 tunnelUrl（留空清除）</label>
     <div class="row"><input id="set-tunnel-url" placeholder="https://nexus.example.com/" /></div>
     <label>命令白名单（一行一条通配模式，留空关闭白名单）</label>
@@ -266,7 +277,7 @@ const PAGE = `<!doctype html>
   <section class="card wide" data-block="logs">
     <h2>最近日志 <small>最近 100 行，令牌已抹掉</small></h2>
     <div class="row">
-      <input id="log-filter" placeholder="筛关键字，比如 error" />
+      <input id="log-filter" placeholder="筛关键字，比如 debug / warn / sid= / read" />
       <button id="log-new" class="ghost" hidden>有新日志</button>
     </div>
     <pre id="logs">读取中…</pre>
@@ -384,8 +395,13 @@ const PAGE = `<!doctype html>
       }
       var message = document.createElement("span");
       message.textContent = text;
-      if (/error|failed|失败|出错|异常/i.test(text)) message.className = "lv-error";
-      else if (/warn|警告|重试/i.test(text)) message.className = "lv-warn";
+      if (text.indexOf("[ERROR]") === 0) message.className = "lv-error";
+      else if (text.indexOf("[WARN]") === 0) message.className = "lv-warn";
+      else if (text.indexOf("[DEBUG]") === 0) message.className = "lv-debug";
+      else if (text.indexOf("[INFO]") !== 0) {
+        if (/error|failed|失败|出错|异常/i.test(text)) message.className = "lv-error";
+        else if (/warn|警告|重试/i.test(text)) message.className = "lv-warn";
+      }
       row.appendChild(message);
       fragment.appendChild(row);
     });
@@ -466,6 +482,7 @@ const PAGE = `<!doctype html>
     document.getElementById("set-shell").value = s.shell;
     document.getElementById("set-max-output").value = String(s.maxOutputBytes);
     document.getElementById("set-timeout").value = String(s.defaultTimeoutMs);
+    document.getElementById("set-log-level").value = s.logLevel || "info";
     document.getElementById("set-tunnel-url").value = s.tunnelUrl || "";
     document.getElementById("set-allow").value = (s.commandPolicy.allow || []).join("\\n");
     document.getElementById("set-deny").value = (s.commandPolicy.deny || []).join("\\n");
@@ -581,6 +598,7 @@ const PAGE = `<!doctype html>
       shell: document.getElementById("set-shell").value,
       maxOutputBytes: Number(document.getElementById("set-max-output").value),
       defaultTimeoutMs: Number(document.getElementById("set-timeout").value),
+      logLevel: document.getElementById("set-log-level").value,
       tunnelUrl: document.getElementById("set-tunnel-url").value.trim(),
       commandPolicy: {
         allow: lines("set-allow"),
@@ -863,6 +881,7 @@ export async function startPanel(
       shell: config.shell,
       maxOutputBytes: config.maxOutputBytes,
       defaultTimeoutMs: config.defaultTimeoutMs,
+      logLevel: config.logLevel,
       tunnelUrl: config.tunnelUrl ?? "",
       commandPolicy: config.commandPolicy,
     };
@@ -946,7 +965,7 @@ export async function startPanel(
       }
       config.root = abs;
       saveConfig(config);
-      log(`根目录已切换到 ${abs}`);
+      logInfo("panel.root", { root: abs });
       sendJson(res, 200, await statusPayload());
       return;
     }
@@ -964,6 +983,7 @@ export async function startPanel(
         shell?: AppConfig["shell"];
         maxOutputBytes?: number;
         defaultTimeoutMs?: number;
+        logLevel?: AppConfig["logLevel"];
         tunnelUrl?: string;
         commandPolicy?: AppConfig["commandPolicy"];
       } = {};
@@ -978,6 +998,9 @@ export async function startPanel(
         }
         if (body.defaultTimeoutMs !== undefined) {
           patch.defaultTimeoutMs = normalizePositiveInt(body.defaultTimeoutMs, "defaultTimeoutMs");
+        }
+        if (body.logLevel !== undefined) {
+          patch.logLevel = normalizeLogLevel(body.logLevel);
         }
         if (body.tunnelUrl !== undefined) {
           patch.tunnelUrl = normalizeTunnelUrl(body.tunnelUrl) ?? "";
@@ -994,6 +1017,10 @@ export async function startPanel(
       if (patch.shell !== undefined) config.shell = patch.shell;
       if (patch.maxOutputBytes !== undefined) config.maxOutputBytes = patch.maxOutputBytes;
       if (patch.defaultTimeoutMs !== undefined) config.defaultTimeoutMs = patch.defaultTimeoutMs;
+      if (patch.logLevel !== undefined) {
+        config.logLevel = patch.logLevel;
+        setLogLevel(patch.logLevel);
+      }
       if (patch.tunnelUrl !== undefined) {
         if (patch.tunnelUrl) config.tunnelUrl = patch.tunnelUrl;
         else delete config.tunnelUrl;
@@ -1001,7 +1028,7 @@ export async function startPanel(
       if (patch.commandPolicy !== undefined) config.commandPolicy = patch.commandPolicy;
 
       saveConfig(config);
-      log("快捷设置已更新并写回 config.json");
+      logInfo("panel.settings", { shell: config.shell, logLevel: config.logLevel });
       sendJson(res, 200, { ...(await statusPayload()), settings: settingsPayload() });
       return;
     }
@@ -1014,22 +1041,23 @@ export async function startPanel(
       try {
         if (action === "stop") {
           await service.stop();
-          log("面板操作: 停止 MCP 服务");
+          logInfo("panel.service", { action: "stop" });
         } else if (action === "start") {
           await service.start();
-          log("面板操作: 启动 MCP 服务");
+          logInfo("panel.service", { action: "start" });
         } else if (action === "restart") {
           // 只断开重连，不重读磁盘配置；要带上配置文件改动就用「重载配置」
           await service.stop();
           await service.start();
-          log("面板操作: 重启 MCP 服务");
+          logInfo("panel.service", { action: "restart" });
         } else if (action === "reload") {
           const next = loadConfig();
           replaceConfigInPlace(config, next);
+          setLogLevel(config.logLevel);
           await syncTunnelManager(config);
-          log(`配置已重载，根目录 ${config.root}`);
+          logInfo("panel.service", { action: "reload", root: config.root, logLevel: config.logLevel });
           if (next.panelPort !== panelPort) {
-            log(`panelPort 改成 ${next.panelPort}，面板需要重启进程才生效`);
+            logWarn("panel.reload_port_pending", { panelPort: next.panelPort });
           }
           if (service.isRunning()) {
             await service.stop();
@@ -1040,6 +1068,7 @@ export async function startPanel(
           return;
         }
       } catch (error) {
+        logError("panel.service_error", { action, err: (error as Error).message });
         sendJson(res, 500, { error: `操作失败: ${(error as Error).message}` });
         return;
       }
@@ -1060,14 +1089,24 @@ export async function startPanel(
       try {
         if (action === "start") {
           const result = await currentTunnel.start();
-          log(`面板操作: 启动隧道 ${result.started ? `pid=${result.pid}` : (result.reason ?? "未拉起")}`);
+          logInfo("panel.tunnel", {
+            action: "start",
+            started: result.started,
+            pid: result.pid,
+            reason: result.reason,
+          });
         } else if (action === "stop") {
           await currentTunnel.stop();
-          log("面板操作: 停止隧道");
+          logInfo("panel.tunnel", { action: "stop" });
         } else if (action === "probe") {
           // 手动探测：真的往外打一次，把状态码和往返耗时报给面板。
           // 状态灯已经不靠它了（见 status.ts 的 tunnelStatus），这里只是链路体检。
           const probe = await probePublicTunnel(config);
+          if (probe.ok) {
+            logInfo("tunnel.probe", { ok: true, status: probe.status, ms: probe.ms });
+          } else {
+            logWarn("tunnel.probe", { ok: false, ms: probe.ms, err: probe.error });
+          }
           sendJson(res, 200, { probe });
           return;
         } else {
@@ -1075,6 +1114,7 @@ export async function startPanel(
           return;
         }
       } catch (error) {
+        logError("panel.tunnel_error", { action, err: (error as Error).message });
         sendJson(res, 500, { error: `操作失败: ${(error as Error).message}` });
         return;
       }
@@ -1090,7 +1130,7 @@ export async function startPanel(
     route(req, res).catch((error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);
       const safeMessage = redactText(message, config.token);
-      log(`面板请求失败: ${safeMessage}`);
+      logError("panel.error", { err: safeMessage });
       if (res.headersSent) {
         res.end();
         return;
@@ -1115,7 +1155,7 @@ export async function startPanel(
 
   const address = server.address();
   panelPort = typeof address === "object" && address ? address.port : config.panelPort;
-  log(`面板已就绪: http://${LISTEN_HOST}:${panelPort}`);
+  logInfo("panel.ready", { url: `http://${LISTEN_HOST}:${panelPort}` });
 
   return {
     port: panelPort,

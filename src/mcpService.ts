@@ -8,7 +8,7 @@ import type { AppConfig } from "./config.js";
 import { configFilePath } from "./config.js";
 import { closeExecutor } from "./executor.js";
 import { readBody, sendJson } from "./httpHelpers.js";
-import { log, redactText } from "./log.js";
+import { logDebug, logError, logInfo, logWarn, redactText } from "./log.js";
 import { OAuthProvider, safeEqual } from "./oauth.js";
 import { createServer } from "./server.js";
 
@@ -107,12 +107,13 @@ function hasProxyForwardingHeaders(req: IncomingMessage): boolean {
 
 interface AuthFailure {
   status: number;
+  reason: string;
   message: string;
   /** 令牌无效时带给 WWW-Authenticate 的 OAuth 错误码（RFC 6750） */
   oauthError?: string;
 }
 
-/** 日志只记录方法与状态；令牌、Authorization 头一律不进日志 */
+/** 日志只记录状态码与原因码；令牌、Authorization 头一律不进日志 */
 function checkAuth(req: IncomingMessage, config: AppConfig, oauth: OAuthProvider): AuthFailure | null {
   const remote = req.socket.remoteAddress;
 
@@ -120,18 +121,21 @@ function checkAuth(req: IncomingMessage, config: AppConfig, oauth: OAuthProvider
     if (!isLoopback(remote)) {
       return {
         status: 403,
+        reason: "non_loopback",
         message: `配置里没有令牌，只接受本机连接；拒绝来自 ${remote ?? "未知地址"} 的请求。`,
       };
     }
     if (hasProxyForwardingHeaders(req)) {
       return {
         status: 403,
+        reason: "proxy_header",
         message: "配置里没有令牌，只接受本机直连；拒绝经隧道或反向代理转发的请求。",
       };
     }
     if (!isLoopbackHostHeader(req.headers.host)) {
       return {
         status: 403,
+        reason: "invalid_host",
         message: "配置里没有令牌，只接受本机直连；拒绝非本机 Host 头的请求。",
       };
     }
@@ -140,11 +144,11 @@ function checkAuth(req: IncomingMessage, config: AppConfig, oauth: OAuthProvider
 
   const header = req.headers.authorization;
   if (!header) {
-    return { status: 401, message: "缺少 Authorization 请求头，需要 Bearer 令牌。" };
+    return { status: 401, reason: "missing_credentials", message: "缺少 Authorization 请求头，需要 Bearer 令牌。" };
   }
   const [scheme, value] = header.split(" ");
   if (!scheme || scheme.toLowerCase() !== "bearer" || !value) {
-    return { status: 401, message: "Authorization 头格式不对，需要写成 Bearer <令牌>。" };
+    return { status: 401, reason: "invalid_scheme", message: "Authorization 头格式不对，需要写成 Bearer <令牌>。" };
   }
   if (safeEqual(value, config.token)) {
     return null;
@@ -155,6 +159,7 @@ function checkAuth(req: IncomingMessage, config: AppConfig, oauth: OAuthProvider
   }
   return {
     status: 401,
+    reason: "invalid_token",
     message: "令牌不正确：既不是静态 Bearer 令牌，也不是有效的 OAuth 访问令牌。",
     oauthError: "invalid_token",
   };
@@ -170,8 +175,23 @@ function sendRpcError(
   sendJson(res, status, { jsonrpc: "2.0", error: { code, message }, id: null }, headers);
 }
 
-function sendSessionNotFound(res: ServerResponse): void {
+function sendSessionNotFound(res: ServerResponse, sessionId: string, method: string): void {
+  logWarn("session.not_found", { sid: sessionId.slice(0, 8), method });
   sendRpcError(res, 404, RPC_SESSION_GONE, "会话不存在或已结束，请重新 initialize。");
+}
+
+function rpcControlMethods(parsed: unknown): string[] {
+  const messages = Array.isArray(parsed) ? parsed : [parsed];
+  const methods: string[] = [];
+  for (const message of messages) {
+    if (typeof message === "object" && message !== null) {
+      const m = (message as { method?: unknown }).method;
+      if (typeof m === "string" && m !== "tools/call") {
+        methods.push(m);
+      }
+    }
+  }
+  return methods;
 }
 
 function sessionIdOf(req: IncomingMessage): string | undefined {
@@ -190,10 +210,17 @@ function hasInitializeMessage(parsed: unknown): boolean {
   );
 }
 
-async function releaseSession(session: Session, sessions: Map<string, Session>): Promise<void> {
+async function releaseSession(
+  session: Session,
+  sessions: Map<string, Session>,
+  reason: "client" | "idle" | "shutdown" | "init_failed" = "client",
+): Promise<void> {
   if (session.id) sessions.delete(session.id);
   if (session.closed) return;
   session.closed = true;
+  if (session.id) {
+    logInfo("session.close", { sid: session.id.slice(0, 8), reason, active: sessions.size });
+  }
   try {
     await session.server.close();
   } catch {
@@ -210,16 +237,24 @@ function createSession(config: AppConfig, sessions: Map<string, Session>): Sessi
       sessions.set(id, session);
     },
     onsessionclosed: () => {
-      void releaseSession(session, sessions);
+      void releaseSession(session, sessions, "client");
     },
   });
   transport.onclose = () => {
-    void releaseSession(session, sessions);
+    void releaseSession(session, sessions, "client");
   };
   transport.onerror = (error) => {
-    log(`会话出错: ${error.message}`);
+    logWarn("session.error", {
+      sid: session.id ? session.id.slice(0, 8) : "init",
+      err: error.message,
+    });
   };
-  session = { server: createServer(config), transport, closed: false, lastSeen: Date.now() };
+  session = {
+    server: createServer(config, { sessionId: () => session.id }),
+    transport,
+    closed: false,
+    lastSeen: Date.now(),
+  };
   return session;
 }
 
@@ -261,8 +296,7 @@ export function createMcpService(config: AppConfig): McpService {
     const now = Date.now();
     for (const session of [...sessions.values()]) {
       if (now - session.lastSeen > IDLE_SESSION_MS) {
-        log(`回收空闲会话 ${safeText(session.id ?? "(未完成初始化)")}`);
-        void releaseSession(session, sessions);
+        void releaseSession(session, sessions, "idle");
       }
     }
   }
@@ -290,6 +324,7 @@ export function createMcpService(config: AppConfig): McpService {
 
     const auth = checkAuth(req, config, oauth);
     if (auth) {
+      logWarn("auth.deny", { status: auth.status, reason: auth.reason });
       const headers: Record<string, string> = {};
       if (auth.status === 401) headers["WWW-Authenticate"] = oauth.wwwAuthenticate(auth.oauthError);
       sendRpcError(res, auth.status, RPC_AUTH_FAILED, auth.message, headers);
@@ -325,10 +360,13 @@ export function createMcpService(config: AppConfig): McpService {
       if (sessionId) {
         const existing = sessions.get(sessionId);
         if (!existing) {
-          sendSessionNotFound(res);
+          sendSessionNotFound(res, sessionId, method);
           return;
         }
         existing.lastSeen = Date.now();
+        for (const rpcMethod of rpcControlMethods(parsed)) {
+          logDebug("mcp.rpc", { sid: sessionId.slice(0, 8), method: rpcMethod });
+        }
         await existing.transport.handleRequest(req, res, parsed);
         return;
       }
@@ -338,14 +376,17 @@ export function createMcpService(config: AppConfig): McpService {
         return;
       }
 
+      for (const rpcMethod of rpcControlMethods(parsed)) {
+        logDebug("mcp.rpc", { sid: "init", method: rpcMethod });
+      }
       const session = createSession(config, sessions);
       await session.server.connect(session.transport);
       await session.transport.handleRequest(req, res, parsed);
       if (session.id) {
-        log(`会话已建立 ${session.id}，当前 ${sessions.size} 个`);
+        logInfo("session.open", { sid: session.id.slice(0, 8), active: sessions.size });
       } else {
         // initialize 没走完（客户端中断或协议错误），别把孤儿实例留在表外
-        await releaseSession(session, sessions);
+        await releaseSession(session, sessions, "init_failed");
       }
       return;
     }
@@ -356,10 +397,17 @@ export function createMcpService(config: AppConfig): McpService {
     }
     const existing = sessions.get(sessionId);
     if (!existing) {
-      sendSessionNotFound(res);
+      sendSessionNotFound(res, sessionId, method);
       return;
     }
     existing.lastSeen = Date.now();
+    if (method === "GET") {
+      const sidShort = sessionId.slice(0, 8);
+      logDebug("sse.open", { sid: sidShort });
+      res.once("close", () => {
+        logDebug("sse.close", { sid: sidShort });
+      });
+    }
     await existing.transport.handleRequest(req, res);
   }
 
@@ -369,7 +417,7 @@ export function createMcpService(config: AppConfig): McpService {
     const server = http.createServer((req, res) => {
       route(req, res).catch((error: unknown) => {
         const message = error instanceof Error ? error.message : String(error);
-        log(`请求处理失败: ${safeText(message)}`);
+        logError("service.error", { err: safeText(message) });
         if (res.headersSent) {
           res.end();
           return;
@@ -393,11 +441,10 @@ export function createMcpService(config: AppConfig): McpService {
     ready = true;
     sweeper = setInterval(() => sweepIdleSessions(), SESSION_SWEEP_MS);
     sweeper.unref();
-    log(
-      config.token
-        ? `MCP 端点已就绪: ${url()}（已启用 Bearer 校验与 OAuth 2.1，数据落盘 ${oauthStorePath}）`
-        : `MCP 端点已就绪: ${url()}（未配置令牌，只接受本机连接）`,
-    );
+    logInfo("service.start", {
+      url: url(),
+      auth: config.token ? "bearer+oauth" : "loopback_only",
+    });
   }
 
   async function stop(): Promise<void> {
@@ -417,12 +464,12 @@ export function createMcpService(config: AppConfig): McpService {
     }
 
     for (const session of [...sessions.values()]) {
-      await releaseSession(session, sessions);
+      await releaseSession(session, sessions, "shutdown");
     }
     sessions.clear();
     await closeExecutor();
 
-    if (current) log("MCP 端点已停止");
+    if (current) logInfo("service.stop", { url: url() });
   }
 
   return {

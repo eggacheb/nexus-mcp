@@ -9,11 +9,11 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// job 测试都真实 spawn bash，cargo 默认并行跑测试会把机器压满，
-/// 拖垮既有的 bash 时序断言。本模块内部串行执行。
+/// 真实 spawn bash 的测试（jobs_tests 与 main_tests）共享本锁串行执行，
+/// 避免 cargo 默认并行跑测试把 Windows 进程创建压满、拖垮时序断言。
 static SPAWN_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-fn spawn_lock() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn spawn_lock() -> std::sync::MutexGuard<'static, ()> {
     SPAWN_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()

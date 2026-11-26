@@ -4,6 +4,7 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import { gitBashPath } from "./config.js";
 import type { AppConfig } from "./config.js";
+import { logDebug, logError } from "./log.js";
 import { appRoot, isPackaged } from "./paths.js";
 
 export interface ShellSpec {
@@ -183,6 +184,8 @@ export function resolveShell(config: AppConfig): ShellSpec {
 }
 
 interface Pending {
+  op: string;
+  startedAt: number;
   resolve(value: unknown): void;
   reject(error: Error): void;
   timer: NodeJS.Timeout;
@@ -211,16 +214,21 @@ export class ExecutorClient {
   private dispatch<T>(payload: Record<string, unknown>): Promise<T> {
     const child = this.ensureProcess();
     const id = this.nextId++;
+    const op = typeof payload.op === "string" ? payload.op : "unknown";
+    const startedAt = Date.now();
     const timeoutMs =
       typeof payload.timeout_ms === "number" ? payload.timeout_ms : 120_000;
     const deadlineMs = timeoutMs + 15_000;
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
+        logError("ipc.timeout", { id, op, timeout_ms: deadlineMs });
         void this.close();
         reject(new Error(`执行器在 ${deadlineMs}ms 内没有响应请求 ${id}，已终止执行器进程`));
       }, deadlineMs);
       this.pending.set(id, {
+        op,
+        startedAt,
         resolve: resolve as (value: unknown) => void,
         reject,
         timer,
@@ -230,6 +238,7 @@ export class ExecutorClient {
       } catch (err) {
         this.pending.delete(id);
         clearTimeout(timer);
+        logError("ipc.write_error", { id, op, err: (err as Error).message });
         reject(new Error(`执行器进程意外退出（写入请求失败: ${(err as Error).message}）`));
       }
     });
@@ -252,11 +261,19 @@ export class ExecutorClient {
       this.stderrTail = (this.stderrTail + chunk).slice(-2000);
     });
     child.on("error", (err) => {
-      if (this.child === child) this.child = null;
+      const unexpected = this.child === child;
+      if (unexpected) {
+        this.child = null;
+        logError("executor.error", { err: err.message });
+      }
       this.failAll(`执行器启动失败: ${err.message}`);
     });
     child.on("exit", (code, signal) => {
-      if (this.child === child) this.child = null;
+      const unexpected = this.child === child;
+      if (unexpected) {
+        this.child = null;
+        logError("executor.exit", { code: code ?? "-", signal: signal ?? "-" });
+      }
       const why = code !== null ? `退出码 ${code}` : `信号 ${signal}`;
       const tail = this.stderrTail.trim();
       const detail = tail ? `执行器 stderr 末尾：${tail}` : "";
@@ -284,6 +301,12 @@ export class ExecutorClient {
       if (!entry) continue;
       this.pending.delete(id as number);
       clearTimeout(entry.timer);
+      logDebug("ipc.done", {
+        id: id as number,
+        op: entry.op,
+        ms: Date.now() - entry.startedAt,
+        ok: parsed.ok === true,
+      });
       entry.resolve(parsed);
     }
   }

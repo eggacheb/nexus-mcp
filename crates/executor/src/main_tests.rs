@@ -1,6 +1,7 @@
 //! 执行器协议与 bash 执行的测试。需要 Git Bash（可用 NEXUS_GIT_BASH 指定路径）。
 
 use super::*;
+use crate::jobs::tests::spawn_lock;
 use serde_json::json;
 use std::fs;
 use std::path::PathBuf;
@@ -60,6 +61,7 @@ fn malformed_line_returns_parse_error() {
 
 #[test]
 fn bash_echo_returns_output_and_exit_code() {
+    let _guard = spawn_lock();
     let response = handle_request(&bash_line("echo cargo-executor-你好", 10_000, 64 * 1024));
     assert_eq!(response["ok"], json!(true));
     assert_eq!(response["exit_code"], json!(0));
@@ -68,6 +70,7 @@ fn bash_echo_returns_output_and_exit_code() {
 
 #[test]
 fn stderr_merged_and_nonzero_exit_code_preserved() {
+    let _guard = spawn_lock();
     let response = handle_request(&bash_line("echo 出错 >&2; exit 3", 10_000, 64 * 1024));
     assert_eq!(response["ok"], json!(true));
     assert_eq!(response["exit_code"], json!(3));
@@ -76,15 +79,23 @@ fn stderr_merged_and_nonzero_exit_code_preserved() {
 
 #[test]
 fn timeout_kills_child_and_reports() {
+    let _guard = spawn_lock();
     let started = Instant::now();
-    let response = handle_request(&bash_line("sleep 2", 300, 64 * 1024));
-    assert!(started.elapsed() < Duration::from_millis(2_000));
+    // sleep 10 远大于 5s 断言上限：既留足 Windows Git Bash 启动 + taskkill 开销，
+    // 又明确证明 300ms 超时确实提前终止了子进程而非等到自然结束
+    let response = handle_request(&bash_line("sleep 10", 300, 64 * 1024));
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(5_000),
+        "超时应提前终止 sleep 10，实际耗时 {elapsed:?}"
+    );
     assert_eq!(response["timed_out"], json!(true));
     assert_eq!(response["exit_code"], Value::Null);
 }
 
 #[test]
 fn oversized_output_gets_omission_marker() {
+    let _guard = spawn_lock();
     let response = handle_request(&bash_line("seq 1 5000", 10_000, 1000));
     assert_eq!(response["ok"], json!(true));
     assert!(response["output"].as_str().unwrap().contains("bytes omitted"));
@@ -126,6 +137,7 @@ fn missing_cwd_is_a_clean_error() {
 
 #[test]
 fn oversized_chinese_output_stays_valid_utf8() {
+    let _guard = spawn_lock();
     let response = handle_request(&bash_line(
         "for i in $(seq 1 4000); do echo \"第${i}行\"; done",
         10_000,

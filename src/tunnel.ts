@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import type { AppConfig, TunnelConfig } from "./config.js";
 import { configFilePath } from "./config.js";
-import { log } from "./log.js";
+import { logError, logInfo, logWarn } from "./log.js";
 
 /** 日志尾部最多保留的行数与读取字节数 */
 const TAIL_LINES = 8;
@@ -155,7 +155,7 @@ export class TunnelManager {
       });
     });
     this.child = undefined;
-    log("受管隧道进程已随配置变更停止");
+    logInfo("tunnel.stop", { reason: "config_change" });
   }
 
   /** 重载配置时同步隧道参数：若启动参数变了且受管子进程在跑，重启切换到新参数 */
@@ -236,13 +236,13 @@ export class TunnelManager {
       windowsHide: true,
     });
     child.on("error", (error: Error) => {
-      log(`隧道进程出错: ${error.message}`);
+      logError("tunnel.error", { err: error.message });
     });
     child.once("exit", (code, signal) => this.handleExit(code, signal));
     // detached + unref：服务进程退出不带走隧道
     child.unref();
     this.child = child;
-    log(`隧道进程已拉起 pid=${child.pid}`);
+    logInfo("tunnel.start", { pid: child.pid });
     return { started: true, pid: child.pid };
   }
 
@@ -268,26 +268,35 @@ export class TunnelManager {
       await execFileText("taskkill", ["/IM", "cloudflared.exe", "/F"]).catch(() => undefined);
     }
     this.child = undefined;
-    log("隧道进程已停止");
+    logInfo("tunnel.stop");
   }
 
   private handleExit(code: number | null, signal: NodeJS.Signals | null): void {
     this.lastExitCode = code ?? undefined;
     this.lastExitAt = new Date().toISOString();
-    log(`隧道进程退出: code=${code ?? "-"} signal=${signal ?? "-"}`);
-    if (this.stopping || !this.options.autoRestart) return;
+    if (this.stopping) {
+      logInfo("tunnel.exit", { code: code ?? "-", signal: signal ?? "-" });
+      return;
+    }
+
+    const delay = this.options.restartDelayMs ?? 10_000;
+    logWarn("tunnel.exit", {
+      code: code ?? "-",
+      signal: signal ?? "-",
+      auto_restart: this.options.autoRestart,
+      delay_s: this.options.autoRestart ? Math.round(delay / 1000) : undefined,
+    });
+    if (!this.options.autoRestart) return;
 
     this.restarting = true;
-    const delay = this.options.restartDelayMs ?? 10_000;
-    log(`隧道异常退出，${Math.round(delay / 1000)} 秒后自动重启`);
     const timer = setTimeout(() => {
       this.restartTimer = undefined;
       this.restarting = false;
       void this.start()
         .then((result) => {
-          if (!result.started) log(`自动重启未执行: ${result.reason ?? ""}`);
+          if (!result.started) logWarn("tunnel.restart_skipped", { reason: result.reason ?? "" });
         })
-        .catch((error: Error) => log(`自动重启失败: ${error.message}`));
+        .catch((error: Error) => logError("tunnel.restart_failed", { err: error.message }));
     }, delay);
     timer.unref?.();
     this.restartTimer = timer;

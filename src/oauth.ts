@@ -14,6 +14,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { logError, logInfo, logWarn } from "./log.js";
 
 const ACCESS_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 小时
 const REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 天
@@ -200,7 +201,7 @@ export class OAuthProvider {
         };
       }
     } catch (err) {
-      console.error(`[nexus-mcp] OAuth 数据读取失败，从空库开始: ${(err as Error).message}`);
+      logWarn("oauth.store.load_error", { err: (err as Error).message });
     }
     return { clients: {}, accessTokens: {}, refreshTokens: {} };
   }
@@ -213,7 +214,7 @@ export class OAuthProvider {
       fs.writeFileSync(tmp, JSON.stringify(this.store), { encoding: "utf-8", mode: 0o600 });
       fs.renameSync(tmp, this.opts.storePath);
     } catch (err) {
-      console.error(`[nexus-mcp] OAuth 数据写入失败: ${(err as Error).message}`);
+      logError("oauth.store.save_error", { err: (err as Error).message });
     }
   }
 
@@ -370,6 +371,11 @@ export class OAuthProvider {
       created_at: this.now(),
     };
     this.persist();
+    logInfo("oauth.register", {
+      client_id: clientId,
+      auth_method: authMethod,
+      name: clientName,
+    });
 
     sendJson(res, 201, {
       client_id: clientId,
@@ -447,6 +453,7 @@ export class OAuthProvider {
     redirect.searchParams.set("iss", this.base());
 
     if (params.action !== "approve") {
+      logInfo("oauth.authorize.deny", { client_id: check.client.client_id });
       redirect.searchParams.set("error", "access_denied");
       res.writeHead(302, { Location: redirect.toString(), "Cache-Control": "no-store" });
       res.end();
@@ -454,6 +461,7 @@ export class OAuthProvider {
     }
 
     if (!this.approvalAllowed(req)) {
+      logWarn("oauth.authorize.reject", { client_id: check.client.client_id, reason: "rate_limited" });
       sendHtml(res, 429, this.renderConsent(params, check.client, "尝试次数过多，请一分钟后再试。"));
       return;
     }
@@ -461,6 +469,7 @@ export class OAuthProvider {
     const typed = String(params.approval_token ?? "").trim();
     if (!typed || !safeEqual(typed, this.approvalSecret())) {
       this.recordApprovalFailure(req);
+      logWarn("oauth.authorize.reject", { client_id: check.client.client_id, reason: "invalid_token" });
       sendHtml(res, 401, this.renderConsent(params, check.client, "本地令牌不正确。"));
       return;
     }
@@ -472,6 +481,7 @@ export class OAuthProvider {
       code_challenge: String(params.code_challenge),
       exp: this.now() + AUTH_CODE_TTL_MS,
     });
+    logInfo("oauth.authorize.approve", { client_id: check.client.client_id });
     redirect.searchParams.set("code", code);
     res.writeHead(302, { Location: redirect.toString(), "Cache-Control": "no-store" });
     res.end();
@@ -551,6 +561,7 @@ export class OAuthProvider {
 
     const client = this.authenticateClient(req, body);
     if (!client) {
+      logWarn("oauth.token.fail", { reason: "invalid_client" });
       sendJson(
         res,
         401,
@@ -565,19 +576,23 @@ export class OAuthProvider {
       const pending = this.codes.get(codeKey);
       this.codes.delete(codeKey); // 无论成败都一次性，防重放
       if (!pending || pending.exp <= this.now() || pending.client_id !== client.client_id) {
+        logWarn("oauth.token.fail", { client_id: client.client_id, grant: "code", reason: "invalid_code" });
         sendOAuthError(res, 400, "invalid_grant", "授权码无效或已过期");
         return;
       }
       if (String(body.redirect_uri ?? "") !== pending.redirect_uri) {
+        logWarn("oauth.token.fail", { client_id: client.client_id, grant: "code", reason: "redirect_mismatch" });
         sendOAuthError(res, 400, "invalid_grant", "redirect_uri 与授权请求不一致");
         return;
       }
       const verifier = String(body.code_verifier ?? "");
       const computed = crypto.createHash("sha256").update(verifier).digest("base64url");
       if (!verifier || !safeEqual(computed, pending.code_challenge)) {
+        logWarn("oauth.token.fail", { client_id: client.client_id, grant: "code", reason: "pkce_failed" });
         sendOAuthError(res, 400, "invalid_grant", "PKCE 校验失败");
         return;
       }
+      logInfo("oauth.token.issue", { client_id: client.client_id, grant: "code" });
       sendJson(res, 200, this.issueTokens(client.client_id));
       return;
     }
@@ -586,14 +601,21 @@ export class OAuthProvider {
       const key = sha256(String(body.refresh_token ?? ""));
       const entry = this.store.refreshTokens[key];
       if (!entry || entry.exp <= this.now() || entry.client_id !== client.client_id) {
+        logWarn("oauth.token.fail", {
+          client_id: client.client_id,
+          grant: "refresh_token",
+          reason: "invalid_refresh_token",
+        });
         sendOAuthError(res, 400, "invalid_grant", "刷新令牌无效或已过期");
         return;
       }
       delete this.store.refreshTokens[key]; // 轮换：旧的立刻作废
+      logInfo("oauth.token.issue", { client_id: client.client_id, grant: "refresh_token" });
       sendJson(res, 200, this.issueTokens(client.client_id));
       return;
     }
 
+    logWarn("oauth.token.fail", { client_id: client.client_id, reason: "unsupported_grant_type" });
     sendOAuthError(res, 400, "unsupported_grant_type", "只支持 authorization_code 与 refresh_token");
   }
 

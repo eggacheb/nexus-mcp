@@ -1,7 +1,10 @@
 #!/bin/sh
-# 拦下不该进版本库的构建产物。
+# 拦下不该进版本库的构建产物与常见回归陷阱。
 # 安装（每台机器一次）：git config core.hooksPath scripts/hooks
 # 移除误加的产物：git restore --staged <路径>
+
+# 自举兼容：执行器为 Git Bash 设了 MSYS_NO_PATHCONV=1，继承进钩子会让 pnpm 的 npm 包装脚本拼坏路径
+unset MSYS_NO_PATHCONV
 
 staged=$(git diff --cached --name-only --diff-filter=ACMR)
 blocked=$(printf '%s\n' "$staged" | grep -E '(^|/)target/' || true)
@@ -27,6 +30,22 @@ if [ -n "$bad_tests" ]; then
   echo "pre-commit: 以下测试直接构造 StdioClientTransport 但没带 NEXUS_MCP_CONFIG：" >&2
   printf '%s\n' $bad_tests | sed 's/^/  - /' >&2
   echo "用临时目录配置（writeTempConfig / mkdtemp + config.json）经 env 传入，见 mcp.test.ts 的写法。" >&2
+  exit 1
+fi
+
+bare_stdio=$(grep -En 'connectStdio\([[:space:]]*\)' tests/*.test.ts || true)
+if [ -n "$bare_stdio" ]; then
+  echo "pre-commit: 禁止无参调用 connectStdio()（会裸读仓库根 config.json）：" >&2
+  printf '%s\n' "$bare_stdio" | sed 's/^/  /' >&2
+  echo "请传入隔离配置：connectStdio({ NEXUS_MCP_CONFIG: cfg.path })。" >&2
+  exit 1
+fi
+
+cross_realm=$(grep -En '\.toBeInstanceOf\(' tests/*.test.ts | grep -Ev '^[^:]+:[0-9]+:[[:space:]]*//' || true)
+if [ -n "$cross_realm" ]; then
+  echo "pre-commit: vitest 运行在 vmThreads 池，禁止使用跨 realm 假阴性的 .toBeInstanceOf(...)：" >&2
+  printf '%s\n' "$cross_realm" | sed 's/^/  /' >&2
+  echo "请改为断言错误消息内容（如 expect(err?.message).toContain(...)）。" >&2
   exit 1
 fi
 

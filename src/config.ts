@@ -3,8 +3,12 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { appRoot, isPackaged } from "./paths.js";
 import { log } from "./log.js";
+import type { LogLevel } from "./log.js";
 
+export type { LogLevel } from "./log.js";
 export type ShellKind = "auto" | "git-bash" | "pwsh" | "powershell";
+
+const VALID_LOG_LEVELS: ReadonlySet<string> = new Set<LogLevel>(["debug", "info", "warn", "error"]);
 
 export interface CommandPolicyConfig {
   /** 白名单：通配模式（如 "git push *"），非空时启用白名单 */
@@ -41,6 +45,8 @@ export interface AppConfig {
   maxOutputBytes: number;
   /** 单条命令默认超时 */
   defaultTimeoutMs: number;
+  /** 服务日志输出阈值，默认 info */
+  logLevel: LogLevel;
   /** 命令闸门：白/黑名单与未命中策略，原样透传给执行器 */
   commandPolicy: CommandPolicyConfig;
   /** 隧道公网地址，配了面板才会去探测连通性 */
@@ -58,6 +64,7 @@ const DEFAULTS: Omit<AppConfig, "root" | "panelPort" | "commandPolicy"> = {
   shell: "auto",
   maxOutputBytes: 64 * 1024,
   defaultTimeoutMs: 120_000,
+  logLevel: "info",
 };
 
 /** 命令闸门配置校验：形状不对启动即报错，不带着坏配置起服务 */
@@ -185,6 +192,16 @@ export function normalizePositiveInt(value: unknown, field: string): number {
     throw new Error(`config.json 的 ${field} 必须是正整数`);
   }
   return value;
+}
+
+/** 日志等级校验（loadConfig 与面板快捷设置同源复用） */
+export function normalizeLogLevel(value: unknown, sourceLabel = "config.json 的 logLevel"): LogLevel {
+  if (typeof value !== "string" || !VALID_LOG_LEVELS.has(value)) {
+    throw new Error(
+      `${sourceLabel} 只支持 "debug" / "info" / "warn" / "error"，收到 ${JSON.stringify(value)}`,
+    );
+  }
+  return value as LogLevel;
 }
 
 /** 隧道公网地址校验：允许省略或置空，非空时不得包含空白字符 */
@@ -325,6 +342,12 @@ export function loadConfig(): AppConfig {
     raw.defaultTimeoutMs !== undefined
       ? normalizePositiveInt(raw.defaultTimeoutMs, "defaultTimeoutMs")
       : DEFAULTS.defaultTimeoutMs;
+  const fileLogLevel =
+    raw.logLevel !== undefined ? normalizeLogLevel(raw.logLevel) : DEFAULTS.logLevel;
+  const rawEnvLogLevel = process.env.NEXUS_MCP_LOG_LEVEL?.trim();
+  const logLevel = rawEnvLogLevel
+    ? normalizeLogLevel(rawEnvLogLevel, "环境变量 NEXUS_MCP_LOG_LEVEL")
+    : fileLogLevel;
   const tunnelUrl = normalizeTunnelUrl(raw.tunnelUrl);
   const tunnel = normalizeTunnel(raw.tunnel);
 
@@ -337,6 +360,7 @@ export function loadConfig(): AppConfig {
     shell,
     maxOutputBytes,
     defaultTimeoutMs,
+    logLevel,
     commandPolicy: normalizeCommandPolicy(raw.commandPolicy),
     ...(tunnelUrl ? { tunnelUrl } : {}),
     ...(tunnel ? { tunnel } : {}),
@@ -365,6 +389,7 @@ export function saveConfig(config: AppConfig): void {
     shell: config.shell,
     maxOutputBytes: config.maxOutputBytes,
     defaultTimeoutMs: config.defaultTimeoutMs,
+    logLevel: config.logLevel,
     commandPolicy: config.commandPolicy,
   };
   // 可选键：配置里已不存在时要把旧键从文件里清掉，否则 {...raw} 会把它一直带着

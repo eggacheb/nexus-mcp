@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { loadConfig } from "./config.js";
 import { closeExecutor } from "./executor.js";
-import { log } from "./log.js";
+import { configureLogger, logError, logInfo, logWarn, resolveLogDir } from "./log.js";
 import { createMcpService } from "./mcpService.js";
 import { startPanel } from "./panel.js";
 import { createServer } from "./server.js";
@@ -20,7 +20,7 @@ function openPanelInBrowser(url: string): void {
   try {
     spawn("cmd", ["/c", "start", "", url], { detached: true, stdio: "ignore", windowsHide: true }).unref();
   } catch (error) {
-    log(`没能自动打开浏览器（手动访问 ${url}）：${(error as Error).message}`);
+    logWarn("panel.open_browser_failed", { url, err: (error as Error).message });
   }
 }
 
@@ -29,6 +29,11 @@ function openPanelInBrowser(url: string): void {
  */
 async function main(): Promise<void> {
   const config = loadConfig();
+  configureLogger({
+    level: config.logLevel,
+    logDir: resolveLogDir(),
+    getSecret: () => config.token,
+  });
 
   // --stdio 优先于配置，方便本机客户端与测试固定走 stdio
   const useStdio = process.argv.includes("--stdio") || config.transport === "stdio";
@@ -51,8 +56,8 @@ async function main(): Promise<void> {
     process.on("SIGINT", () => void shutdownStdio());
     process.on("SIGTERM", () => void shutdownStdio());
     await server.connect(transport);
-    // stdio 模式下 stdout 属于协议通道，日志一律走 stderr
-    console.error(`[nexus-mcp] v${VERSION} stdio 已就绪，根目录: ${config.root}`);
+    // stdio 模式下 stdout 属于协议通道，日志一律走 stderr 与磁盘文件
+    logInfo("service.ready", { transport: "stdio", version: VERSION, root: config.root });
     return;
   }
 
@@ -60,7 +65,7 @@ async function main(): Promise<void> {
   await service.start();
 
   const tunnel = resolveTunnelManager(config);
-  if (tunnel) log("隧道管理已启用（面板可启停 cloudflared）");
+  if (tunnel) logInfo("tunnel.enabled");
   const panel = await startPanel(config, service, tunnel);
 
   let stopping = false;
@@ -71,13 +76,13 @@ async function main(): Promise<void> {
     await service.stop();
     process.exit(0);
   };
-  log(`nexus-mcp v${VERSION} 面板入口: ${panel.url}`);
+  logInfo("service.ready", { version: VERSION, panel: panel.url });
   if (process.argv.includes("--open-panel")) openPanelInBrowser(panel.url);
   process.on("SIGINT", () => void shutdown());
   process.on("SIGTERM", () => void shutdown());
 }
 
 main().catch((error: unknown) => {
-  console.error(`[nexus-mcp] 启动失败: ${(error as Error).message}`);
+  logError("service.boot_failed", { err: (error as Error).message });
   process.exit(1);
 });

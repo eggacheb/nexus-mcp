@@ -23,12 +23,17 @@ export interface RunningServer {
 }
 
 export interface StartOptions {
+  root?: string;
   token?: string;
+  logLevel?: string;
+  commandPolicy?: Record<string, unknown>;
   tunnelUrl?: string;
   /** config.json 的 tunnel 段，透传给服务的隧道管理器 */
   tunnel?: Record<string, unknown>;
   /** NEXUS_TUNNEL_STUB：插在 cloudflared 参数最前面的 stub 脚本路径 */
   tunnelStubPath?: string;
+  /** 附加环境变量（如 NEXUS_MCP_EXECUTOR / NEXUS_MCP_LOG_DIR） */
+  env?: Record<string, string>;
 }
 
 export function freePort(): Promise<number> {
@@ -75,12 +80,14 @@ export async function startServer(options: StartOptions = {}): Promise<RunningSe
     configPath,
     JSON.stringify(
       {
-        root: projectRoot,
+        root: options.root ?? projectRoot,
         transport: "http",
         port,
         panelPort,
         token: options.token ?? "",
         shell: "auto",
+        ...(options.logLevel ? { logLevel: options.logLevel } : {}),
+        ...(options.commandPolicy ? { commandPolicy: options.commandPolicy } : {}),
         ...(options.tunnelUrl ? { tunnelUrl: options.tunnelUrl } : {}),
         // 默认把 metrics 端口钉到 1：跑测试的机器上可能有真 cloudflared 占着 20241，
         // 不隔离的话隧道用例会被机器状态带偏。用例要测就自己传 metricsPort 覆盖。
@@ -100,6 +107,7 @@ export async function startServer(options: StartOptions = {}): Promise<RunningSe
       // 测试机上可能跑着真隧道，外部进程检测一律关闭，用例只管自己拉起的进程
       NEXUS_TUNNEL_EXTERNAL: "off",
       ...(options.tunnelStubPath ? { NEXUS_TUNNEL_STUB: options.tunnelStubPath } : {}),
+      ...(options.env ?? {}),
     },
     stdio: ["ignore", "pipe", "pipe"],
   });

@@ -4,7 +4,10 @@ build/
 release/
 crates/target/
 crates/executor/target/
+*.running.exe
 *.log
+.scratch/logs/
+logs/
 config.local.json
 config.json
 oauth-store.json

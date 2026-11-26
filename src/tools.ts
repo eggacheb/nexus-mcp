@@ -2,6 +2,8 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { AppConfig } from "./config.js";
 import { getExecutor, resolveShell } from "./executor.js";
+import { logDebug, logEvent, logWarn, summarizeText } from "./log.js";
+import type { LogFieldValue, LogLevel } from "./log.js";
 import {
   displayPath,
   resolveOptionalDir,
@@ -28,6 +30,17 @@ const MAX_SEARCH_RESULTS = 100;
  * 搜索本身毫秒级，预算全部留给下载兜底。
  */
 const GREP_TIMEOUT_MS = 300_000;
+/** glob/grep 的 pattern 日志截断上限 */
+const MAX_PATTERN_LOG_CHARS = 80;
+/** bash/job_start 的命令日志截断上限 */
+const MAX_CMD_LOG_CHARS = 120;
+/** 错误原因摘要截断上限 */
+const MAX_ERR_LOG_CHARS = 160;
+
+export interface RegisterToolsOptions {
+  /** HTTP 传输下返回当前会话 id；stdio 下省略，日志记为 stdio */
+  sessionId?: () => string | undefined;
+}
 
 /**
  * 面板「可用工具」卡用的短说明。名称必须与下面 registerTools 注册的一一对应，
@@ -47,6 +60,10 @@ export const TOOL_SUMMARY: ReadonlyArray<{ name: string; summary: string }> = [
 
 type TextResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
 
+interface ToolExtra {
+  sessionId?: string;
+}
+
 function ok(text: string): TextResult {
   return { content: [{ type: "text", text }] };
 }
@@ -55,7 +72,66 @@ function fail(message: string): TextResult {
   return { content: [{ type: "text", text: message }], isError: true };
 }
 
-export function registerTools(server: McpServer, config: AppConfig): void {
+function shortSid(extra: ToolExtra | undefined, options: RegisterToolsOptions | undefined): string {
+  const raw = extra?.sessionId ?? options?.sessionId?.();
+  return raw ? raw.slice(0, 8) : "stdio";
+}
+
+function safeDisplayFile(root: string, filePath: string, secret: string): string {
+  try {
+    const target = resolveRequiredFileTarget(root, filePath);
+    return displayPath(root, target.path);
+  } catch {
+    return summarizeText(filePath, MAX_PATTERN_LOG_CHARS, secret);
+  }
+}
+
+function safeDisplayDir(root: string, dirInput: string | undefined, secret: string): string {
+  try {
+    return displayPath(root, resolveOptionalDir(root, dirInput));
+  } catch {
+    return summarizeText(dirInput ?? ".", MAX_PATTERN_LOG_CHARS, secret);
+  }
+}
+
+export function registerTools(
+  server: McpServer,
+  config: AppConfig,
+  options?: RegisterToolsOptions,
+): void {
+  function beginTool(
+    tool: string,
+    extra: ToolExtra | undefined,
+    targetFields: Record<string, LogFieldValue>,
+  ) {
+    const sid = shortSid(extra, options);
+    const startedAt = Date.now();
+    logDebug("tool.start", { sid, tool, ...targetFields });
+    return {
+      ok(text: string, resultFields?: Record<string, LogFieldValue>, level: LogLevel = "info"): TextResult {
+        logEvent(level, "tool.ok", {
+          sid,
+          tool,
+          ...targetFields,
+          ...resultFields,
+          ms: Date.now() - startedAt,
+        });
+        return ok(text);
+      },
+      fail(message: string, resultFields?: Record<string, LogFieldValue>): TextResult {
+        logWarn("tool.err", {
+          sid,
+          tool,
+          ...targetFields,
+          ...resultFields,
+          ms: Date.now() - startedAt,
+          err: summarizeText(message, MAX_ERR_LOG_CHARS, config.token),
+        });
+        return fail(message);
+      },
+    };
+  }
+
   server.registerTool(
     "read",
     {
@@ -68,7 +144,12 @@ export function registerTools(server: McpServer, config: AppConfig): void {
         limit: z.number().int().min(1).max(2000).optional().describe("最多读取多少行"),
       },
     },
-    async ({ path: filePath, offset, limit }) => {
+    async ({ path: filePath, offset, limit }, extra) => {
+      const trace = beginTool("read", extra, {
+        path: safeDisplayFile(config.root, filePath, config.token),
+        offset,
+        limit,
+      });
       try {
         const target = resolveRequiredFileTarget(config.root, filePath);
         const response = await getExecutor().request<ReadResponse>({
@@ -78,11 +159,14 @@ export function registerTools(server: McpServer, config: AppConfig): void {
           limit: limit ?? MAX_READ_LINES,
           max_output_bytes: config.maxOutputBytes,
         });
-        if (!response.ok) return fail(response.error);
-        if (response.total_lines === 0) return ok("（空文件，共 0 行）");
+        if (!response.ok) return trace.fail(response.error);
+        if (response.total_lines === 0) {
+          return trace.ok("（空文件，共 0 行）", { lines: "0/0" });
+        }
         if (response.end_line === 0) {
-          return ok(
+          return trace.ok(
             `文件共 ${response.total_lines} 行，offset=${offset ?? 1} 超出文件末尾，没有内容可读`,
+            { lines: `0/${response.total_lines}` },
           );
         }
         let text = response.content;
@@ -96,9 +180,11 @@ export function registerTools(server: McpServer, config: AppConfig): void {
         if (response.omitted_lines > 0 && !singleLineTruncated) {
           text += `\n[输出超过字节上限，还有 ${response.omitted_lines} 行未显示；用 limit 缩小范围分次读取]`;
         }
-        return ok(text);
+        return trace.ok(text, {
+          lines: `${response.start_line}-${response.end_line}/${response.total_lines}`,
+        });
       } catch (err) {
-        return fail((err as Error).message);
+        return trace.fail((err as Error).message);
       }
     },
   );
@@ -113,7 +199,11 @@ export function registerTools(server: McpServer, config: AppConfig): void {
         content: z.string().describe("完整文件内容"),
       },
     },
-    async ({ path: filePath, content }) => {
+    async ({ path: filePath, content }, extra) => {
+      const trace = beginTool("write", extra, {
+        path: safeDisplayFile(config.root, filePath, config.token),
+        bytes: Buffer.byteLength(content, "utf8"),
+      });
       try {
         const target = resolveRequiredFileTarget(config.root, filePath);
         const response = await getExecutor().request<WriteResponse>({
@@ -121,10 +211,13 @@ export function registerTools(server: McpServer, config: AppConfig): void {
           ...target,
           content,
         });
-        if (!response.ok) return fail(response.error);
-        return ok(`已写入 ${displayPath(config.root, target.path)}（${response.bytes_written} 字节）`);
+        if (!response.ok) return trace.fail(response.error);
+        return trace.ok(
+          `已写入 ${displayPath(config.root, target.path)}（${response.bytes_written} 字节）`,
+          { bytes: response.bytes_written },
+        );
       } catch (err) {
-        return fail((err as Error).message);
+        return trace.fail((err as Error).message);
       }
     },
   );
@@ -142,7 +235,12 @@ export function registerTools(server: McpServer, config: AppConfig): void {
         replace_all: z.boolean().optional().describe("为 true 时替换所有匹配"),
       },
     },
-    async ({ path: filePath, old_string, new_string, replace_all }) => {
+    async ({ path: filePath, old_string, new_string, replace_all }, extra) => {
+      const trace = beginTool("edit", extra, {
+        path: safeDisplayFile(config.root, filePath, config.token),
+        old_len: old_string.length,
+        new_len: new_string.length,
+      });
       try {
         const target = resolveRequiredFileTarget(config.root, filePath);
         const response = await getExecutor().request<EditResponse>({
@@ -152,7 +250,7 @@ export function registerTools(server: McpServer, config: AppConfig): void {
           new_string,
           replace_all: replace_all ?? false,
         });
-        if (!response.ok) return fail(response.error);
+        if (!response.ok) return trace.fail(response.error);
         const where =
           response.start_line === response.end_line
             ? `第 ${response.start_line} 行`
@@ -161,9 +259,12 @@ export function registerTools(server: McpServer, config: AppConfig): void {
           response.replacements === 1
             ? where
             : `替换 ${response.replacements} 处，首处${where}`;
-        return ok(`已编辑 ${displayPath(config.root, target.path)}（${detail}）`);
+        return trace.ok(`已编辑 ${displayPath(config.root, target.path)}（${detail}）`, {
+          replacements: response.replacements,
+          lines: `${response.start_line}-${response.end_line}`,
+        });
       } catch (err) {
-        return fail((err as Error).message);
+        return trace.fail((err as Error).message);
       }
     },
   );
@@ -180,7 +281,11 @@ export function registerTools(server: McpServer, config: AppConfig): void {
         timeout_ms: z.number().int().min(1000).max(600_000).optional().describe("超时毫秒"),
       },
     },
-    async ({ command, cwd, timeout_ms }) => {
+    async ({ command, cwd, timeout_ms }, extra) => {
+      const trace = beginTool("bash", extra, {
+        cwd: safeDisplayDir(config.root, cwd, config.token),
+        cmd: summarizeText(command, MAX_CMD_LOG_CHARS, config.token),
+      });
       try {
         const dir = resolveOptionalDir(config.root, cwd);
         const timeout = timeout_ms ?? config.defaultTimeoutMs;
@@ -194,14 +299,14 @@ export function registerTools(server: McpServer, config: AppConfig): void {
           shell: resolveShell(config),
           policy: config.commandPolicy,
         });
-        if (!response.ok) return fail(response.error);
+        if (!response.ok) return trace.fail(response.error);
         const body = response.output ? `\n\n${response.output}` : "";
         if (response.timed_out) {
-          return ok(`timed_out: ${timeout}ms（命令已终止）${body}`);
+          return trace.ok(`timed_out: ${timeout}ms（命令已终止）${body}`, { timed_out: true });
         }
-        return ok(`exit_code: ${response.exit_code}${body}`);
+        return trace.ok(`exit_code: ${response.exit_code}${body}`, { exit: response.exit_code });
       } catch (err) {
-        return fail((err as Error).message);
+        return trace.fail((err as Error).message);
       }
     },
   );
@@ -216,7 +321,11 @@ export function registerTools(server: McpServer, config: AppConfig): void {
         path: z.string().optional().describe("搜索起点，默认根目录"),
       },
     },
-    async ({ pattern, path: searchPath }) => {
+    async ({ pattern, path: searchPath }, extra) => {
+      const trace = beginTool("glob", extra, {
+        path: safeDisplayDir(config.root, searchPath, config.token),
+        pattern: summarizeText(pattern, MAX_PATTERN_LOG_CHARS, config.token),
+      });
       try {
         const dir = resolveOptionalDir(config.root, searchPath);
         const response = await getExecutor().request<GlobResponse>({
@@ -226,9 +335,9 @@ export function registerTools(server: McpServer, config: AppConfig): void {
           pattern,
           max_results: MAX_SEARCH_RESULTS,
         });
-        if (!response.ok) return fail(response.error);
+        if (!response.ok) return trace.fail(response.error);
         if (response.paths.length === 0) {
-          return ok(`没有匹配「${pattern}」的文件（已遵守 .gitignore）。`);
+          return trace.ok(`没有匹配「${pattern}」的文件（已遵守 .gitignore）。`, { matches: 0 });
         }
         let text = response.paths.join("\n");
         if (response.truncated) {
@@ -236,9 +345,12 @@ export function registerTools(server: McpServer, config: AppConfig): void {
         } else {
           text += `\n\n共 ${response.total_matches} 个匹配。`;
         }
-        return ok(text);
+        return trace.ok(text, {
+          matches: response.total_matches,
+          truncated: response.truncated ? true : undefined,
+        });
       } catch (err) {
-        return fail((err as Error).message);
+        return trace.fail((err as Error).message);
       }
     },
   );
@@ -255,7 +367,12 @@ export function registerTools(server: McpServer, config: AppConfig): void {
         ignore_case: z.boolean().optional().describe("是否忽略大小写"),
       },
     },
-    async ({ pattern, path: searchPath, glob, ignore_case }) => {
+    async ({ pattern, path: searchPath, glob, ignore_case }, extra) => {
+      const trace = beginTool("grep", extra, {
+        path: safeDisplayDir(config.root, searchPath, config.token),
+        pattern: summarizeText(pattern, MAX_PATTERN_LOG_CHARS, config.token),
+        glob: glob ? summarizeText(glob, 40, config.token) : undefined,
+      });
       try {
         const dir = resolveOptionalDir(config.root, searchPath);
         const response = await getExecutor().request<GrepResponse>({
@@ -268,19 +385,23 @@ export function registerTools(server: McpServer, config: AppConfig): void {
           max_results: MAX_SEARCH_RESULTS,
           timeout_ms: GREP_TIMEOUT_MS,
         });
-        if (!response.ok) return fail(response.error);
+        if (!response.ok) return trace.fail(response.error);
         if (response.matches.length === 0) {
-          return ok(
+          return trace.ok(
             `没有匹配「${pattern}」的内容（已遵守 .gitignore；可尝试 ignore_case 或放宽 pattern）。`,
+            { matches: 0 },
           );
         }
         let body = response.matches.map((m) => `${m.path}:${m.line}: ${m.text}`).join("\n");
         if (response.truncated) {
           body += `\n\n已显示前 ${response.matches.length} 条匹配，还有更多未显示；用 glob 参数限定文件类型、指定 path 缩小搜索范围，或换更精确的 pattern。`;
         }
-        return ok(body);
+        return trace.ok(body, {
+          matches: response.matches.length,
+          truncated: response.truncated ? true : undefined,
+        });
       } catch (err) {
-        return fail((err as Error).message);
+        return trace.fail((err as Error).message);
       }
     },
   );
@@ -296,7 +417,11 @@ export function registerTools(server: McpServer, config: AppConfig): void {
         cwd: z.string().optional().describe("工作目录，默认根目录"),
       },
     },
-    async ({ command, cwd }) => {
+    async ({ command, cwd }, extra) => {
+      const trace = beginTool("job_start", extra, {
+        cwd: safeDisplayDir(config.root, cwd, config.token),
+        cmd: summarizeText(command, MAX_CMD_LOG_CHARS, config.token),
+      });
       try {
         const dir = resolveOptionalDir(config.root, cwd);
         const response = await getExecutor().request<JobStartResponse>({
@@ -308,12 +433,13 @@ export function registerTools(server: McpServer, config: AppConfig): void {
           shell: resolveShell(config),
           policy: config.commandPolicy,
         });
-        if (!response.ok) return fail(response.error);
-        return ok(
+        if (!response.ok) return trace.fail(response.error);
+        return trace.ok(
           `已启动后台任务 ${response.job_id}（pid ${response.pid}）。用 job_output 查看输出与状态。`,
+          { job_id: response.job_id, pid: response.pid },
         );
       } catch (err) {
-        return fail((err as Error).message);
+        return trace.fail((err as Error).message);
       }
     },
   );
@@ -328,7 +454,11 @@ export function registerTools(server: McpServer, config: AppConfig): void {
         offset: z.number().int().min(0).optional().describe("从第几个字节开始读"),
       },
     },
-    async ({ job_id, offset }) => {
+    async ({ job_id, offset }, extra) => {
+      const trace = beginTool("job_output", extra, {
+        job_id,
+        offset: offset ?? 0,
+      });
       try {
         const response = await getExecutor().request<JobOutputResponse>({
           op: "job_output",
@@ -336,7 +466,7 @@ export function registerTools(server: McpServer, config: AppConfig): void {
           offset: offset ?? 0,
           max_output_bytes: config.maxOutputBytes,
         });
-        if (!response.ok) return fail(response.error);
+        if (!response.ok) return trace.fail(response.error);
         const head = [`status: ${response.status}`];
         if (response.exit_code !== null) head.push(`exit_code: ${response.exit_code}`);
         let body = response.output;
@@ -345,9 +475,19 @@ export function registerTools(server: McpServer, config: AppConfig): void {
         if (response.status === "running" || response.next_offset < response.total_bytes) {
           text += `\n\n[下次调用用 offset=${response.next_offset} 继续读取]`;
         }
-        return ok(text);
+        const outputBytes = Buffer.byteLength(response.output, "utf8");
+        const isEmptyPoll = response.status === "running" && outputBytes === 0;
+        return trace.ok(
+          text,
+          {
+            status: response.status,
+            bytes: outputBytes,
+            exit: response.exit_code ?? undefined,
+          },
+          isEmptyPoll ? "debug" : "info",
+        );
       } catch (err) {
-        return fail((err as Error).message);
+        return trace.fail((err as Error).message);
       }
     },
   );
@@ -362,21 +502,25 @@ export function registerTools(server: McpServer, config: AppConfig): void {
         job_id: z.string().describe("job_start 返回的 id"),
       },
     },
-    async ({ job_id }) => {
+    async ({ job_id }, extra) => {
+      const trace = beginTool("job_kill", extra, { job_id });
       try {
         const response = await getExecutor().request<JobKillResponse>({
           op: "job_kill",
           job_id,
         });
-        if (!response.ok) return fail(response.error);
+        if (!response.ok) return trace.fail(response.error);
         const head = [`killed: ${response.killed}`, `status: ${response.status}`];
         if (response.exit_code !== null) head.push(`exit_code: ${response.exit_code}`);
         const note = response.killed
           ? `已终止 ${response.job_id} 的进程树。用 job_output 确认退出码。`
           : `${response.job_id} 已经结束（exit_code: ${response.exit_code}），无需终止。`;
-        return ok(`${head.join("\n")}\n\n${note}`);
+        return trace.ok(`${head.join("\n")}\n\n${note}`, {
+          killed: response.killed,
+          status: response.status,
+        });
       } catch (err) {
-        return fail((err as Error).message);
+        return trace.fail((err as Error).message);
       }
     },
   );
