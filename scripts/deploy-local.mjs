@@ -309,34 +309,37 @@ async function runMain(opts) {
 
   // 路径 A：运行中的托盘存在且托盘 exe 哈希未变 -> 托盘内无缝换核
   if (ctrl && stageTrayHash && stageTrayHash === targetTrayHash) {
-    try {
-      const resp = await requestLoopback(
-        ctrl.port,
-        "POST",
-        "/hotswap",
-        { "X-Tray-Token": ctrl.token },
-        JSON.stringify({
-          serverPath: path.join(opts.stageDir, SERVER_EXE),
-          executorPath: path.join(opts.stageDir, EXECUTOR_EXE),
-          delayMs: opts.delayMs,
-          healthTimeoutMs: opts.healthTimeoutMs,
-        }),
-        3000,
-      );
-      if (resp.status === 202) {
-        const payload = JSON.parse(resp.body);
-        console.log(
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const resp = await requestLoopback(
+          ctrl.port,
+          "POST",
+          "/hotswap",
+          { "X-Tray-Token": ctrl.token },
           JSON.stringify({
-            ok: true,
-            mode: "in-place",
-            targetDir: opts.targetDir,
-            ...payload,
+            serverPath: path.join(opts.stageDir, SERVER_EXE),
+            executorPath: path.join(opts.stageDir, EXECUTOR_EXE),
+            delayMs: opts.delayMs,
+            healthTimeoutMs: opts.healthTimeoutMs,
           }),
+          5000,
         );
-        return;
+        if (resp.status === 202) {
+          const payload = JSON.parse(resp.body);
+          console.log(
+            JSON.stringify({
+              ok: true,
+              mode: "in-place",
+              targetDir: opts.targetDir,
+              ...payload,
+            }),
+          );
+          return;
+        }
+        break;
+      } catch {
+        if (attempt === 0) await sleep(200);
       }
-    } catch {
-      // 控制端口不可达时退回脱离进程树切换器
     }
   }
 
