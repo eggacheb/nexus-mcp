@@ -73,7 +73,8 @@ async function main(): Promise<void> {
     if (stopping) return;
     stopping = true;
     await panel?.close();
-    await service.stop();
+    // 进程退出/热切换时保留活跃会话索引，供新进程重启后透明恢复，避免云端连接器连环撞 404
+    await service.stop({ preserveSessions: true });
     process.exit(0);
   };
 

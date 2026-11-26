@@ -211,9 +211,16 @@ async function stopRunningTray(targetDir, logPath) {
 
 function spawnDetachedTray(targetDir) {
   const trayExe = path.join(targetDir, TRAY_EXE);
+  const env = { ...process.env };
+  // 显式钉死目标目录配置，防止从父进程（例如运行中的宿主机托盘）继承到别处的 NEXUS_MCP_CONFIG
+  env.NEXUS_MCP_CONFIG = path.join(targetDir, "config.json");
+  delete env.NEXUS_MCP_LOG_DIR;
+  delete env.NEXUS_MCP_PORT;
+  delete env.NEXUS_MCP_ROOT;
+  delete env.NEXUS_MCP_TOKEN;
   const child = spawn(trayExe, [], {
     cwd: targetDir,
-    env: { ...process.env },
+    env,
     detached: true,
     stdio: "ignore",
     windowsHide: true,
@@ -348,19 +355,47 @@ async function runMain(opts) {
     "--log-path",
     opts.logPath,
   ];
-  const worker = spawn(process.execPath, workerArgs, {
-    cwd: rootDir,
-    env: { ...process.env },
-    detached: true,
-    stdio: "ignore",
-    windowsHide: true,
-  });
-  worker.unref();
+
+  // 优先委托运行中的托盘宿主通过 POST /spawn-worker 拉起切换器，彻底跳出 nexus-executor 的 Job Object
+  let spawnedByTray = false;
+  if (ctrl) {
+    try {
+      const resp = await requestLoopback(
+        ctrl.port,
+        "POST",
+        "/spawn-worker",
+        { "X-Tray-Token": ctrl.token },
+        JSON.stringify({
+          program: process.execPath,
+          args: workerArgs,
+          cwd: rootDir,
+        }),
+        3000,
+      );
+      if (resp.status === 202) {
+        spawnedByTray = true;
+      }
+    } catch {
+      // 旧版托盘无此端点或不可达，退回本地 detached spawn
+    }
+  }
+
+  if (!spawnedByTray) {
+    const worker = spawn(process.execPath, workerArgs, {
+      cwd: rootDir,
+      env: { ...process.env },
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    worker.unref();
+  }
 
   console.log(
     JSON.stringify({
       ok: true,
       mode: "detached-worker",
+      spawnedByTray,
       queued: true,
       targetDir: opts.targetDir,
       delayMs: opts.delayMs,

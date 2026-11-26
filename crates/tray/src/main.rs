@@ -165,7 +165,8 @@ fn to_tray_ui_state(mapped: &MappedStatus, autostart_enabled: bool) -> TrayUiSta
 
 #[cfg(windows)]
 fn poll_once(panel_port: u16, mcp_port: u16) -> MappedStatus {
-    match http_client::get(panel_port, "/api/status", Duration::from_millis(1200)) {
+    // /api/status 内部包含执行器 ping 握手与 tasklist 查询，Windows 上实测可达 1.4s+，超时给足 5 秒
+    match http_client::get(panel_port, "/api/status", Duration::from_secs(5)) {
         Ok(resp) if resp.status == 200 => map_status_json(&resp.body, mcp_port),
         _ => unreachable_status(mcp_port),
     }
@@ -309,6 +310,8 @@ fn main() {
         let handle_for_cmd = Arc::clone(&handle_slot);
         let status_for_cmd = Arc::clone(&latest_status);
         let quit_for_cmd = Arc::clone(&on_quit);
+        let server_for_restart = Arc::clone(&server);
+        let spec_for_restart = spec.clone();
 
         let initial_ui = TrayUiState {
             autostart_enabled: initial_autostart,
@@ -331,7 +334,7 @@ fn main() {
                             *st = mapped.clone();
                         }
                         h.update(to_tray_ui_state(&mapped, auto_on));
-                        for _ in 0..20 {
+                        for _ in 0..50 {
                             if stop_for_poll.load(Ordering::Relaxed) {
                                 return;
                             }
@@ -343,13 +346,29 @@ fn main() {
             move |cmd| match cmd {
                 TrayCommand::OpenPanel => open_panel_url(panel_port),
                 TrayCommand::RestartService => {
+                    let server_copy = Arc::clone(&server_for_restart);
+                    let spec_copy = spec_for_restart.clone();
                     thread::spawn(move || {
-                        let _ = http_client::post_json(
+                        let resp = http_client::post_json(
                             panel_port,
                             "/api/service",
                             r#"{"action":"restart"}"#,
                             Duration::from_secs(5),
                         );
+                        // 若面板已失联（nexus-server.exe 进程已退出），由托盘宿主直接重新拉起协议层
+                        let panel_ok = matches!(resp, Ok(r) if r.status == 200);
+                        if !panel_ok
+                            && let Ok(mut guard) = server_copy.lock()
+                        {
+                            if let Some(mut old) = guard.take()
+                                && old.is_running()
+                            {
+                                let _ = old.shutdown(false, Duration::from_secs(2));
+                            }
+                            if let Ok(fresh) = ManagedServer::spawn(&spec_copy) {
+                                *guard = Some(fresh);
+                            }
+                        }
                     });
                 }
                 TrayCommand::ToggleTunnel => {

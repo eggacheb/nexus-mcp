@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import path from "node:path";
@@ -41,7 +42,7 @@ interface Session {
 
 export interface McpService {
   start(): Promise<void>;
-  stop(): Promise<void>;
+  stop(options?: { preserveSessions?: boolean }): Promise<void>;
   isRunning(): boolean;
   port(): number;
   url(): string;
@@ -215,12 +216,19 @@ async function releaseSession(
   session: Session,
   sessions: Map<string, Session>,
   reason: "client" | "idle" | "shutdown" | "init_failed" = "client",
+  onForget?: (id: string) => void,
 ): Promise<void> {
-  if (session.id) sessions.delete(session.id);
+  const sid = session.id;
+  if (sid) {
+    sessions.delete(sid);
+    if (reason === "client" || reason === "idle") {
+      onForget?.(sid);
+    }
+  }
   if (session.closed) return;
   session.closed = true;
-  if (session.id) {
-    logInfo("session.close", { sid: session.id.slice(0, 8), reason, active: sessions.size });
+  if (sid) {
+    logInfo("session.close", { sid: sid.slice(0, 8), reason, active: sessions.size });
   }
   try {
     await session.server.close();
@@ -229,20 +237,29 @@ async function releaseSession(
   }
 }
 
-function createSession(config: AppConfig, sessions: Map<string, Session>, baseUrl: string): Session {
+function createSession(
+  config: AppConfig,
+  sessions: Map<string, Session>,
+  baseUrl: string,
+  onRemember: (id: string) => void,
+  onForget: (id: string) => void,
+): Session {
   let session!: Session;
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => randomUUID(),
     onsessioninitialized: (id) => {
       session.id = id;
       sessions.set(id, session);
+      onRemember(id);
     },
     onsessionclosed: () => {
-      void releaseSession(session, sessions, "client");
+      void releaseSession(session, sessions, "client", onForget);
     },
   });
   transport.onclose = () => {
-    void releaseSession(session, sessions, "client");
+    // 仅客户端显式 DELETE（onsessionclosed）或空闲回收才遗忘持久化会话；
+    // 停机/重启触发的底层连接关闭走 shutdown，保留 persistedSessions 以便重启后透明恢复。
+    void releaseSession(session, sessions, "shutdown");
   };
   transport.onerror = (error) => {
     logWarn("session.error", {
@@ -257,6 +274,36 @@ function createSession(config: AppConfig, sessions: Map<string, Session>, baseUr
     lastSeen: Date.now(),
   };
   return session;
+}
+
+function loadPersistedSessions(storePath: string): Map<string, number> {
+  const map = new Map<string, number>();
+  if (!existsSync(storePath)) return map;
+  try {
+    const raw = JSON.parse(readFileSync(storePath, "utf8")) as Record<string, unknown>;
+    const now = Date.now();
+    for (const [sid, ts] of Object.entries(raw)) {
+      if (typeof ts === "number" && now - ts <= IDLE_SESSION_MS) {
+        map.set(sid, ts);
+      }
+    }
+  } catch {
+    // 损坏文件忽略，按空表启动
+  }
+  return map;
+}
+
+function savePersistedSessions(storePath: string, map: Map<string, number>): void {
+  try {
+    mkdirSync(path.dirname(storePath), { recursive: true });
+    const obj: Record<string, number> = {};
+    for (const [sid, ts] of map) {
+      obj[sid] = ts;
+    }
+    writeFileSync(storePath, `${JSON.stringify(obj, null, 2)}\n`, "utf8");
+  } catch {
+    // 落盘失败不阻断正常请求
+  }
 }
 
 export function createMcpService(config: AppConfig): McpService {
@@ -276,8 +323,35 @@ export function createMcpService(config: AppConfig): McpService {
     return `http://127.0.0.1:${actualPort}`;
   }
 
-  // OAuth 数据与 config.json 放同一目录，分发时一个目录全带走
-  const oauthStorePath = path.join(path.dirname(configFilePath()), "oauth-store.json");
+  // OAuth 与活跃会话索引均与 config.json 放同一目录，热切换重启后可透明恢复未关闭的历史会话
+  const configDir = path.dirname(configFilePath());
+  const oauthStorePath = path.join(configDir, "oauth-store.json");
+  const sessionsStorePath = path.join(configDir, "sessions-store.json");
+  const persistedSessions = loadPersistedSessions(sessionsStorePath);
+  const resumedLogged = new Set<string>();
+
+  function rememberSession(id: string): void {
+    persistedSessions.set(id, Date.now());
+    savePersistedSessions(sessionsStorePath, persistedSessions);
+  }
+
+  function forgetSession(id: string): void {
+    resumedLogged.delete(id);
+    if (persistedSessions.delete(id)) {
+      savePersistedSessions(sessionsStorePath, persistedSessions);
+    }
+  }
+
+  function hasValidPersistedSession(id: string): boolean {
+    const ts = persistedSessions.get(id);
+    if (ts === undefined) return false;
+    if (Date.now() - ts > IDLE_SESSION_MS) {
+      forgetSession(id);
+      return false;
+    }
+    return true;
+  }
+
   const oauth = new OAuthProvider({
     approvalSecret: () => config.token,
     publicBaseUrl,
@@ -297,8 +371,42 @@ export function createMcpService(config: AppConfig): McpService {
     const now = Date.now();
     for (const session of [...sessions.values()]) {
       if (now - session.lastSeen > IDLE_SESSION_MS) {
-        void releaseSession(session, sessions, "idle");
+        void releaseSession(session, sessions, "idle", forgetSession);
       }
+    }
+    let changed = false;
+    for (const [sid, ts] of [...persistedSessions]) {
+      if (now - ts > IDLE_SESSION_MS) {
+        persistedSessions.delete(sid);
+        resumedLogged.delete(sid);
+        changed = true;
+      }
+    }
+    if (changed) savePersistedSessions(sessionsStorePath, persistedSessions);
+  }
+
+  async function handleResumedPost(
+    req: IncomingMessage,
+    res: ServerResponse,
+    parsed: unknown,
+    sessionId: string,
+  ): Promise<void> {
+    persistedSessions.set(sessionId, Date.now());
+    if (!resumedLogged.has(sessionId)) {
+      resumedLogged.add(sessionId);
+      logInfo("session.resume", { sid: sessionId.slice(0, 8) });
+    }
+    for (const rpcMethod of rpcControlMethods(parsed)) {
+      logDebug("mcp.rpc", { sid: sessionId.slice(0, 8), method: rpcMethod });
+    }
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    const server = createServer(config, { sessionId: () => sessionId, baseUrl: publicBaseUrl() });
+    await server.connect(transport);
+    res.setHeader(SESSION_HEADER, sessionId);
+    try {
+      await transport.handleRequest(req, res, parsed);
+    } finally {
+      await server.close().catch(() => undefined);
     }
   }
 
@@ -366,10 +474,15 @@ export function createMcpService(config: AppConfig): McpService {
       if (sessionId) {
         const existing = sessions.get(sessionId);
         if (!existing) {
+          if (hasValidPersistedSession(sessionId)) {
+            await handleResumedPost(req, res, parsed, sessionId);
+            return;
+          }
           sendSessionNotFound(res, sessionId, method);
           return;
         }
         existing.lastSeen = Date.now();
+        persistedSessions.set(sessionId, existing.lastSeen);
         for (const rpcMethod of rpcControlMethods(parsed)) {
           logDebug("mcp.rpc", { sid: sessionId.slice(0, 8), method: rpcMethod });
         }
@@ -385,14 +498,20 @@ export function createMcpService(config: AppConfig): McpService {
       for (const rpcMethod of rpcControlMethods(parsed)) {
         logDebug("mcp.rpc", { sid: "init", method: rpcMethod });
       }
-      const session = createSession(config, sessions, publicBaseUrl());
+      const session = createSession(
+        config,
+        sessions,
+        publicBaseUrl(),
+        rememberSession,
+        forgetSession,
+      );
       await session.server.connect(session.transport);
       await session.transport.handleRequest(req, res, parsed);
       if (session.id) {
         logInfo("session.open", { sid: session.id.slice(0, 8), active: sessions.size });
       } else {
         // initialize 没走完（客户端中断或协议错误），别把孤儿实例留在表外
-        await releaseSession(session, sessions, "init_failed");
+        await releaseSession(session, sessions, "init_failed", forgetSession);
       }
       return;
     }
@@ -403,6 +522,12 @@ export function createMcpService(config: AppConfig): McpService {
     }
     const existing = sessions.get(sessionId);
     if (!existing) {
+      if (method === "DELETE" && hasValidPersistedSession(sessionId)) {
+        forgetSession(sessionId);
+        res.writeHead(200);
+        res.end();
+        return;
+      }
       sendSessionNotFound(res, sessionId, method);
       return;
     }
@@ -453,7 +578,8 @@ export function createMcpService(config: AppConfig): McpService {
     });
   }
 
-  async function stop(): Promise<void> {
+  async function stop(options?: { preserveSessions?: boolean }): Promise<void> {
+    const preserveSessions = options?.preserveSessions === true;
     const current = listener;
     listener = undefined;
     ready = false;
@@ -473,6 +599,11 @@ export function createMcpService(config: AppConfig): McpService {
       await releaseSession(session, sessions, "shutdown");
     }
     sessions.clear();
+    if (!preserveSessions) {
+      persistedSessions.clear();
+      resumedLogged.clear();
+    }
+    savePersistedSessions(sessionsStorePath, persistedSessions);
     await closeExecutor();
 
     if (current) logInfo("service.stop", { url: url() });

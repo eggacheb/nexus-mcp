@@ -10,6 +10,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -46,6 +47,16 @@ struct HotswapRequest {
 struct QuitRequest {
     #[serde(default = "default_true")]
     include_tunnel: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SpawnWorkerRequest {
+    program: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    cwd: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -453,6 +464,51 @@ pub fn start_control_server(
                             );
                             busy_c.store(false, Ordering::SeqCst);
                         });
+                    } else if method == "POST" && path == "/spawn-worker" {
+                        let Ok(req) = serde_json::from_str::<SpawnWorkerRequest>(&body) else {
+                            write_http(stream, 400, "Bad Request", r#"{"error":"invalid json"}"#);
+                            continue;
+                        };
+                        let prog = PathBuf::from(&req.program);
+                        if !prog.exists() {
+                            write_http(stream, 400, "Bad Request", r#"{"error":"program not found"}"#);
+                            continue;
+                        }
+                        let mut cmd = Command::new(&prog);
+                        cmd.args(&req.args)
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null());
+                        if let Some(cwd) = &req.cwd
+                            && !cwd.trim().is_empty()
+                        {
+                            cmd.current_dir(cwd.trim());
+                        }
+                        #[cfg(windows)]
+                        {
+                            use std::os::windows::process::CommandExt;
+                            // DETACHED_PROCESS | CREATE_NO_WINDOW：由不在 nexus-executor Job 内的托盘宿主拉起，彻底避免被连带树杀
+                            const DETACHED_PROCESS: u32 = 0x0000_0008;
+                            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                            cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
+                        }
+                        match cmd.spawn() {
+                            Ok(child) => {
+                                let resp_body = serde_json::json!({
+                                    "ok": true,
+                                    "pid": child.id(),
+                                })
+                                .to_string();
+                                write_http(stream, 202, "Accepted", &resp_body);
+                            }
+                            Err(err) => {
+                                let resp_body = serde_json::json!({
+                                    "error": format!("spawn worker failed: {err}"),
+                                })
+                                .to_string();
+                                write_http(stream, 500, "Internal Server Error", &resp_body);
+                            }
+                        }
                     } else if method == "POST" && path == "/quit" {
                         let req = serde_json::from_str::<QuitRequest>(&body)
                             .unwrap_or(QuitRequest { include_tunnel: true });

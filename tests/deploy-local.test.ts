@@ -112,8 +112,13 @@ describe("票 06: 本地一键热切换部署脚本（缝隙 3）", () => {
       writeFileSync(path.join(targetDir, "oauth-store.json"), oauthContent, "utf8");
 
       const mutexName = `Local\\nexus-deploy-e2e-${process.pid}-${mcpPort}`;
-      const sharedEnv = {
+      const sharedEnv: Record<string, string | undefined> = {
         ...process.env,
+        NEXUS_MCP_CONFIG: path.join(targetDir, "config.json"),
+        NEXUS_MCP_LOG_DIR: undefined,
+        NEXUS_MCP_PORT: undefined,
+        NEXUS_MCP_ROOT: undefined,
+        NEXUS_MCP_TOKEN: undefined,
         NEXUS_TRAY_HEADLESS: "detached",
         NEXUS_TRAY_MUTEX: mutexName,
         NEXUS_TRAY_NO_BROWSER: "1",
@@ -150,7 +155,16 @@ describe("票 06: 本地一键热切换部署脚本（缝隙 3）", () => {
           return false;
         }
       }, 15_000);
-      await waitFor(() => existsSync(path.join(targetDir, ".tray-control.json")), 8_000);
+      await waitFor(() => {
+        const ctrlFile = path.join(targetDir, ".tray-control.json");
+        if (!existsSync(ctrlFile)) return false;
+        try {
+          const parsed = JSON.parse(readFileSync(ctrlFile, "utf8")) as { port?: number; token?: string };
+          return typeof parsed.port === "number" && parsed.port > 0 && Boolean(parsed.token);
+        } catch {
+          return false;
+        }
+      }, 10_000);
 
       // 2) 再次部署相同托盘哈希 -> 命中托盘内无缝换核（mode: "in-place"）
       const out2 = execFileSync(
@@ -206,9 +220,16 @@ describe("票 06: 本地一键热切换部署脚本（缝隙 3）", () => {
         ],
         { cwd: projectRoot, env: sharedEnv, encoding: "utf8" },
       );
-      const res3 = JSON.parse(out3.trim()) as { ok: boolean; mode: string; trayChanged: boolean; logPath: string };
+      const res3 = JSON.parse(out3.trim()) as {
+        ok: boolean;
+        mode: string;
+        spawnedByTray: boolean;
+        trayChanged: boolean;
+        logPath: string;
+      };
       expect(res3.ok).toBe(true);
       expect(res3.mode).toBe("detached-worker");
+      expect(res3.spawnedByTray).toBe(true);
       expect(res3.trayChanged).toBe(true);
 
       await waitFor(() => {

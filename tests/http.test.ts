@@ -5,6 +5,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import http from "node:http";
 import net from "node:net";
 import os from "node:os";
+import path from "node:path";
 import { projectRoot, startServer } from "./support/server.js";
 import type { RunningServer } from "./support/server.js";
 
@@ -377,5 +378,80 @@ describe("HTTP 传输（没有配置令牌）", () => {
       expect(nonLoopbackHostStatus).toBe(403);
     },
     20_000,
+  );
+
+  it(
+    "进程重启（热切换）后，未关闭的合法历史 Mcp-Session-Id 透明恢复返回 200，伪造 sid 仍返回 404",
+    async () => {
+      // 1) 建立正常会话并拿到合法 sessionId（不显式 terminateSession）
+      const { client, transport } = await connectClient(server.mcpUrl, {});
+      const savedSid = transport.sessionId as string;
+      expect(savedSid).toBeTruthy();
+
+      // 2) 通过 /api/shutdown 优雅关闭当前进程（模拟热切换，保留 sessions-store.json）
+      const shutdownRes = await fetch(`${server.panelUrl}/api/shutdown`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ includeTunnel: false }),
+      });
+      expect(shutdownRes.status).toBe(200);
+      await new Promise<void>((resolve) => setTimeout(resolve, 400));
+
+      // 3) 用同一份 config.json 拉起新进程（模拟热切换后的新 nexus-server）
+      const { spawn } = await import("node:child_process");
+      const { projectRoot } = await import("./support/server.js");
+      const nextChild = spawn(process.execPath, [path.join(projectRoot, "dist", "index.js")], {
+        cwd: projectRoot,
+        env: { ...process.env, NEXUS_MCP_CONFIG: server.configPath, NEXUS_TUNNEL_EXTERNAL: "off" },
+        stdio: "ignore",
+      });
+      try {
+        const deadline = Date.now() + 10_000;
+        let ready = false;
+        while (Date.now() < deadline) {
+          try {
+            const h = await fetch(`http://127.0.0.1:${server.port}/health`);
+            if (h.status === 200) {
+              ready = true;
+              break;
+            }
+          } catch {
+            // retry
+          }
+          await new Promise((r) => setTimeout(r, 80));
+        }
+        expect(ready).toBe(true);
+
+        // 4) 直接带着旧 sessionId 调 tools/list，应透明恢复返回 200 而非 404
+        const resumed = await fetch(server.mcpUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json, text/event-stream",
+            "mcp-session-id": savedSid,
+          },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 99, method: "tools/list", params: {} }),
+        });
+        expect(resumed.status).toBe(200);
+        const resumedText = await resumed.text();
+        expect(resumedText).toContain("read");
+
+        // 5) 伪造未知 sid 仍必须拒绝 404
+        const forged = await fetch(server.mcpUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json, text/event-stream",
+            "mcp-session-id": "forged-unknown-session-id",
+          },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 100, method: "tools/list", params: {} }),
+        });
+        expect(forged.status).toBe(404);
+      } finally {
+        nextChild.kill();
+        await client.close().catch(() => undefined);
+      }
+    },
+    25_000,
   );
 });
