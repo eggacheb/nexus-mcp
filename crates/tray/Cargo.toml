@@ -1,6 +1,6 @@
 [package]
 name = "nexus-tray"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "AGPL-3.0"
 description = "nexus-mcp 托盘宿主：Windows 系统托盘常驻入口，托管协议层与隧道生命周期"
