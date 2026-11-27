@@ -151,7 +151,7 @@ impl JobRegistry {
         ) {
             return response;
         }
-        let work_dir = match crate::resolve_work_dir(&request.root, &request.cwd, id) {
+        let work_dir = match crate::sandbox::resolve_work_dir(&request.root, &request.cwd, id) {
             Ok(dir) => dir,
             Err(response) => return response,
         };

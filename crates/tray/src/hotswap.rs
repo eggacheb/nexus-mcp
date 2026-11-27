@@ -64,12 +64,21 @@ fn default_true() -> bool {
 }
 
 fn generate_token() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let pid = std::process::id() as u128;
-    format!("{:032x}", nanos ^ (pid.wrapping_mul(0x9E37_79B9_7F4A_7C15)))
+    let mut h1 = RandomState::new().build_hasher();
+    h1.write_u128(nanos);
+    h1.write_u128(pid);
+    let mut h2 = RandomState::new().build_hasher();
+    h2.write_u128(pid ^ 0x9E37_79B9_7F4A_7C15);
+    h2.write_u128(nanos);
+    format!("{:016x}{:016x}", h1.finish(), h2.finish())
 }
 
 fn append_log(log_path: &Path, line: &str) {

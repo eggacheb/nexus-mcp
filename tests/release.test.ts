@@ -77,7 +77,8 @@ describe("本地一键 Release 脚本（scripts/release.mjs）", () => {
         execFileSync(process.execPath, [RELEASE_SCRIPT, "not-a-version", "--skip-check"], {
           env: { ...process.env, NEXUS_RELEASE_ROOT: repo.dir, NEXUS_GH_MISSING: "1" },
           encoding: "utf8",
-          stdio: "pipe",
+          stdio: ["ignore", "pipe", "pipe"],
+          timeout: 15_000,
         });
       } catch (error) {
         failed = true;
@@ -105,6 +106,8 @@ describe("本地一键 Release 脚本（scripts/release.mjs）", () => {
       execFileSync(process.execPath, [RELEASE_SCRIPT, "0.2.0", "--skip-check"], {
         env: { ...process.env, NEXUS_RELEASE_ROOT: repo.dir, NEXUS_GH_STUB: ghStub },
         encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 15_000,
       });
 
       expect(JSON.parse(readFileSync(path.join(repo.dir, "package.json"), "utf8")).version).toBe("0.2.0");
@@ -136,6 +139,8 @@ describe("本地一键 Release 脚本（scripts/release.mjs）", () => {
       execFileSync(process.execPath, [RELEASE_SCRIPT, "--publish", "--skip-check"], {
         env: { ...process.env, NEXUS_RELEASE_ROOT: repo.dir, NEXUS_GH_STUB: ghStub },
         encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 15_000,
       });
       const pubCalls = readFileSync(ghLog, "utf8")
         .trim()
@@ -157,6 +162,8 @@ describe("本地一键 Release 脚本（scripts/release.mjs）", () => {
       const stdout = execFileSync(process.execPath, [RELEASE_SCRIPT, "--skip-check"], {
         env: { ...process.env, NEXUS_RELEASE_ROOT: repo.dir, NEXUS_GH_MISSING: "1" },
         encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 15_000,
       });
       expect(stdout).toContain("SHA256SUMS.txt");
       expect(stdout).toContain("nexus-mcp_0.1.0_x64-setup.exe");

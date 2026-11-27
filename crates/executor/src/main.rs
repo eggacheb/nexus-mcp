@@ -19,7 +19,7 @@ mod win_job;
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{BufRead, Read, Write, stdin, stdout};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -30,10 +30,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use head_tail_buffer::{HeadTailBuffer, format_output_omission_marker};
-use sandbox::{
-    Containment, SandboxEntryKind, classify, display_path, escape_error, lexical_normalize,
-    open_within_sandbox, resolve_existing_within_sandbox, resolve_root, root_not_writable_error,
-};
+use sandbox::{open_within_sandbox, resolve_work_dir, resolve_write_target};
 use string::{aligned_tail, truncated_prefix};
 
 use edit_match::{
@@ -206,31 +203,6 @@ fn build_shell_command(
     Ok(command)
 }
 
-/// bash 与 job_start 共用的工作目录沙箱校验（词法 + canonicalize 真实路径两道），
-/// 返回剥除 `\\?\` 前缀后的真实目录路径（避免 Windows 下 cmd/工具链拒绝 UNC verbatim 当前目录）。
-pub(crate) fn resolve_work_dir(
-    root_str: &str,
-    cwd_str: &str,
-    id: Option<u64>,
-) -> Result<PathBuf, Value> {
-    let root = resolve_root(root_str, id)?;
-    let trimmed = cwd_str.trim();
-    if trimmed.is_empty() {
-        return Ok(PathBuf::from(display_path(&root.canonical)));
-    }
-    let canonical = resolve_existing_within_sandbox(
-        &root,
-        trimmed,
-        SandboxEntryKind::Directory {
-            missing_prefix: "工作目录不存在或不是目录",
-            wrong_kind_prefix: "工作目录是文件不是目录",
-            canonicalize_prefix: "工作目录解析失败",
-        },
-        id,
-    )?;
-    Ok(PathBuf::from(display_path(&canonical)))
-}
-
 fn run_bash(request: &BashRequest) -> Value {
     let max_bytes = request.max_output_bytes.max(1);
     let timeout_ms = request.timeout_ms.clamp(1, MAX_TIMEOUT_MS);
@@ -390,158 +362,12 @@ fn run_read(request: &ReadRequest) -> Value {
 }
 
 fn run_write(request: &WriteRequest) -> Value {
-    let id = Some(request.id);
-    if request.path.trim().is_empty() {
-        return error_response(id, "path 不能为空");
-    }
-    let root = match resolve_root(&request.root, id) {
-        Ok(r) => r,
+    let target = match resolve_write_target(&request.root, &request.path, Some(request.id)) {
+        Ok(t) => t,
         Err(response) => return response,
     };
-    let target = Path::new(&request.path);
-
-    // 第一道：词法校验（含「目标就是根目录」的提前拒绝）
-    let normalized = match lexical_normalize(target) {
-        Ok(p) => p,
-        Err(()) => return error_response(id, escape_error(&request.path, target, &root.lexical)),
-    };
-    match classify(&root.lexical, &normalized) {
-        Containment::Outside => {
-            return error_response(id, escape_error(&request.path, &normalized, &root.lexical));
-        }
-        Containment::RootItself => {
-            return root_not_writable_error(id, &root.canonical);
-        }
-        Containment::Inside => {}
-    }
-
-    // 第二道：目标路径上已存在的东西按类型处理
-    match fs::symlink_metadata(target) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            // 链接存在（含悬空）：按解析结果判定，解析失败就不猜
-            match fs::canonicalize(target) {
-                Ok(real) => {
-                    if let Containment::Outside = classify(&root.canonical, &real) {
-                        return error_response(id, escape_error(&request.path, &real, &root.canonical));
-                    }
-                    let _guard = file_lock::acquire(&real);
-                    write_bytes(request, target)
-                }
-                Err(_) => error_response(
-                    id,
-                    format!("路径不可写: {} 是指向不存在目标的符号链接，拒绝写入", request.path),
-                ),
-            }
-        }
-        Ok(meta) if meta.is_dir() => {
-            let canonical = fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
-            if let Containment::RootItself = classify(&root.canonical, &canonical) {
-                return root_not_writable_error(id, &root.canonical);
-            }
-            error_response(id, format!("目标路径是目录，不能作为文件写入: {}", request.path))
-        }
-        Ok(_) => {
-            // 常规文件覆盖写：解析真实路径防中间链接偷换
-            match fs::canonicalize(target) {
-                Ok(real) => {
-                    if let Containment::Outside = classify(&root.canonical, &real) {
-                        return error_response(id, escape_error(&request.path, &real, &root.canonical));
-                    }
-                    let _guard = file_lock::acquire(&real);
-                    write_bytes(request, target)
-                }
-                Err(err) => error_response(id, format!("路径解析失败: {} ({err})", request.path)),
-            }
-        }
-        Err(_) => {
-            // 目标不存在：先沿祖先链找到最深已存在节点并验根（防中间符号链接越界），再自动创建沙箱内缺失父目录
-            let Some(parent) = normalized.parent().filter(|p| !p.as_os_str().is_empty()) else {
-                return error_response(id, format!("路径没有可写的文件名: {}", request.path));
-            };
-            let Some(name) = normalized.file_name() else {
-                return error_response(id, format!("路径没有可写的文件名: {}", request.path));
-            };
-            let mut missing_segments: Vec<std::ffi::OsString> = Vec::new();
-            let mut cursor = parent;
-            loop {
-                match fs::symlink_metadata(cursor) {
-                    Ok(_) => break,
-                    Err(_) => {
-                        let Some(seg) = cursor.file_name() else {
-                            return error_response(
-                                id,
-                                format!("父目录无法解析: {}", display_path(parent)),
-                            );
-                        };
-                        missing_segments.push(seg.to_os_string());
-                        let Some(next) = cursor.parent() else {
-                            return error_response(
-                                id,
-                                format!("父目录无法解析: {}", display_path(parent)),
-                            );
-                        };
-                        cursor = next;
-                    }
-                }
-            }
-            let ancestor_canonical = match fs::canonicalize(cursor) {
-                Ok(p) => p,
-                Err(err) => {
-                    return error_response(
-                        id,
-                        format!("父目录不可访问: {} ({err})", display_path(cursor)),
-                    );
-                }
-            };
-            if let Containment::Outside = classify(&root.canonical, &ancestor_canonical) {
-                return error_response(
-                    id,
-                    escape_error(&request.path, &ancestor_canonical, &root.canonical),
-                );
-            }
-            match fs::metadata(&ancestor_canonical) {
-                Ok(meta) if meta.is_dir() => {}
-                Ok(_) => {
-                    return error_response(
-                        id,
-                        format!(
-                            "父路径是已存在的文件而非目录，无法写入: {}",
-                            display_path(&ancestor_canonical)
-                        ),
-                    );
-                }
-                Err(err) => {
-                    return error_response(
-                        id,
-                        format!("父目录不可访问: {} ({err})", display_path(&ancestor_canonical)),
-                    );
-                }
-            }
-            let mut target_parent = ancestor_canonical;
-            for seg in missing_segments.into_iter().rev() {
-                target_parent.push(seg);
-            }
-            if !target_parent.exists()
-                && let Err(err) = fs::create_dir_all(&target_parent)
-            {
-                return error_response(
-                    id,
-                    format!("创建父目录失败: {} ({err})", display_path(&target_parent)),
-                );
-            }
-            let candidate = target_parent.join(name);
-            match classify(&root.canonical, &candidate) {
-                Containment::Outside => {
-                    error_response(id, escape_error(&request.path, &candidate, &root.canonical))
-                }
-                Containment::RootItself => root_not_writable_error(id, &root.canonical),
-                Containment::Inside => {
-                    let _guard = file_lock::acquire(&candidate);
-                    write_bytes(request, &candidate)
-                }
-            }
-        }
-    }
+    let _guard = file_lock::acquire(&target.lock_path);
+    write_bytes(request, &target.write_path)
 }
 
 /// 整文件覆盖写：内容原样字节落盘，UTF-8 编码，换行风格保持传入形态。

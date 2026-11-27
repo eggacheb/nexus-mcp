@@ -3,10 +3,9 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import http from "node:http";
-import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { projectRoot, startServer } from "./support/server.js";
+import { startServer } from "./support/server.js";
 import type { RunningServer } from "./support/server.js";
 
 const TOKEN = "test-token-6f3c1a";

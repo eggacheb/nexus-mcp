@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { TunnelManager } from "../src/tunnel.js";
 import type { TunnelManagerOptions } from "../src/tunnel.js";
-import { projectRoot, startServer } from "./support/server.js";
+import { startServer } from "./support/server.js";
 import type { RunningServer } from "./support/server.js";
 
 const TOKEN = "tunnel-token-3c9f21";
