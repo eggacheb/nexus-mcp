@@ -71,6 +71,33 @@ describe("打包与配置优先级", () => {
     expect(nsi).not.toContain("启动.cmd");
   });
 
+  it("NSIS 脚本覆盖安装与卸载优先优雅退出托盘、清理残留并保留用户数据，且 README 已切向用户三步上手", () => {
+    const nsi = readFileSync(
+      path.join(projectRoot, "scripts", "installer", "nexus-mcp.nsi"),
+      "utf8",
+    );
+    expect(nsi).toContain(".tray-control.json");
+    expect(nsi).toContain("/quit");
+    expect(nsi).toContain("$SMSTARTUP\\${APP_NAME}.lnk");
+    expect(nsi).toContain("${APP_EXE}.prev");
+    expect(nsi).toContain("${APP_SERVER}.prev");
+    expect(nsi).toContain("${APP_EXECUTOR}.prev");
+    expect(nsi).toContain("${APP_EXE}.old");
+    expect(nsi).not.toMatch(/Delete\s+"\$INSTDIR\\config\.json"/i);
+    expect(nsi).not.toMatch(/Delete\s+"\$INSTDIR\\oauth-store\.json"/i);
+    expect(nsi).not.toMatch(/Delete\s+"\$INSTDIR\\sessions-store\.json"/i);
+    expect(nsi).not.toMatch(/RMDir\s+\/r\s+"\$INSTDIR\\workspace"/i);
+
+    const readme = readFileSync(path.join(projectRoot, "README.md"), "utf8");
+    expect(readme).not.toContain("启动.cmd");
+    expect(readme).not.toContain("nexus-mcp.vbs");
+    expect(readme).toContain("Releases");
+    expect(readme).toContain("SmartScreen");
+    expect(readme).toContain("临时隧道");
+    expect(readme).toContain("Tailscale Funnel");
+    expect(readme).toContain("命名隧道");
+  });
+
   it("首次运行缺配置时生成默认配置，不抛错", () => {
     expect(existsSync(configFile())).toBe(false);
 

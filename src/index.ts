@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { loadConfig } from "./config.js";
+import { effectiveTunnelMode, loadConfig } from "./config.js";
 import { closeExecutor } from "./executor.js";
 import { configureLogger, logError, logInfo, logWarn, resolveLogDir } from "./log.js";
 import { createMcpService } from "./mcpService.js";
@@ -80,7 +80,7 @@ async function main(): Promise<void> {
 
   panel = await startPanel(config, service, tunnel, () => shutdown());
 
-  if (tunnel && config.tunnel?.autoStart !== false) {
+  if (tunnel && effectiveTunnelMode(config) === "named" && config.tunnel?.autoStart !== false) {
     try {
       const result = await tunnel.start();
       logInfo("tunnel.autostart", { started: result.started, pid: result.pid, reason: result.reason });

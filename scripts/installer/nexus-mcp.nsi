@@ -40,12 +40,14 @@ VIAddVersionKey "CompanyName" "${APP_PUBLISHER}"
 VIAddVersionKey "LegalCopyright" "AGPL-3.0"
 
 !define MUI_ABORTWARNING
+!define MUI_ICON "..\..\assets\nexus-mcp.ico"
+!define MUI_UNICON "..\..\assets\nexus-mcp.ico"
 !define MUI_WELCOMEPAGE_TEXT "nexus-mcp 是给云端 AI 用的本地 MCP 服务。$\r$\n$\r$\n只装到当前用户目录，不需要管理员权限。首次启动会在安装目录生成 config.json 与 workspace。"
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
 !define MUI_FINISHPAGE_RUN "$INSTDIR\${APP_EXE}"
-!define MUI_FINISHPAGE_RUN_TEXT "现在启动 nexus-mcp（常驻右下角托盘）"
+!define MUI_FINISHPAGE_RUN_TEXT "现在启动 nexus-mcp（自动打开控制面板并常驻右下角托盘）"
 !insertmacro MUI_PAGE_FINISH
 
 !insertmacro MUI_UNPAGE_CONFIRM
@@ -53,13 +55,19 @@ VIAddVersionKey "LegalCopyright" "AGPL-3.0"
 
 !insertmacro MUI_LANGUAGE "SimpChinese"
 
-Section "安装" SecInstall
-  SetShellVarContext current
-
-  ; 覆盖安装前先停掉正在跑的进程，否则 exe 被占用写不进去（照 Nexus 的 hook 手法）
+; 优先经托盘控制端口优雅退出（避免硬杀留孤儿隧道），缺失或超时再 taskkill 兜底
+!macro StopRunningApp includeTunnel
+  nsExec::Exec 'powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -Command "$$f = Join-Path \"$INSTDIR\" \".tray-control.json\"; if (Test-Path $$f) { try { $$c = Get-Content $$f -Raw | ConvertFrom-Json; Invoke-RestMethod -Method Post -Uri (\"http://127.0.0.1:\" + $$c.port + \"/quit\") -Headers @{ \"X-Tray-Token\" = $$c.token } -ContentType \"application/json\" -Body \"{\\\"includeTunnel\\\":${includeTunnel}}\" -TimeoutSec 3 | Out-Null; Start-Sleep -Milliseconds 1500 } catch {} }"'
   nsExec::Exec 'taskkill /F /IM ${APP_EXE}'
   nsExec::Exec 'taskkill /F /IM ${APP_SERVER}'
   nsExec::Exec 'taskkill /F /IM ${APP_EXECUTOR}'
+!macroend
+
+Section "安装" SecInstall
+  SetShellVarContext current
+
+  ; 覆盖安装前先优雅停止托盘（保隧道不断），超时再兜底强杀
+  !insertmacro StopRunningApp "false"
 
   SetOutPath "$INSTDIR"
   File /r "${STAGE_DIR}\*.*"
@@ -85,19 +93,24 @@ SectionEnd
 Section "Uninstall"
   SetShellVarContext current
 
-  nsExec::Exec 'taskkill /F /IM ${APP_EXE}'
-  nsExec::Exec 'taskkill /F /IM ${APP_SERVER}'
-  nsExec::Exec 'taskkill /F /IM ${APP_EXECUTOR}'
+  ; 卸载前先优雅全停（连同受管隧道一并关闭），超时再兜底强杀
+  !insertmacro StopRunningApp "true"
 
   Delete "$DESKTOP\${APP_NAME}.lnk"
+  Delete "$SMSTARTUP\${APP_NAME}.lnk"
   RMDir /r "$SMPROGRAMS\${APP_NAME}"
   DeleteRegKey HKCU "${UNINST_KEY}"
   DeleteRegKey HKCU "Software\${APP_ID}"
 
-  ; 只删程序文件；config.json、oauth-store.json 与 workspace 属于用户数据，卸载不碰
+  ; 只删程序文件与热切换/控制残留；config.json、oauth-store.json、sessions-store.json 与 workspace 属于用户数据，卸载不碰
   Delete "$INSTDIR\${APP_EXE}"
   Delete "$INSTDIR\${APP_SERVER}"
   Delete "$INSTDIR\${APP_EXECUTOR}"
+  Delete "$INSTDIR\${APP_EXE}.prev"
+  Delete "$INSTDIR\${APP_SERVER}.prev"
+  Delete "$INSTDIR\${APP_EXECUTOR}.prev"
+  Delete "$INSTDIR\${APP_EXE}.old"
+  Delete "$INSTDIR\.tray-control.json"
   Delete "$INSTDIR\使用说明.txt"
   Delete "$INSTDIR\uninstall.exe"
   RMDir "$INSTDIR"

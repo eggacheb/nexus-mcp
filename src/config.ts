@@ -7,8 +7,10 @@ import type { LogLevel } from "./log.js";
 
 export type { LogLevel } from "./log.js";
 export type ShellKind = "auto" | "git-bash" | "pwsh" | "powershell";
+export type TunnelMode = "none" | "quick" | "tailscale" | "named";
 
 const VALID_LOG_LEVELS: ReadonlySet<string> = new Set<LogLevel>(["debug", "info", "warn", "error"]);
+const VALID_TUNNEL_MODES: ReadonlySet<string> = new Set<TunnelMode>(["none", "quick", "tailscale", "named"]);
 
 export interface CommandPolicyConfig {
   /** 白名单：通配模式（如 "git push *"），非空时启用白名单 */
@@ -51,9 +53,13 @@ export interface AppConfig {
   logLevel: LogLevel;
   /** 命令闸门：白/黑名单与未命中策略，原样透传给执行器 */
   commandPolicy: CommandPolicyConfig;
-  /** 隧道公网地址，配了面板才会去探测连通性 */
+  /** 隧道公网地址（命名隧道固定地址），配了面板才会去探测连通性 */
   tunnelUrl?: string;
-  /** 本机 cloudflared 隧道管理；配置了这个段面板才提供启停按钮 */
+  /** Tailscale Funnel 固定公网地址（与命名隧道 tunnelUrl 独立存储，切换不互相覆盖） */
+  tailscaleUrl?: string;
+  /** 激活的公网隧道渠道：单通道互斥；省略时有 tunnel 段推导为 named，否则 none */
+  tunnelMode?: TunnelMode;
+  /** 本机 cloudflared 命名隧道管理；配置了这个段面板才提供命名隧道启停 */
   tunnel?: TunnelConfig;
 }
 
@@ -224,6 +230,23 @@ export function normalizeTunnelUrl(value: unknown): string | undefined {
   return trimmed;
 }
 
+/** 隧道渠道模式校验：省略时按 config.tunnel 是否存在向后兼容推导 */
+export function normalizeTunnelMode(value: unknown): TunnelMode | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  if (typeof value !== "string" || !VALID_TUNNEL_MODES.has(value)) {
+    throw new Error(
+      `config.json 的 tunnelMode 只支持 "none" / "quick" / "tailscale" / "named"，收到 ${JSON.stringify(value)}`,
+    );
+  }
+  return value as TunnelMode;
+}
+
+/** 生效中的单通道模式：老用户未写 tunnelMode 但已有 tunnel 段时默认保持 named */
+export function effectiveTunnelMode(config: Pick<AppConfig, "tunnelMode" | "tunnel">): TunnelMode {
+  if (config.tunnelMode) return config.tunnelMode;
+  return config.tunnel ? "named" : "none";
+}
+
 /** 原地替换共享 AppConfig 的全部键，清理磁盘配置中已删除的可选字段（如 tunnelUrl / tunnel） */
 export function replaceConfigInPlace(target: AppConfig, next: AppConfig): void {
   for (const key of Object.keys(target) as Array<keyof AppConfig>) {
@@ -355,6 +378,8 @@ export function loadConfig(): AppConfig {
     ? normalizeLogLevel(rawEnvLogLevel, "环境变量 NEXUS_MCP_LOG_LEVEL")
     : fileLogLevel;
   const tunnelUrl = normalizeTunnelUrl(raw.tunnelUrl);
+  const tailscaleUrl = normalizeTunnelUrl(raw.tailscaleUrl);
+  const tunnelMode = normalizeTunnelMode(raw.tunnelMode);
   const tunnel = normalizeTunnel(raw.tunnel);
 
   return {
@@ -369,6 +394,8 @@ export function loadConfig(): AppConfig {
     logLevel,
     commandPolicy: normalizeCommandPolicy(raw.commandPolicy),
     ...(tunnelUrl ? { tunnelUrl } : {}),
+    ...(tailscaleUrl ? { tailscaleUrl } : {}),
+    ...(tunnelMode ? { tunnelMode } : {}),
     ...(tunnel ? { tunnel } : {}),
   };
 }
@@ -401,6 +428,10 @@ export function saveConfig(config: AppConfig): void {
   // 可选键：配置里已不存在时要把旧键从文件里清掉，否则 {...raw} 会把它一直带着
   if (config.tunnelUrl) next.tunnelUrl = config.tunnelUrl;
   else delete next.tunnelUrl;
+  if (config.tailscaleUrl) next.tailscaleUrl = config.tailscaleUrl;
+  else delete next.tailscaleUrl;
+  if (config.tunnelMode) next.tunnelMode = config.tunnelMode;
+  else delete next.tunnelMode;
   if (config.tunnel) next.tunnel = config.tunnel;
   else delete next.tunnel;
 

@@ -231,3 +231,92 @@ setInterval(() => {{}}, 1000);
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn cold_start_opens_panel_when_ready_unless_minimized() {
+    let _lock = SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = unique_temp_dir("nexus-tray-autoopen");
+    let panel_port = free_port();
+    let stub_script = dir.join("stub-panel.cjs");
+    fs::write(
+        &stub_script,
+        format!(
+            r#"
+const http = require("http");
+const fs = require("fs");
+const srv = http.createServer((req, res) => {{
+  if (req.method === "POST" && req.url === "/api/shutdown") {{
+    res.writeHead(200, {{ "Content-Type": "application/json" }});
+    res.end('{{"ok":true}}');
+    setTimeout(() => process.exit(0), 20);
+    return;
+  }}
+  if (req.url === "/api/status") {{
+    res.writeHead(200, {{ "Content-Type": "application/json" }});
+    res.end('{{"service":{{"state":"running"}}}}');
+    return;
+  }}
+  res.writeHead(200);
+  res.end("ok");
+}});
+srv.listen({panel_port}, "127.0.0.1", () => {{
+  fs.writeFileSync({ready_file:?}, "ready");
+}});
+"#,
+            ready_file = dir.join("ready.txt").to_string_lossy(),
+        ),
+    )
+    .unwrap();
+
+    let args_json = serde_json::to_string(&vec![stub_script.to_string_lossy().to_string()]).unwrap();
+
+    // 1. 普通冷启动（不带 --minimized）：面板就绪后自动记录打开面板 URL
+    let open_cold = dir.join("open-cold.txt");
+    let mutex_cold = format!("Local\\nexus-tray-cold-{}", std::process::id());
+    let mut cold = Command::new(tray_bin())
+        .env("NEXUS_TRAY_HEADLESS", "1")
+        .env("NEXUS_TRAY_MUTEX", &mutex_cold)
+        .env("NEXUS_TRAY_PANEL_PORT", panel_port.to_string())
+        .env("NEXUS_TRAY_SERVER_BIN", "node")
+        .env("NEXUS_TRAY_SERVER_ARGS", &args_json)
+        .env("NEXUS_TRAY_WORKDIR", &dir)
+        .env("NEXUS_TRAY_OPEN_URL_LOG", &open_cold)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("启动普通冷启动托盘");
+
+    let recorded = wait_for_file(&open_cold, Duration::from_secs(6));
+    assert_eq!(recorded.trim(), format!("http://127.0.0.1:{panel_port}"));
+    writeln!(cold.stdin.as_mut().unwrap(), "quit").unwrap();
+    assert!(cold.wait().expect("等待普通冷启动退出").success());
+
+    // 2. 带 --minimized 启动：面板就绪后也不触发打开浏览器
+    let _ = fs::remove_file(dir.join("ready.txt"));
+    let open_min = dir.join("open-min.txt");
+    let mutex_min = format!("Local\\nexus-tray-min-{}", std::process::id());
+    let mut min_proc = Command::new(tray_bin())
+        .arg("--minimized")
+        .env("NEXUS_TRAY_HEADLESS", "1")
+        .env("NEXUS_TRAY_MUTEX", &mutex_min)
+        .env("NEXUS_TRAY_PANEL_PORT", panel_port.to_string())
+        .env("NEXUS_TRAY_SERVER_BIN", "node")
+        .env("NEXUS_TRAY_SERVER_ARGS", &args_json)
+        .env("NEXUS_TRAY_WORKDIR", &dir)
+        .env("NEXUS_TRAY_OPEN_URL_LOG", &open_min)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("启动 --minimized 托盘");
+
+    let _ = wait_for_file(&dir.join("ready.txt"), Duration::from_secs(6));
+    thread::sleep(Duration::from_millis(500));
+    assert!(!open_min.exists(), "--minimized 启动不应自动打开浏览器面板");
+
+    writeln!(min_proc.stdin.as_mut().unwrap(), "quit").unwrap();
+    assert!(min_proc.wait().expect("等待 --minimized 退出").success());
+
+    let _ = fs::remove_dir_all(&dir);
+}

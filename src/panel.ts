@@ -3,12 +3,14 @@ import { existsSync, statSync } from "node:fs";
 import http from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import path from "node:path";
-import type { AppConfig } from "./config.js";
+import type { AppConfig, TunnelMode } from "./config.js";
 import {
+  effectiveTunnelMode,
   loadConfig,
   normalizeCommandPolicy,
   normalizeLogLevel,
   normalizePositiveInt,
+  normalizeTunnelMode,
   normalizeTunnelUrl,
   replaceConfigInPlace,
   saveConfig,
@@ -18,6 +20,9 @@ import { readBody, sendJson as sendJsonRaw } from "./httpHelpers.js";
 import { ICON_DATA_URI_SVG } from "./icon.js";
 import { logError, logInfo, logWarn, recentLogs, redactText, setLogLevel } from "./log.js";
 import type { McpService } from "./mcpService.js";
+import { QuickTunnelManager } from "./quickTunnel.js";
+import type { TailscaleInfo } from "./tailscale.js";
+import { detectTailscale, disableTailscaleFunnel, enableTailscaleFunnel } from "./tailscale.js";
 import type { ComponentStatus, TunnelStatus } from "./status.js";
 import { executorStatus, probePublicTunnel, tunnelStatus } from "./status.js";
 import { TOOL_SUMMARY } from "./tools.js";
@@ -202,7 +207,17 @@ const PAGE = `<!doctype html>
   </section>
 
   <section class="card" data-block="tunnel">
-    <h2>隧道 <small id="tunnel-host">cloudflared</small></h2>
+    <h2>隧道 <small id="tunnel-host">单通道互斥</small></h2>
+    <label>公网接入渠道（同一时刻仅启用一种）</label>
+    <div class="row">
+      <select id="tunnel-mode">
+        <option value="none">关闭（仅本机）</option>
+        <option value="quick">临时隧道（零账号，重启换域名）</option>
+        <option value="tailscale">Tailscale Funnel（免买域名固定地址）</option>
+        <option value="named">Cloudflare 命名隧道（自有固定域名）</option>
+      </select>
+      <button id="tunnel-apply">切换渠道</button>
+    </div>
     <div class="row">
       <input id="tunnel-url" readonly value="未配置" />
       <button id="tunnel-probe" class="ghost">检测可达性</button>
@@ -211,6 +226,10 @@ const PAGE = `<!doctype html>
       <button id="tunnel-start">启动隧道</button>
       <button id="tunnel-stop" class="ghost danger">停止隧道</button>
     </div>
+    <p class="hint" id="tunnel-ephemeral-note" hidden>临时域名在进程重启后会变更；长期使用建议切换为 Tailscale Funnel 或 Cloudflare 命名隧道。</p>
+    <p class="hint" id="tunnel-ts-guide" hidden>
+      <a id="tunnel-ts-link" href="https://tailscale.com/download" target="_blank" rel="noopener">前往 Tailscale 后台 / 下载</a>
+    </p>
     <p class="hint" id="tunnel-hint">—</p>
     <p class="hint" id="tunnel-probe-result" hidden></p>
     <pre id="tunnel-tail" hidden></pre>
@@ -332,15 +351,38 @@ const PAGE = `<!doctype html>
       s.service.label + " · 本地 http://127.0.0.1:" + s.service.port + "/mcp · 会话 " +
       s.service.sessions + " 个 · 面板端口 " + s.panelPort;
 
+    var tunnelModeSelect = document.getElementById("tunnel-mode");
+    if (tunnelModeSelect && document.activeElement !== tunnelModeSelect && s.tunnel.mode) {
+      tunnelModeSelect.value = s.tunnel.mode;
+    }
+    var ephemeralNote = document.getElementById("tunnel-ephemeral-note");
+    if (ephemeralNote) ephemeralNote.hidden = !s.tunnel.ephemeral;
+    var tsGuide = document.getElementById("tunnel-ts-guide");
+    var tsLink = document.getElementById("tunnel-ts-link");
+    if (tsGuide && tsLink) {
+      var ts = s.tunnel.tailscale;
+      if (s.tunnel.mode === "tailscale" && ts && ts.approvalUrl) {
+        tsLink.href = ts.approvalUrl;
+        tsLink.textContent = "去 Tailscale 后台点一下启用 Funnel（完成后再点「启动隧道」）";
+        tsGuide.hidden = false;
+      } else if (s.tunnel.mode === "tailscale" && ts && !ts.installed) {
+        tsLink.href = "https://tailscale.com/download";
+        tsLink.textContent = "未检测到 Tailscale：点击前往官网下载并登录，再点「启动隧道」";
+        tsGuide.hidden = false;
+      } else {
+        tsGuide.hidden = true;
+      }
+    }
+
     var tunnelUrlInput = document.getElementById("tunnel-url");
     if (document.activeElement !== tunnelUrlInput) tunnelUrlInput.value = s.tunnel.url || "未配置";
 
-    var tunnelHost = "cloudflared";
+    var tunnelHost = s.tunnel.mode === "quick" ? "临时隧道" : s.tunnel.mode === "tailscale" ? "Tailscale Funnel" : "cloudflared";
     if (s.tunnel.url) {
       try {
-        tunnelHost = "cloudflared · " + new URL(s.tunnel.url).host;
+        tunnelHost = tunnelHost + " · " + new URL(s.tunnel.url).host;
       } catch (error) {
-        tunnelHost = "cloudflared · " + s.tunnel.url;
+        tunnelHost = tunnelHost + " · " + s.tunnel.url;
       }
     }
     document.getElementById("tunnel-host").textContent = tunnelHost;
@@ -350,7 +392,11 @@ const PAGE = `<!doctype html>
     var tunnelParts = [s.tunnel.label];
     if (s.tunnel.detail) tunnelParts.push(s.tunnel.detail);
     var tunnelProc = s.tunnel.process || {};
-    if (tunnelProc.pid) tunnelParts.push("pid " + tunnelProc.pid);
+    if (s.tunnel.mode === "quick" && s.tunnel.quick && s.tunnel.quick.pid) {
+      tunnelParts.push("pid " + s.tunnel.quick.pid);
+    } else if (tunnelProc.pid) {
+      tunnelParts.push("pid " + tunnelProc.pid);
+    }
     if (tunnelProc.exitCode !== undefined && tunnelProc.exitCode !== null) {
       tunnelParts.push("退出码 " + tunnelProc.exitCode);
     }
@@ -360,7 +406,12 @@ const PAGE = `<!doctype html>
     document.getElementById("tunnel-hint").textContent = tunnelParts.join(" · ");
 
     var tailBox = document.getElementById("tunnel-tail");
-    var tailLines = s.tunnel.process && s.tunnel.process.tail ? s.tunnel.process.tail : [];
+    var tailLines =
+      s.tunnel.mode === "quick" && s.tunnel.quick && s.tunnel.quick.tail
+        ? s.tunnel.quick.tail
+        : s.tunnel.process && s.tunnel.process.tail
+          ? s.tunnel.process.tail
+          : [];
     tailBox.hidden = tailLines.length === 0;
     tailBox.textContent = tailLines.join("\\n");
 
@@ -631,12 +682,30 @@ const PAGE = `<!doctype html>
     post("/api/service", { action: "reload" });
   });
 
-  document.getElementById("tunnel-start").addEventListener("click", function () {
-    post("/api/tunnel", { action: "start" });
+  document.getElementById("tunnel-apply").addEventListener("click", async function () {
+    var button = this;
+    var mode = document.getElementById("tunnel-mode").value;
+    button.disabled = true;
+    button.textContent = "切换中…";
+    var data = await post("/api/tunnel", { action: "mode", mode: mode });
+    button.disabled = false;
+    button.textContent = "切换渠道";
+    if (data) {
+      loadCredentials();
+      showAlert("隧道渠道已切换为 " + mode, "ok");
+    }
+  });
+
+  document.getElementById("tunnel-start").addEventListener("click", async function () {
+    var data = await post("/api/tunnel", { action: "start" });
+    if (data) loadCredentials();
   });
 
   document.getElementById("tunnel-stop").addEventListener("click", function () {
-    armConfirm(this, "停止隧道", function () { post("/api/tunnel", { action: "stop" }); });
+    armConfirm(this, "停止隧道", async function () {
+      var data = await post("/api/tunnel", { action: "stop" });
+      if (data) loadCredentials();
+    });
   });
 
   document.getElementById("tunnel-probe").addEventListener("click", async function () {
@@ -825,6 +894,16 @@ export async function startPanel(
 ): Promise<PanelHandle> {
   let panelPort = config.panelPort;
   let currentTunnel: TunnelManager | undefined = tunnel;
+  const quickTunnel = new QuickTunnelManager();
+  let lastTailscale: TailscaleInfo | undefined;
+  let lastTailscaleAt = 0;
+
+  function activePublicUrl(): string {
+    const mode = effectiveTunnelMode(config);
+    if (mode === "quick") return quickTunnel.currentUrl() ?? "";
+    if (mode === "tailscale") return lastTailscale?.url ?? config.tailscaleUrl?.trim() ?? "";
+    return config.tunnelUrl?.trim() ?? "";
+  }
 
   async function syncTunnelManager(nextConfig: AppConfig): Promise<void> {
     const options = resolveTunnelOptions(nextConfig);
@@ -844,6 +923,11 @@ export async function startPanel(
 
   async function statusPayload(): Promise<PanelStatus> {
     const running = service.isRunning();
+    const mode = effectiveTunnelMode(config);
+    if (mode === "tailscale" && !lastTailscale?.approvalUrl && Date.now() - lastTailscaleAt > 3_000) {
+      lastTailscale = await detectTailscale(service.port());
+      lastTailscaleAt = Date.now();
+    }
     return {
       service: {
         state: running ? "running" : "stopped",
@@ -853,7 +937,7 @@ export async function startPanel(
         sessions: service.sessionCount(),
       },
       executor: await executorStatus(),
-      tunnel: await tunnelStatus(config, currentTunnel),
+      tunnel: await tunnelStatus(config, currentTunnel, quickTunnel, mode === "tailscale" ? lastTailscale : undefined),
       root: config.root,
       panelPort,
       version: VERSION,
@@ -865,15 +949,19 @@ export async function startPanel(
     url: string;
     publicUrl: string;
     token: string;
+    tunnelMode: TunnelMode;
+    ephemeral: boolean;
     oauth: { url: string; available: boolean };
   } {
-    const publicUrl = config.tunnelUrl
-      ? `${config.tunnelUrl.replace(/\/+$/, "")}/mcp`
-      : "";
+    const mode = effectiveTunnelMode(config);
+    const activeUrl = activePublicUrl();
+    const publicUrl = activeUrl ? `${activeUrl.replace(/\/+$/, "")}/mcp` : "";
     return {
       url: service.url(),
       publicUrl,
       token: config.token,
+      tunnelMode: mode,
+      ephemeral: mode === "quick",
       oauth: service.oauthInfo(),
     };
   }
@@ -1081,30 +1169,113 @@ export async function startPanel(
     }
 
     if (req.method === "POST" && url.pathname === "/api/tunnel") {
-      if (!currentTunnel) {
-        sendJson(res, 400, { error: "未启用隧道管理（config.json 里没有 tunnel 段）" });
-        return;
-      }
       const body = await readWriteBody(req, res, panelPort);
       if (!body) return;
       const action = typeof body.action === "string" ? body.action : "";
+      const activeMode = effectiveTunnelMode(config);
 
       try {
-        if (action === "start") {
-          const result = await currentTunnel.start();
-          logInfo("panel.tunnel", {
-            action: "start",
-            started: result.started,
-            pid: result.pid,
-            reason: result.reason,
-          });
+        if (action === "mode") {
+          let nextMode: TunnelMode | undefined;
+          try {
+            nextMode = normalizeTunnelMode(body.mode);
+          } catch (error) {
+            sendJson(res, 400, { error: (error as Error).message });
+            return;
+          }
+          if (!nextMode) {
+            sendJson(res, 400, { error: "缺少合法的 mode 参数（none / quick / tailscale / named）" });
+            return;
+          }
+          if (nextMode === "named" && !currentTunnel) {
+            sendJson(res, 400, { error: "未启用命名隧道（config.json 里没有 tunnel 段）" });
+            return;
+          }
+          // 单通道互斥：切往新渠道前先停旧渠道
+          if (activeMode !== nextMode) {
+            if (quickTunnel.isRunning()) await quickTunnel.stop();
+            if (activeMode === "named" && currentTunnel) await currentTunnel.stop();
+            if (activeMode === "tailscale") {
+              await disableTailscaleFunnel();
+              lastTailscale = undefined;
+              lastTailscaleAt = 0;
+            }
+          }
+
+          if (nextMode === "quick") {
+            await quickTunnel.start(service.port(), config);
+          } else if (nextMode === "tailscale") {
+            const ts = await enableTailscaleFunnel(service.port());
+            lastTailscale = ts;
+            lastTailscaleAt = Date.now();
+            if (ts.funnelActive && ts.url) {
+              config.tailscaleUrl = ts.url;
+            }
+          } else if (nextMode === "named" && currentTunnel) {
+            await currentTunnel.start();
+          }
+
+          config.tunnelMode = nextMode;
+          saveConfig(config);
+          logInfo("panel.tunnel", { action: "mode", from: activeMode, to: nextMode });
+        } else if (action === "detect-tailscale") {
+          lastTailscale = await detectTailscale(service.port());
+          lastTailscaleAt = Date.now();
+          sendJson(res, 200, { tailscale: lastTailscale, status: await statusPayload() });
+          return;
+        } else if (action === "start") {
+          if (activeMode === "quick") {
+            await quickTunnel.start(service.port(), config);
+            logInfo("panel.tunnel", { action: "start", mode: "quick" });
+          } else if (activeMode === "tailscale") {
+            const ts = await enableTailscaleFunnel(service.port());
+            lastTailscale = ts;
+            lastTailscaleAt = Date.now();
+            if (ts.funnelActive && ts.url) {
+              config.tailscaleUrl = ts.url;
+              saveConfig(config);
+            }
+            logInfo("panel.tunnel", { action: "start", mode: "tailscale", active: ts.funnelActive });
+          } else if (activeMode === "named") {
+            if (!currentTunnel) {
+              sendJson(res, 400, { error: "未启用隧道管理（config.json 里没有 tunnel 段）" });
+              return;
+            }
+            const result = await currentTunnel.start();
+            logInfo("panel.tunnel", {
+              action: "start",
+              started: result.started,
+              pid: result.pid,
+              reason: result.reason,
+            });
+          } else {
+            sendJson(res, 400, { error: "当前未启用隧道管理（请先选择一种隧道渠道）" });
+            return;
+          }
         } else if (action === "stop") {
-          await currentTunnel.stop();
-          logInfo("panel.tunnel", { action: "stop" });
+          if (activeMode === "quick") {
+            await quickTunnel.stop();
+            logInfo("panel.tunnel", { action: "stop", mode: "quick" });
+          } else if (activeMode === "tailscale") {
+            await disableTailscaleFunnel();
+            lastTailscale = await detectTailscale(service.port());
+            lastTailscaleAt = Date.now();
+            logInfo("panel.tunnel", { action: "stop", mode: "tailscale" });
+          } else if (activeMode === "named") {
+            if (!currentTunnel) {
+              sendJson(res, 400, { error: "未启用隧道管理（config.json 里没有 tunnel 段）" });
+              return;
+            }
+            await currentTunnel.stop();
+            logInfo("panel.tunnel", { action: "stop" });
+          } else {
+            sendJson(res, 400, { error: "当前未启用隧道管理（config.json 里没有 tunnel 段）" });
+            return;
+          }
         } else if (action === "probe") {
           // 手动探测：真的往外打一次，把状态码和往返耗时报给面板。
           // 状态灯已经不靠它了（见 status.ts 的 tunnelStatus），这里只是链路体检。
-          const probe = await probePublicTunnel(config);
+          const probe = await probePublicTunnel(config, activePublicUrl() || undefined);
           if (probe.ok) {
             logInfo("tunnel.probe", { ok: true, status: probe.status, ms: probe.ms });
           } else {
@@ -1138,10 +1309,15 @@ export async function startPanel(
       sendJson(res, 200, { ok: true, includeTunnel });
       setImmediate(() => {
         void (async () => {
-          if (includeTunnel && currentTunnel) {
-            await currentTunnel.stop().catch((error: unknown) => {
-              logWarn("panel.shutdown_tunnel_error", { err: (error as Error).message });
+          if (includeTunnel) {
+            await quickTunnel.stop().catch((error: unknown) => {
+              logWarn("panel.shutdown_quick_tunnel_error", { err: (error as Error).message });
             });
+            if (currentTunnel) {
+              await currentTunnel.stop().catch((error: unknown) => {
+                logWarn("panel.shutdown_tunnel_error", { err: (error as Error).message });
+              });
+            }
           } else if (currentTunnel) {
             currentTunnel.cancelPendingRestart();
           }
@@ -1190,6 +1366,7 @@ export async function startPanel(
     url: `http://${LISTEN_HOST}:${panelPort}`,
     async close() {
       currentTunnel?.cancelPendingRestart();
+      await quickTunnel.stop().catch(() => undefined);
       await new Promise<void>((resolve) => {
         server.close(() => resolve());
         server.closeAllConnections();

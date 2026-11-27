@@ -1,89 +1,72 @@
 # nexus-mcp
 
-给云端 AI（Gemini 自定义 MCP、ChatGPT 连接器）用的本地 MCP 服务，暴露 9 个工具：
+给云端 AI（Gemini 自定义 MCP、ChatGPT 连接器）用的本地 MCP 服务，暴露 9 个稳定工具：
 `read` / `write` / `edit` / `bash` / `glob` / `grep` / `job_start` / `job_output` / `job_kill`。
 
-装在 Windows 上，只监听 `127.0.0.1`，外面通过 cloudflared 隧道访问；隧道进程由自带控制面板启停和守护。
+装在 Windows 上，只监听 `127.0.0.1`，通过内置托盘宿主无黑框常驻，并在浏览器控制面板内提供三层公网接入渠道（单通道互斥）。
 
-## 装上就能用
+## 快速上手（3 步连上云端 AI）
 
-本地跑一次 `npm run package`，产物落在 `release/` 下，两个随便挑一个：
+前往 **[GitHub Releases](https://github.com/eggacheb/nexus-mcp/releases)** 下载最新版本，两个包任选其一（无需安装 Node.js 或 Rust）：
 
-- `nexus-mcp_0.1.0_x64-setup.exe` —— 安装包。双击，装到当前用户目录（不弹 UAC），装完桌面和开始菜单有快捷方式，卸载走「设置 → 应用」。
-- `nexus-mcp-0.1.0-win64.zip` —— 绿色版。解压到任意目录就能用。
+- **`nexus-mcp_<版本>_x64-setup.exe`**（推荐）—— Windows 安装包。双击按当前用户安装到 `%LOCALAPPDATA%\Programs\nexus-mcp`（不弹 UAC），自带桌面与开始菜单快捷方式，卸载走「设置 → 应用」。
+- **`nexus-mcp-<版本>-win64.zip`** —— 绿色便携版。解压到任意目录直接双击 `nexus-mcp.exe` 即可。
 
-**三步上手：**
+> **首次运行提示**：当前安装包未购买商业代码签名证书，Windows Defender SmartScreen 首次可能会拦截，点「**更多信息 → 仍要运行**」即可放行。发布页同时附带 `SHA256SUMS.txt` 供核对校验和。
 
-1. 双击桌面上的 `nexus-mcp`（或解压目录里的 `启动.cmd`），控制面板会在浏览器里打开。
-2. 面板「连接信息」里直接显示云端要填的 MCP 地址和令牌，点「复制地址+令牌」一次带走
-   （首次启动自动生成，同时打印在启动窗口里）。
-3. 云端填地址：Gemini 会跳到 OAuth 授权页，输入面板上的令牌批准即可；
-   ChatGPT 连接器等能自定义请求头的客户端用 Bearer 鉴权（`Authorization: Bearer <令牌>`）。
-   两条路并存，详见下面「鉴权」。
+### 第一步：安装并启动
 
-首次启动会在程序目录生成 `config.json` 和 `workspace/`（默认沙箱根）。卸载不会删这两个。
+安装完成界面默认勾选「**现在启动 nexus-mcp**」（平时也可直接双击桌面图标 `nexus-mcp`）。程序会无黑框常驻右下角系统托盘，待面板就绪后**自动在浏览器打开控制面板**（`http://127.0.0.1:8788`）。
 
-`bash` 与 `job_*` 需要机器上有 Git Bash（Git for Windows）；`read` / `write` / `edit` / `glob` / `grep`
-不依赖任何外部命令。`grep` 首次使用会下载一份固定版本的 ripgrep 到全局缓存。
+首次启动会在程序目录自动生成 `config.json`（含随机访问令牌）与默认沙箱根目录 `workspace/`。
+
+### 第二步：选一种公网接入渠道（单通道互斥）
+
+在面板「**隧道**」卡选择其中一种渠道（同一时刻仅激活一种，切换时自动停掉旧渠道）：
+
+| 渠道 | 适合场景 | 是否需买域名 | 特点 |
+|---|---|---|---|
+| **临时隧道**（Cloudflare Quick Tunnel） | 首次试用 / 1 分钟跑通 | 否 | 零账号、零配置；点击切换后按需下载固定校验版 `cloudflared.exe`，几秒获得 `https://*.trycloudflare.com`；**重启进程后会换域名** |
+| **Tailscale Funnel** | 零域名费长期使用 | 否 | 本机装好并登录 [Tailscale](https://tailscale.com/download) 后，面板一键开启即得永久固定 `https://<机名>.<tailnet>.ts.net`（无拦截页、无请求数硬上限）；账号首次使用按面板弹出的链接点一下启用即可 |
+| **Cloudflare 命名隧道** | 自有域名最稳方案 | 是 | 兼容既有 `~/.cloudflared/config.yml`，无流量/请求上限，支持 10 秒异常自动拉回；老用户已有 `tunnel` 配置时默认保持此渠道，绝不被本机 Tailscale 覆盖 |
+
+### 第三步：填进 Gemini / ChatGPT 连接器
+
+1. 在面板「**连接信息**」卡点「**复制地址+令牌**」。
+2. **Gemini 网页版自定义 MCP**：填入 `https://<公网地址>/mcp`，自动跳到 OAuth 授权页后输入面板上的令牌批准即可。
+3. **ChatGPT 连接器等支持自定义请求头的客户端**：填入相同地址，请求头带 `Authorization: Bearer <令牌>`。
+
+> `read` / `write` / `edit` / `glob` / `grep` 开箱即用（`grep` 首次自动下载固定校验版 ripgrep 到全局缓存）；`bash` 与 `job_*` 需要本机装有 [Git for Windows](https://git-scm.com/download/win)（或在面板「快捷设置」改用 PowerShell 7 `pwsh`）。
+
+## 托盘快捷操作与开机自启
+
+- **托盘状态灯**：绿灯（正常）、黄灯（启动/连接中或仅本机模式）、红灯（面板/服务异常）。
+- **右键菜单**：打开控制面板、重启服务、启停隧道、打开日志目录、勾选「**开机自启**」、安全退出（优雅停服并连同受管隧道一并关闭）。
+- **静默开机自启**：勾选「开机自启」会在当前用户启动文件夹创建带 `--minimized` 参数的 `nexus-mcp.lnk`，开机静默驻留托盘不弹浏览器；平时手动双击桌面图标则会自动弹出控制面板。
+
+## 升级与卸载
+
+- **覆盖升级**：直接双击新版 `nexus-mcp_<版本>_x64-setup.exe` 安装即可。安装器会先通过托盘控制端口优雅退出旧托盘（保隧道不断），超时再兜底清理，不会改动 `config.json`、`oauth-store.json`、`sessions-store.json` 与 `workspace/`。
+- **卸载**：走「设置 → 应用 → nexus-mcp」。卸载会优雅停服并清理程序文件、桌面/开始菜单快捷方式、开机自启 `.lnk` 与热切换残留，但**保留 `config.json`、`oauth-store.json`、`sessions-store.json` 与 `workspace/`**。
 
 ## 鉴权
 
-`token` 非空时两条路都开着：服务先比对静态 Bearer，不匹配再验 OAuth 2.1。
+`token` 非空时两条路并存：服务先比对静态 Bearer，不匹配再验 OAuth 2.1。
 
-- **OAuth 2.1**（Gemini 走这条）：连接器填 `https://<隧道域名>/mcp` 后自动发现授权端点，
-  浏览器打开授权页，输入 `config.json` 里的令牌批准即可。动态注册的客户端与
-  refresh token 落盘在 `config.json` 旁的 `oauth-store.json`，删掉它等于吊销所有已授权客户端。
+- **OAuth 2.1**（Gemini 走这条）：连接器填 `https://<公网地址>/mcp` 后自动发现授权端点，浏览器打开授权页输入 `config.json` 里的令牌批准即可。动态注册的客户端与 refresh token 落盘在 `config.json` 旁的 `oauth-store.json`，删掉它等于吊销所有已授权客户端。
 - **静态 Bearer**：能自定义请求头的客户端都能用，令牌就是面板上显示的那个。
 
-`token` 为空时服务不校验任何请求，仅限本机调试，别配着隧道用。
+`token` 为空时服务不校验任何请求，仅限本机调试，别配着公网隧道用。
 
 ## 控制面板
 
 面板独立监听 `8788`（`panelPort`，默认 `port + 1`），停服务时面板不掉线：
 
-- 三盏状态灯：执行器 / MCP 服务 / 隧道。隧道灯只看 cloudflared 的本地就绪连接数，
-  不看公网往返（为什么，见 `docs/tunnel.md`）。
-- 服务按钮：停止 / 启动 / 重启 / 重载配置。
-- 连接信息卡：MCP 地址、令牌显示与复制，外加 OAuth 授权入口。
-- 隧道卡（配了 `tunnel` 段才有）：公网地址、启动 / 停止隧道、检测可达性
-  （真实请求公网 `/health`，只影响这条显示，不影响灯）、pid 与日志尾行。
-- 根目录选择，保存即生效；可用工具卡（9 个）；最近 100 行日志。
-
-## 隧道
-
-- 服务在 MCP 端口上提供无鉴权的 `GET /health`，只报存活，可从公网访问。
-- 配置 `tunnel` 段后面板接管 cloudflared：进程异常退出 10 秒后自动拉回
-  （`tunnel.autoRestart: false` 关闭）；面板「停止隧道」不触发守护，想停就停得住。
-- 命令行兜底 `nexus-tunnel.cmd`：服务挂死时用它手动拉起；服务活着时 `nexus-tunnel stop`
-  会被守护 10 秒拉回，真停隧道走面板按钮。现行运维记录都在 `docs/tunnel.md`。
-
-## 开机自启（可选）
-
-安装包和绿色版**都不会**加开机自启。要的话，在
-`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup` 放一个 `nexus-mcp.vbs`：
-
-```vbs
-Set sh = CreateObject("WScript.Shell")
-sh.CurrentDirectory = "C:\Users\<你>\AppData\Local\Programs\nexus-mcp"
-sh.Run """C:\Users\<你>\AppData\Local\Programs\nexus-mcp\nexus-mcp.exe""", 0, False
-```
-
-结尾的 `0` 是隐藏窗口，`False` 是不等它退出。
-
-cloudflared 另有自己的一份开机自启（启动文件夹里的 `nexus-tunnel.vbs`），跟这份脚本互不相干。
-隧道守护跟随服务进程——服务没起时，隧道靠它自己的自启活着。现状见 `docs/tunnel.md`。
-
-**卸载程序不会删这个文件**（它只认自己装的东西）。卸载后记得手动删掉，否则每次开机都会弹一次找不到 exe 的报错。
-
-## 升级 / 换版本
-
-1. 先确认 8787 上没人监听：`Get-NetTCPConnection -LocalPort 8787 -State Listen`。
-   有输出说明还有旧进程，用 `OwningProcess` 那一列的 pid 结束它：`Stop-Process -Id <pid>`。
-2. 双击新的安装包装上。覆盖安装会自己 `taskkill` 掉 `nexus-mcp.exe` 和 `nexus-executor.exe`，
-   但**杀不掉开发态起的 `node dist/index.js`**——端口冲突就是这么来的。
-3. 重新启动服务。
-
-装完启动报 `EADDRINUSE: address already in use 127.0.0.1:8787`，就是第 1 步没清干净。
+- **三盏状态灯**：执行器 / MCP 服务 / 隧道（命名隧道灯只读 `127.0.0.1:20241/ready` 本地信号，不靠公网往返，详见 `docs/tunnel.md`）。
+- **服务控制**：停止 / 启动 / 重启 / 重载配置。
+- **连接信息卡**：自动跟随当前激活隧道渠道显示 MCP 地址、令牌与 OAuth 授权入口。
+- **隧道卡**：四态单通道切换（关闭 / 临时隧道 / Tailscale Funnel / 命名隧道）、一键启停与公网可达性探测。
+- **根目录与快捷设置**：可视化选目录、改 shell/超时/日志等级/命令闸门，保存即写回 `config.json`；可用工具卡（9 个）与最近日志（`GET http://127.0.0.1:8788/api/logs` 返回最近 200 行脱敏日志）。
 
 ## 配置
 
@@ -100,31 +83,24 @@ cloudflared 另有自己的一份开机自启（启动文件夹里的 `nexus-tun
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `transport` | `http` | `stdio` 给本机客户端；打包版 exe 加 `--stdio` 参数可无视配置强制 stdio |
+| `transport` | `http` | `stdio` 给本机客户端；打包版 `nexus-server.exe --stdio` 可无视配置强制 stdio |
 | `shell` | `auto` | `bash` / `job_*` 用的 shell，默认自动找 Git Bash，可指明 `pwsh`（PowerShell 7）；`powershell`（5.1）启动即报错 |
 | `commandPolicy` | 空 | 命令白/黑名单，见「命令闸门」 |
-| `tunnelUrl` | — | 隧道公网地址，配了面板才会去探测连通性 |
-| `tunnel` | — | cloudflared 管理段（路径 / 守护开关 / metrics 端口），配了面板才提供隧道启停 |
+| `tunnelMode` | 自动推导 | 激活的公网渠道：`none` / `quick` / `tailscale` / `named`（省略时有 `tunnel` 段推导为 `named`，否则 `none`） |
+| `tunnelUrl` | — | 命名隧道固定公网地址（切换其他渠道时不覆盖） |
+| `tailscaleUrl` | — | Tailscale Funnel 固定公网地址（由面板开启时自动写入） |
+| `tunnel` | — | Cloudflare 命名隧道管理段（路径 / 配置 / `autoStart` / `autoRestart` / `metricsPort`） |
 | `maxOutputBytes` / `defaultTimeoutMs` | 64KB / 120s | 单工具输出上限 / 单条命令默认超时 |
 
 字段全表与校验规则见 `src/config.ts`。
 
 ## 命令闸门
 
-`bash` 与 `job_start` 里的每条命令在 spawn 前过闸门（`crates/executor/src/command_policy.rs`），
-两个工具共用同一套判定与话术。三层判定顺序固定，**任一子命令被拒则整条命令拒绝**：
+`bash` 与 `job_start` 里的每条命令在 spawn 前过闸门（`crates/executor/src/command_policy.rs`），两个工具共用同一套判定与话术。三层判定顺序固定，**任一子命令被拒则整条命令拒绝**：
 
-1. **内置危险表**——无条件生效，不依赖用户配置，开箱即拦：
-   - `rm` 同时带递归（`-r`/`-R`/`--recursive`）与强制（`-f`/`--force`）标记（仅 git-bash）；
-   - `format`、`diskpart`、`reg delete`；
-   - `cmd /c` 内部的 `del`/`erase` 带 `/f`、`rd`/`rmdir` 带 `/s /q`（黏连运算符如 `echo hi&del` 会切开判定）；
-   - pwsh 下删除 cmdlet（`Remove-Item` 及别名 `rm`/`ri`/`del`/`erase`/`rd`/`rmdir`）与 `-Force` 同段出现；
-     显式 `pwsh -Command "..."` 包裹时，任何 shell 下都检查脚本内容。
-
-   拒绝话术附命中规则、原因与替代做法，可直接贴给模型。
+1. **内置危险表**——无条件生效，开箱即拦 `rm -rf`、`format`、`diskpart`、`reg delete`、`cmd /c del /f` / `rd /s /q`、pwsh `Remove-Item -Force` 等。
 2. **黑名单** `commandPolicy.deny`：通配模式，任一子命令命中即拒。
-3. **白名单** `commandPolicy.allow`：通配模式，非空即启用；每条子命令都必须命中，
-   没接住的按 `onUnmatched` 处理（默认 `deny`，改 `"allow"` 可放宽）。
+3. **白名单** `commandPolicy.allow`：通配模式，非空即启用；未命中按 `onUnmatched` 处理（默认 `deny`）。
 
 ```json
 "commandPolicy": {
@@ -134,65 +110,34 @@ cloudflared 另有自己的一份开机自启（启动文件夹里的 `nexus-tun
 }
 ```
 
-判定前的解析规则：
-
-- 顶层 `;` `&&` `||` `|` `&` 把命令拆成简单命令段，逐段判定；
-- `$( )`、反引号、进程替换、双引号内的替换体递归检查一层；`sudo`/`env` 前导与 `VAR=value`
-  赋值剥离后再判；`trap` 的 action 当 shell 源码递归；
-- **fail-closed**：引号/括号/反引号未闭合、命令名含变量或替换（首词带 `$`）、wrapper 嵌套
-  超过 8 层，一律拒绝，不猜。
-
-匹配细节：白/黑名单的匹配目标是「归一化后的可执行名 + 其余参数原样」——首词剥路径与盘符、
-ASCII 小写、去掉 `.exe`/`.cmd`/`.bat`/`.com` 后缀。模式里 `*` 匹配任意序列（含空格）、
-`?` 匹配单字符，`\` 与 `/` 等价，Windows 下大小写不敏感；模式以 `" *"` 结尾时裸命令
-（不带参数）也命中。
-
-已知局限（字面判定哲学）：只看命令字面量，看不见变量展开后的实际内容（动态命令名因此直接
-fail-closed）；管道把数据喂给危险命令（如 `cat list | xargs rm`）这类数据流不在字面判定范围内。
-
 闸门不绕沙箱：越出 `root` 的文件访问一律报错，不静默裁剪。
 
-## 分发
+## 开发与本地分发
 
 打包机需要 Rust 与 Node 24；目标机器什么都不用装。
 
 ```bash
-npm run package        # 约 25 秒：esbuild 打 CJS → SEA 注入 → zip → NSIS 安装包
-npm run package:smoke  # 拿刚出的产物在最小环境里自检：启动、连上、read、面板
+npm run build         # cargo build --release（执行器 + 托盘宿主），再 tsc
+npm run typecheck
+npm run test          # vitest，只走 MCP 客户端入口
+npm run test:rs       # Rust 侧（nexus-executor + nexus-tray）
+npm run smoke         # 起服务、列出工具、调一次 read
+npm run check         # build + vitest + cargo test + smoke，提交前必须全绿
+npm run package:stage # 仅产 build/package/ 最小三件套（供本机热切换）
+npm run package       # 产 release/ 下的 NSIS 安装包与绿色 zip
+npm run package:smoke # 在最小环境下验证打包产物
+npm run release -- 0.2.0           # 本地一键发布：同步版本号 → check → 打包 → SHA256SUMS → gh Draft Release（加 --publish 直发）
+node scripts/deploy-local.mjs # 本机一键热切换（保隧道不断，10 秒失败自动回滚）
 ```
 
-产物落在 `release/`（不进版本库），文件名里的版本号取自 `package.json`：
+产物落在 `release/`（不进版本库），文件名版本号取自 `package.json`：
 
 | 文件 | 说明 |
 |---|---|
-| `nexus-mcp_<版本>_x64-setup.exe` | NSIS 安装包，按用户装到 `%LOCALAPPDATA%\Programs\nexus-mcp`，桌面 + 开始菜单快捷方式，卸载入口进「应用和功能」 |
-| `nexus-mcp-<版本>-win64.zip` | 绿色版，四个文件平铺：`nexus-mcp.exe`、`nexus-executor.exe`、`启动.cmd`、`使用说明.txt` |
+| `nexus-mcp_<版本>_x64-setup.exe` | NSIS 安装包，含托盘三件套（`nexus-mcp.exe`、`nexus-server.exe`、`nexus-executor.exe`）与 `使用说明.txt` |
+| `nexus-mcp-<版本>-win64.zip` | 绿色便携版，相同四文件平铺 |
 
-发给别人之前要知道的：
-
-1. 都没有签名，SmartScreen 首次会拦一次（「更多信息 → 仍要运行」），企业策略可能直接拦掉。要正经发就得买代码签名证书。
-2. 两个 exe 必须在同一目录：`nexus-mcp.exe` 找不到 `nexus-executor.exe` 时，只有文件类工具能用，报错里会指出缺哪个文件。
-3. 覆盖安装会先 `taskkill` 掉正在跑的 `nexus-mcp.exe` / `nexus-executor.exe`（杀不掉开发态的 `node dist/index.js`，见「升级 / 换版本」）；卸载只删程序文件，`config.json`、`workspace` 和你自己加的开机自启脚本都留着。
-4. 第一次打包要联网取 NSIS 3.11（2.4MB，脚本里钉了 SHA-256 校验）；内网机器可以用 `NEXUS_NSIS_DIR` 指向已解压的 NSIS 目录跳过下载。
-5. 默认 MCP 端口 8787、面板 8788；目标机器上被占了就改 `config.json` 的 `port` / `panelPort`。
-
-## 开发
-
-```bash
-npm run build        # cargo build --release 构建执行器，再 tsc
-npm run typecheck
-npm run test         # vitest，只走 MCP 客户端入口
-npm run test:rs      # Rust 侧
-npm run smoke        # 起服务、列出工具、调一次 read
-npm run check        # build + vitest + cargo test + smoke，提交前必须全绿
-npm run package      # 出 release/ 下的 zip 与 NSIS 安装包
-npm run package:smoke # 在最小环境下验证打包产物（启动、连上、read、面板）
-```
-
-目录：`src/` TypeScript 侧（MCP 协议、工具、HTTP、面板、执行器客户端）、`crates/executor/` Rust 执行器、
-`scripts/` 自检与打包、`docs/research/` 调研笔记。
-
-动手前读 `AGENTS.md`（命令、禁忌、踩过的坑），调研结论在 `docs/research/`。
+目录：`src/` TypeScript 协议层、`crates/executor/` Rust 执行层、`crates/tray/` Rust 托盘宿主、`scripts/` 打包/热切换/发布、`docs/adr/` 架构决策记录。动手前读 `AGENTS.md` 与 `GLOSSARY.md`。
 
 ## 致谢
 

@@ -1,6 +1,9 @@
 import http from "node:http";
-import type { AppConfig } from "./config.js";
+import { effectiveTunnelMode } from "./config.js";
+import type { AppConfig, TunnelMode } from "./config.js";
 import { probeExecutorHandshake } from "./executor.js";
+import type { QuickTunnelInfo, QuickTunnelManager } from "./quickTunnel.js";
+import type { TailscaleInfo } from "./tailscale.js";
 import type { TunnelManager, TunnelProcessInfo } from "./tunnel.js";
 
 /** connecting = 进程在跑但还没连上 Cloudflare 边缘（黄灯，不是故障） */
@@ -12,12 +15,20 @@ export interface ComponentStatus {
   detail?: string;
 }
 
-/** 隧道状态：合成灯 + 公网地址 + 进程详情（pid、退出码、错误尾行） */
+/** 隧道状态：合成灯 + 激活渠道 + 公网地址 + 进程详情（pid、退出码、错误尾行） */
 export interface TunnelStatus extends ComponentStatus {
-  /** 公网地址（config.tunnelUrl） */
+  /** 当前激活的单通道模式 */
+  mode: TunnelMode;
+  /** 是否为临时域名（重启后会变） */
+  ephemeral?: boolean;
+  /** 公网地址（随激活渠道决定） */
   url?: string;
-  /** 隧道进程详情；未启用隧道管理（config.json 没有 tunnel 段）时没有这块 */
+  /** 命名隧道进程详情；未配置 tunnel 段时没有这块 */
   process?: TunnelProcessInfo;
+  /** 临时隧道运行态 */
+  quick?: QuickTunnelInfo;
+  /** Tailscale Funnel 检测与运行态 */
+  tailscale?: TailscaleInfo;
 }
 
 /** 执行器状态：真握手——临时起一个执行器进程发 ping，回得来才算在线，不做假绿灯 */
@@ -115,24 +126,143 @@ function probeMetrics(port: number): Promise<MetricsProbe> {
 }
 
 /** 手动「检测可达性」：一次性公网探测。状态灯不走它，用户可以随时点一次看链路真实往返 */
-export async function probePublicTunnel(config: AppConfig): Promise<ProbeResult> {
-  if (!config.tunnelUrl?.trim()) return { ok: false, error: "config.json 里没有 tunnelUrl" };
-  return probeEndpoint(config.tunnelUrl);
+export async function probePublicTunnel(config: AppConfig, overrideUrl?: string): Promise<ProbeResult> {
+  const target = (overrideUrl ?? config.tunnelUrl)?.trim();
+  if (!target) return { ok: false, error: "当前没有可用的公网隧道地址" };
+  return probeEndpoint(target);
 }
 
 /**
- * 隧道状态：以 cloudflared 本地 metrics 的就绪连接为主信号。
- * 公网往返会被系统代理和链路抖动带偏（实测 0.9-3.5 秒波动），不再驱动状态灯。
+ * 隧道状态：按当前激活的单通道模式分别判定，保证状态灯与渠道一致。
+ * 命名隧道继续以 cloudflared 本地 metrics 的就绪连接为主信号（见 docs/tunnel.md 注 2）。
  */
-export async function tunnelStatus(config: AppConfig, tunnel?: TunnelManager): Promise<TunnelStatus> {
-  const url = config.tunnelUrl?.trim() || undefined;
-  const base = url ? { url } : {};
+export async function tunnelStatus(
+  config: AppConfig,
+  tunnel?: TunnelManager,
+  quickTunnel?: QuickTunnelManager,
+  tailscaleInfo?: TailscaleInfo,
+): Promise<TunnelStatus> {
+  const mode = effectiveTunnelMode(config);
+  const namedUrl = config.tunnelUrl?.trim() || undefined;
+  const quickInfo = quickTunnel?.status();
+
+  if (mode === "none") {
+    return {
+      mode,
+      ...(namedUrl ? { url: namedUrl } : {}),
+      ...(quickInfo ? { quick: quickInfo } : {}),
+      ...(tailscaleInfo ? { tailscale: tailscaleInfo } : {}),
+      state: "unconfigured",
+      label: namedUrl ? "未启用管理" : "未开启",
+      detail: namedUrl
+        ? "config.json 加 tunnel 段或切换上方渠道，面板才能管理并验证隧道连通性"
+        : "当前仅本机可访问，可在下方选择一种公网隧道渠道一键开启",
+    };
+  }
+
+  if (mode === "tailscale") {
+    const ts = tailscaleInfo;
+    const tsUrl = ts?.url ?? config.tailscaleUrl?.trim() ?? undefined;
+    if (ts?.approvalUrl) {
+      return {
+        mode,
+        ...(tsUrl ? { url: tsUrl } : {}),
+        tailscale: ts,
+        state: "connecting",
+        label: "待授权",
+        detail: "请先在 Tailscale 后台点一下启用 Funnel，再点「启动隧道」",
+      };
+    }
+    if (ts && !ts.installed) {
+      return {
+        mode,
+        tailscale: ts,
+        state: "unavailable",
+        label: "未安装",
+        detail: "未检测到 Tailscale，请先安装并登录客户端",
+      };
+    }
+    if (ts && !ts.loggedIn) {
+      return {
+        mode,
+        tailscale: ts,
+        state: "unavailable",
+        label: "未登录",
+        detail: ts.error ?? "Tailscale 客户端尚未登录",
+      };
+    }
+    if (ts?.funnelActive && tsUrl) {
+      return {
+        mode,
+        url: tsUrl,
+        tailscale: ts,
+        state: "up",
+        label: "Funnel 在线",
+        detail: "Tailscale Funnel 固定域名",
+      };
+    }
+    return {
+      mode,
+      ...(tsUrl ? { url: tsUrl } : {}),
+      ...(ts ? { tailscale: ts } : {}),
+      state: "down",
+      label: "未开启",
+      detail: ts?.error ?? "Tailscale Funnel 未开启，点「启动隧道」一键启用",
+    };
+  }
+
+  if (mode === "quick") {
+    const q = quickInfo ?? { running: false, downloading: false };
+    if (q.downloading) {
+      return {
+        mode,
+        ephemeral: true,
+        quick: q,
+        state: "connecting",
+        label: "下载中",
+        detail: "正在按需下载并校验 cloudflared.exe…",
+      };
+    }
+    if (q.running && q.url) {
+      return {
+        mode,
+        ephemeral: true,
+        url: q.url,
+        quick: q,
+        state: "up",
+        label: "临时在线",
+        detail: "临时域名，重启后会变更",
+      };
+    }
+    if (q.running) {
+      return {
+        mode,
+        ephemeral: true,
+        quick: q,
+        state: "connecting",
+        label: "连接中",
+        detail: "正在向 Cloudflare 申请临时域名…",
+      };
+    }
+    return {
+      mode,
+      ephemeral: true,
+      quick: q,
+      state: "down",
+      label: "已停止",
+      detail: q.error ?? "临时隧道未运行",
+    };
+  }
+
+  const base = namedUrl ? { url: namedUrl } : {};
 
   if (!tunnel) {
     // 没有 tunnel 段就拿不到本地就绪连接，只能承认「验不了」。
     // 不退回公网往返：那条路绕代理、会抖，拿来点灯就是假红。
     return {
+      mode,
       ...base,
+      ...(quickInfo ? { quick: quickInfo } : {}),
       state: "unconfigured",
       label: "未启用管理",
       detail: "config.json 加 tunnel 段，面板才能在这里验证隧道连通性",
@@ -140,7 +270,7 @@ export async function tunnelStatus(config: AppConfig, tunnel?: TunnelManager): P
   }
 
   const proc = await tunnel.status();
-  const withProcess = { ...base, process: proc };
+  const withProcess = { mode, ...base, process: proc, ...(quickInfo ? { quick: quickInfo } : {}) };
 
   // 配置错误先说清楚：路径失效时即便端口上有服务，用户点「启动隧道」也一定会失败
   if (proc.exeMissing) {

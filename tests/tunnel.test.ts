@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -601,4 +602,485 @@ describe("隧道随服务自启与协议层优雅全停入口", () => {
     },
     25_000,
   );
+});
+
+describe("临时隧道与单通道模式", () => {
+  const QUICK_STUB_SOURCE = `
+const args = process.argv.slice(2);
+const urlIdx = args.indexOf("--url");
+const target = urlIdx >= 0 ? args[urlIdx + 1] : "";
+console.error("INF +--------------------------------------------------------------------------------------------+");
+console.error("INF |  Your quick Tunnel has been created! Visit it at (it may take some time to be reachable):  |");
+console.error("INF |  https://demo-quick-test.trycloudflare.com                                                 |");
+console.error("INF +--------------------------------------------------------------------------------------------+");
+console.error("INF target=" + target);
+setInterval(() => {}, 1000);
+`;
+
+  function startMockDownloadServer(payload: Buffer): Promise<{ url: string; close(): Promise<void> }> {
+    return new Promise((resolve, reject) => {
+      const srv = http.createServer((_req, res) => {
+        res.writeHead(200, { "Content-Type": "application/octet-stream" });
+        res.end(payload);
+      });
+      srv.once("error", reject);
+      srv.listen(0, "127.0.0.1", () => {
+        const addr = srv.address();
+        const port = typeof addr === "object" && addr ? addr.port : 0;
+        resolve({
+          url: `http://127.0.0.1:${port}/cloudflared.exe`,
+          close: () =>
+            new Promise<void>((done) => {
+              srv.close(() => done());
+              srv.closeAllConnections();
+            }),
+        });
+      });
+    });
+  }
+
+  function isPidAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  it("未配置 tunnel 段时默认 tunnelMode=none，已有 tunnel 段时向后兼容推导为 named", async () => {
+    const serverNone = await startServer({ token: TOKEN });
+    try {
+      const statusNone = (await (await fetch(`${serverNone.panelUrl}/api/status`)).json()) as {
+        tunnel: { mode?: string; state: string };
+      };
+      expect(statusNone.tunnel.mode).toBe("none");
+      expect(statusNone.tunnel.state).toBe("unconfigured");
+    } finally {
+      await serverNone.stop();
+    }
+
+    const workDir = mkdtempSync(path.join(os.tmpdir(), "nexus-mode-named-"));
+    const cfgPath = path.join(workDir, "config.yml");
+    writeFileSync(cfgPath, "tunnel: stub\n", "utf8");
+    const serverNamed = await startServer({
+      token: TOKEN,
+      tunnelUrl: "https://fixed.example.com",
+      tunnel: {
+        cloudflaredPath: process.execPath,
+        configPath: cfgPath,
+        autoStart: false,
+        autoRestart: false,
+      },
+    });
+    try {
+      const statusNamed = (await (await fetch(`${serverNamed.panelUrl}/api/status`)).json()) as {
+        tunnel: { mode?: string; url?: string };
+      };
+      expect(statusNamed.tunnel.mode).toBe("named");
+      expect(statusNamed.tunnel.url).toBe("https://fixed.example.com");
+    } finally {
+      await serverNamed.stop();
+      rmSync(workDir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("按需下载 cloudflared：SHA-256 不符时拒绝且不留脏文件，匹配时缓存并拉起临时隧道回填连接信息", async () => {
+    const workDir = mkdtempSync(path.join(os.tmpdir(), "nexus-quick-dl-"));
+    const cacheDir = path.join(workDir, "bin");
+    const stubPath = path.join(workDir, "quick-stub.cjs");
+    writeFileSync(stubPath, QUICK_STUB_SOURCE, "utf8");
+
+    const fakePayload = Buffer.from("fake-cloudflared-binary-payload-v1");
+    const goodSha = createHash("sha256").update(fakePayload).digest("hex");
+    const badSha = "0".repeat(64);
+    const mockDl = await startMockDownloadServer(fakePayload);
+
+    // 1. 哈希不符：拒绝且缓存目录无文件
+    const badServer = await startServer({
+      token: TOKEN,
+      env: {
+        NEXUS_CLOUDFLARED_SKIP_SYSTEM: "1",
+        NEXUS_CLOUDFLARED_CACHE_DIR: cacheDir,
+        NEXUS_CLOUDFLARED_DOWNLOAD_URL: mockDl.url,
+        NEXUS_CLOUDFLARED_SHA256: badSha,
+        NEXUS_QUICK_TUNNEL_STUB: stubPath,
+      },
+    });
+    try {
+      const res = await fetch(`${badServer.panelUrl}/api/tunnel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "mode", mode: "quick" }),
+      });
+      expect(res.status).toBe(500);
+      const body = (await res.json()) as { error?: string };
+      expect(body.error).toContain("校验和");
+      expect(existsSync(path.join(cacheDir, "cloudflared.exe"))).toBe(false);
+    } finally {
+      await badServer.stop();
+    }
+
+    // 2. 哈希匹配：下载缓存并拉起临时隧道，回填 status 与 credentials
+    const okServer = await startServer({
+      token: TOKEN,
+      env: {
+        NEXUS_CLOUDFLARED_SKIP_SYSTEM: "1",
+        NEXUS_CLOUDFLARED_CACHE_DIR: cacheDir,
+        NEXUS_CLOUDFLARED_DOWNLOAD_URL: mockDl.url,
+        NEXUS_CLOUDFLARED_SHA256: goodSha,
+        NEXUS_QUICK_TUNNEL_STUB: stubPath,
+      },
+    });
+    let quickPid = 0;
+    try {
+      const res = await fetch(`${okServer.panelUrl}/api/tunnel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "mode", mode: "quick" }),
+      });
+      expect(res.status).toBe(200);
+      expect(existsSync(path.join(cacheDir, "cloudflared.exe"))).toBe(true);
+
+      const status = (await res.json()) as {
+        tunnel: {
+          mode: string;
+          state: string;
+          url?: string;
+          ephemeral?: boolean;
+          quick?: { running: boolean; pid?: number; url?: string };
+        };
+      };
+      expect(status.tunnel.mode).toBe("quick");
+      expect(status.tunnel.state).toBe("up");
+      expect(status.tunnel.ephemeral).toBe(true);
+      expect(status.tunnel.url).toBe("https://demo-quick-test.trycloudflare.com");
+      quickPid = status.tunnel.quick?.pid ?? 0;
+      expect(quickPid).toBeGreaterThan(0);
+
+      const creds = (await (await fetch(`${okServer.panelUrl}/api/credentials`)).json()) as {
+        publicUrl: string;
+        tunnelMode?: string;
+        ephemeral?: boolean;
+      };
+      expect(creds.publicUrl).toBe("https://demo-quick-test.trycloudflare.com/mcp");
+      expect(creds.tunnelMode).toBe("quick");
+      expect(creds.ephemeral).toBe(true);
+
+      // includeTunnel=true 退出时清理临时隧道进程，不留孤儿
+      const shutdownRes = await fetch(`${okServer.panelUrl}/api/shutdown`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ includeTunnel: true }),
+      });
+      expect(shutdownRes.status).toBe(200);
+      await waitFor(() => !isPidAlive(quickPid), 6_000);
+    } finally {
+      if (quickPid > 0 && isPidAlive(quickPid)) {
+        try {
+          process.kill(quickPid);
+        } catch {
+          // ignore
+        }
+      }
+      await okServer.stop().catch(() => undefined);
+      await mockDl.close();
+      rmSync(workDir, { recursive: true, force: true });
+    }
+  }, 25_000);
+
+  it("命名隧道切到临时隧道再切回命名隧道：先停旧渠道且不丢失原有固定 tunnelUrl", async () => {
+    const workDir = mkdtempSync(path.join(os.tmpdir(), "nexus-mode-switch-"));
+    const namedStubPath = path.join(workDir, "named-stub.cjs");
+    const quickStubPath = path.join(workDir, "quick-stub.cjs");
+    const cfgPath = path.join(workDir, "config.yml");
+    writeFileSync(namedStubPath, STUB_SOURCE, "utf8");
+    writeFileSync(quickStubPath, QUICK_STUB_SOURCE, "utf8");
+    writeFileSync(cfgPath, "tunnel: stub\n", "utf8");
+
+    const server = await startServer({
+      token: TOKEN,
+      tunnelUrl: "https://fixed.example.com",
+      tunnelStubPath: namedStubPath,
+      tunnel: {
+        cloudflaredPath: process.execPath,
+        configPath: cfgPath,
+        autoStart: true,
+        autoRestart: false,
+      },
+      env: {
+        NEXUS_QUICK_TUNNEL_STUB: quickStubPath,
+        NEXUS_QUICK_TUNNEL_EXE: process.execPath,
+      },
+    });
+    let quickPid = 0;
+    try {
+      const initial = (await (await fetch(`${server.panelUrl}/api/status`)).json()) as {
+        tunnel: { mode: string; process?: { running: boolean; pid?: number } };
+      };
+      expect(initial.tunnel.mode).toBe("named");
+      const namedPid = initial.tunnel.process?.pid ?? 0;
+      expect(namedPid).toBeGreaterThan(0);
+
+      // 切到临时隧道：旧命名隧道应被停止
+      const toQuick = await fetch(`${server.panelUrl}/api/tunnel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "mode", mode: "quick" }),
+      });
+      expect(toQuick.status).toBe(200);
+      const quickStatus = (await toQuick.json()) as {
+        tunnel: { mode: string; url?: string; quick?: { pid?: number } };
+      };
+      expect(quickStatus.tunnel.mode).toBe("quick");
+      expect(quickStatus.tunnel.url).toBe("https://demo-quick-test.trycloudflare.com");
+      quickPid = quickStatus.tunnel.quick?.pid ?? 0;
+      await waitFor(() => !isPidAlive(namedPid), 5_000);
+
+      // 切回命名隧道：临时隧道停止，原有固定 tunnelUrl 完好无损
+      const toNamed = await fetch(`${server.panelUrl}/api/tunnel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "mode", mode: "named" }),
+      });
+      expect(toNamed.status).toBe(200);
+      const namedStatus = (await toNamed.json()) as {
+        tunnel: { mode: string; url?: string };
+      };
+      expect(namedStatus.tunnel.mode).toBe("named");
+      expect(namedStatus.tunnel.url).toBe("https://fixed.example.com");
+      await waitFor(() => !isPidAlive(quickPid), 5_000);
+
+      const saved = JSON.parse(readFileSync(server.configPath, "utf8")) as {
+        tunnelMode?: string;
+        tunnelUrl?: string;
+      };
+      expect(saved.tunnelMode).toBe("named");
+      expect(saved.tunnelUrl).toBe("https://fixed.example.com");
+    } finally {
+      if (quickPid > 0 && isPidAlive(quickPid)) {
+        try {
+          process.kill(quickPid);
+        } catch {
+          // ignore
+        }
+      }
+      await server.stop().catch(() => undefined);
+      rmSync(workDir, { recursive: true, force: true });
+    }
+  }, 25_000);
+});
+
+describe("Tailscale Funnel 与四态单通道互斥", () => {
+  const TAILSCALE_STUB_SOURCE = `
+const fs = require("fs");
+const args = process.argv.slice(2);
+const logFile = process.env.NEXUS_TS_LOG_FILE;
+const stateFile = process.env.NEXUS_TS_STATE_FILE;
+if (logFile) fs.appendFileSync(logFile, args.join(" ") + "\\n");
+
+function readState() {
+  if (!stateFile || !fs.existsSync(stateFile)) return { loggedIn: true, needApproval: false, activePort: null };
+  return JSON.parse(fs.readFileSync(stateFile, "utf8"));
+}
+function writeState(next) {
+  if (stateFile) fs.writeFileSync(stateFile, JSON.stringify(next));
+}
+
+const st = readState();
+if (args[0] === "status" && args.includes("--json")) {
+  if (!st.loggedIn) {
+    console.log(JSON.stringify({ BackendState: "NeedsLogin", Self: { DNSName: "" } }));
+  } else {
+    console.log(JSON.stringify({ BackendState: "Running", Self: { DNSName: "my-pc.tail1234.ts.net." } }));
+  }
+  process.exit(0);
+}
+if (args[0] === "funnel" && args[1] === "status") {
+  if (st.activePort) {
+    console.log(JSON.stringify({
+      AllowFunnel: { "my-pc.tail1234.ts.net:443": true },
+      Web: { "my-pc.tail1234.ts.net:443": { Handlers: { "/": { Proxy: "http://127.0.0.1:" + st.activePort } } } }
+    }));
+  } else {
+    console.log(JSON.stringify({}));
+  }
+  process.exit(0);
+}
+if (args[0] === "funnel" && args.includes("--bg")) {
+  if (st.needApproval) {
+    console.error("Funnel is not enabled on your tailnet.");
+    console.error("To enable, visit: https://login.tailscale.com/f/funnel?node=n123456");
+    process.exit(1);
+  }
+  const port = args[args.length - 1];
+  st.activePort = Number(port) || 8787;
+  writeState(st);
+  console.log("Available on the internet: https://my-pc.tail1234.ts.net/");
+  process.exit(0);
+}
+if (args[0] === "funnel" && args.includes("off")) {
+  st.activePort = null;
+  writeState(st);
+  console.log("Funnel disabled");
+  process.exit(0);
+}
+process.exit(0);
+`;
+
+  const QUICK_STUB_SOURCE = `
+console.error("INF https://switch-quick.trycloudflare.com");
+setInterval(() => {}, 1000);
+`;
+
+  function isPidAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  it("老用户已配命名隧道且本机已登录 Tailscale：默认保持 named，不自动启用或覆盖 tunnelUrl", async () => {
+    const workDir = mkdtempSync(path.join(os.tmpdir(), "nexus-ts-compat-"));
+    const tsStub = path.join(workDir, "ts-stub.cjs");
+    const tsLog = path.join(workDir, "ts.log");
+    const tsState = path.join(workDir, "ts-state.json");
+    const cfgPath = path.join(workDir, "config.yml");
+    writeFileSync(tsStub, TAILSCALE_STUB_SOURCE, "utf8");
+    writeFileSync(tsState, JSON.stringify({ loggedIn: true, needApproval: false, activePort: null }), "utf8");
+    writeFileSync(cfgPath, "tunnel: stub\n", "utf8");
+
+    const server = await startServer({
+      token: TOKEN,
+      tunnelUrl: "https://cf-fixed.example.com",
+      tunnel: {
+        cloudflaredPath: process.execPath,
+        configPath: cfgPath,
+        autoStart: false,
+        autoRestart: false,
+      },
+      env: {
+        NEXUS_TAILSCALE_STUB: tsStub,
+        NEXUS_TS_LOG_FILE: tsLog,
+        NEXUS_TS_STATE_FILE: tsState,
+      },
+    });
+    try {
+      const status = (await (await fetch(`${server.panelUrl}/api/status`)).json()) as {
+        tunnel: { mode: string; url?: string };
+      };
+      expect(status.tunnel.mode).toBe("named");
+      expect(status.tunnel.url).toBe("https://cf-fixed.example.com");
+      expect(existsSync(tsLog)).toBe(false);
+    } finally {
+      await server.stop();
+      rmSync(workDir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("Tailscale Funnel 首次授权链接引导、一键开启回填，以及与临时隧道的单通道互斥切换", async () => {
+    const workDir = mkdtempSync(path.join(os.tmpdir(), "nexus-ts-switch-"));
+    const tsStub = path.join(workDir, "ts-stub.cjs");
+    const tsLog = path.join(workDir, "ts.log");
+    const tsState = path.join(workDir, "ts-state.json");
+    const quickStub = path.join(workDir, "quick-stub.cjs");
+    writeFileSync(tsStub, TAILSCALE_STUB_SOURCE, "utf8");
+    writeFileSync(tsState, JSON.stringify({ loggedIn: true, needApproval: true, activePort: null }), "utf8");
+    writeFileSync(quickStub, QUICK_STUB_SOURCE, "utf8");
+
+    const server = await startServer({
+      token: TOKEN,
+      tunnelUrl: "https://cf-fixed.example.com",
+      env: {
+        NEXUS_TAILSCALE_STUB: tsStub,
+        NEXUS_TS_LOG_FILE: tsLog,
+        NEXUS_TS_STATE_FILE: tsState,
+        NEXUS_QUICK_TUNNEL_STUB: quickStub,
+        NEXUS_QUICK_TUNNEL_EXE: process.execPath,
+      },
+    });
+    let quickPid = 0;
+    try {
+      // 1. 首次开启触发授权链接引导
+      const firstRes = await fetch(`${server.panelUrl}/api/tunnel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "mode", mode: "tailscale" }),
+      });
+      expect(firstRes.status).toBe(200);
+      const firstBody = (await firstRes.json()) as {
+        tunnel: { mode: string; state: string; tailscale?: { approvalUrl?: string } };
+      };
+      expect(firstBody.tunnel.mode).toBe("tailscale");
+      expect(firstBody.tunnel.state).toBe("connecting");
+      expect(firstBody.tunnel.tailscale?.approvalUrl).toBe("https://login.tailscale.com/f/funnel?node=n123456");
+
+      // 2. 模拟用户在后台点完授权后再点一键开启
+      writeFileSync(tsState, JSON.stringify({ loggedIn: true, needApproval: false, activePort: null }), "utf8");
+      const enableRes = await fetch(`${server.panelUrl}/api/tunnel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "start" }),
+      });
+      expect(enableRes.status).toBe(200);
+      const enabledBody = (await enableRes.json()) as {
+        tunnel: { mode: string; state: string; url?: string };
+      };
+      expect(enabledBody.tunnel.state).toBe("up");
+      expect(enabledBody.tunnel.url).toBe("https://my-pc.tail1234.ts.net");
+
+      const creds = (await (await fetch(`${server.panelUrl}/api/credentials`)).json()) as {
+        publicUrl: string;
+        tunnelMode: string;
+      };
+      expect(creds.publicUrl).toBe("https://my-pc.tail1234.ts.net/mcp");
+      expect(creds.tunnelMode).toBe("tailscale");
+
+      // config.json 原有 tunnelUrl 未被覆盖
+      const saved = JSON.parse(readFileSync(server.configPath, "utf8")) as {
+        tunnelUrl?: string;
+        tailscaleUrl?: string;
+      };
+      expect(saved.tunnelUrl).toBe("https://cf-fixed.example.com");
+      expect(saved.tailscaleUrl).toBe("https://my-pc.tail1234.ts.net");
+
+      // 3. 从 tailscale 切换到 quick：必须先执行 tailscale funnel --https=443 off
+      const toQuick = await fetch(`${server.panelUrl}/api/tunnel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "mode", mode: "quick" }),
+      });
+      expect(toQuick.status).toBe(200);
+      const quickBody = (await toQuick.json()) as {
+        tunnel: { mode: string; url?: string; quick?: { pid?: number } };
+      };
+      expect(quickBody.tunnel.mode).toBe("quick");
+      expect(quickBody.tunnel.url).toBe("https://switch-quick.trycloudflare.com");
+      quickPid = quickBody.tunnel.quick?.pid ?? 0;
+      expect(quickPid).toBeGreaterThan(0);
+      const logText = readFileSync(tsLog, "utf8");
+      expect(logText).toContain("funnel --https=443 off");
+
+      // 4. 从 quick 切回 tailscale：临时隧道进程必须退出
+      const backToTs = await fetch(`${server.panelUrl}/api/tunnel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "mode", mode: "tailscale" }),
+      });
+      expect(backToTs.status).toBe(200);
+      await waitFor(() => !isPidAlive(quickPid), 5_000);
+    } finally {
+      if (quickPid > 0 && isPidAlive(quickPid)) {
+        try {
+          process.kill(quickPid);
+        } catch {
+          // ignore
+        }
+      }
+      await server.stop().catch(() => undefined);
+      rmSync(workDir, { recursive: true, force: true });
+    }
+  }, 25_000);
 });

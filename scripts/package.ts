@@ -1,8 +1,9 @@
 /**
- * 打发布包：Node SEA 单文件 exe + 执行器 + 启动脚本 + 说明，收成 zip，再用 NSIS 做安装包。
+ * 打发布包：托盘宿主 + Node SEA 协议层 + Rust 执行器 + 使用说明，收成 zip，再用 NSIS 做安装包。
  *
- * 前置：`npm run build` 过（dist/index.js 与 crates/target/release/nexus-executor.exe 都在）。
- * 用法：`npm run package`。NSIS 首次会从 Tauri 的发布地址取 3.11 的 zip（校验 SHA-256 后才用），
+ * 前置：`npm run build` 过（dist/index.js 与 crates/target/release/nexus-{mcp,executor}.exe 都在）。
+ * 用法：`npm run package`（全量）或 `npm run package:stage`（最小三件套）。
+ * NSIS 首次会从 Tauri 的发布地址取 3.11 的 zip（校验 SHA-256 后才用），
  * 已有解压好的可设 NEXUS_NSIS_DIR 指过去，跳过下载。
  */
 import { execFileSync } from "node:child_process";
@@ -139,14 +140,17 @@ function writeRuntimeFiles(): void {
     [
       `${APP_NAME} ${VERSION} —— 三步上手`,
       "",
-      `1. 双击「${TRAY_EXE}」，程序无黑框驻留到右下角系统托盘（再次双击直接打开控制面板）。`,
-      "2. 双击托盘图标或右键选「打开控制面板」，复制「连接信息」里的 MCP 地址和令牌。",
-      "3. 把地址和令牌填进 Gemini 自定义 MCP / ChatGPT 连接器，就能调 read / write / edit /",
-      "   bash / glob / grep / job_start / job_output / job_kill 这 9 个工具。",
+      `1. 双击「${TRAY_EXE}」，程序无黑框常驻右下角系统托盘，并在控制面板就绪后自动在浏览器打开。`,
+      "2. 在面板「隧道」卡选一种公网接入渠道（单通道互斥）：",
+      "   - 临时隧道：零账号一键开启（首次按需下载校验版 cloudflared），几秒拿到公网地址，适合立刻体验（重启换域名）；",
+      "   - Tailscale Funnel：装好并登录 Tailscale 后一键开启，零域名费获得永久固定 *.ts.net 地址；",
+      "   - Cloudflare 命名隧道：自有域名最稳方案，兼容已有 config.yml。",
+      "3. 在面板「连接信息」复制 MCP 地址和令牌，填进 Gemini 自定义 MCP / ChatGPT 连接器，",
+      "   即可使用 read / write / edit / bash / glob / grep / job_start / job_output / job_kill 这 9 个工具。",
       "",
-      "快捷操作：右键右下角托盘图标可重启服务、启停隧道、打开日志目录、勾选「开机自启」或安全退出（连同隧道一并停止）。",
+      "快捷操作：右键右下角托盘图标可打开面板、重启服务、启停隧道、打开日志目录、勾选「开机自启」（静默启动）或安全退出。",
       "改沙箱根目录：面板「根目录」点「选择…」挑文件夹，或直接改 config.json 的 root。默认是 exe 同目录的 workspace。",
-      "卸载：设置 → 应用 → nexus-mcp。config.json、oauth-store.json 与 workspace 不会被删。",
+      "卸载：设置 → 应用 → nexus-mcp。卸载会清理开机自启快捷方式，但保留 config.json、oauth-store.json 与 workspace。",
       "",
     ].join("\r\n"),
     "utf8",

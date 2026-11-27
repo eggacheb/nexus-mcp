@@ -13,6 +13,8 @@ use std::os::windows::process::CommandExt;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 pub const SHORTCUT_NAME: &str = "nexus-mcp.lnk";
+/// 开机自启快捷方式附带静默参数，避免开机自动弹出浏览器面板
+pub const AUTOSTART_ARGS: &str = "--minimized";
 
 /// 解析当前用户启动文件夹；允许 NEXUS_TRAY_STARTUP_DIR 覆盖以便测试隔离。
 pub fn startup_dir() -> io::Result<PathBuf> {
@@ -71,6 +73,7 @@ fn create_windows_shortcut(lnk: &Path, target_exe: &Path) -> io::Result<()> {
         "$ws = New-Object -ComObject WScript.Shell; \
          $sc = $ws.CreateShortcut('{lnk_str}'); \
          $sc.TargetPath = '{target_str}'; \
+         $sc.Arguments = '{AUTOSTART_ARGS}'; \
          $sc.WorkingDirectory = '{workdir_str}'; \
          $sc.Save()"
     );
@@ -93,7 +96,8 @@ fn create_windows_shortcut(lnk: &Path, target_exe: &Path) -> io::Result<()> {
     };
 
     let output = match run("pwsh.exe") {
-        Ok(out) => out,
+        Ok(out) if out.status.success() => out,
+        Ok(_) => run("powershell.exe")?,
         Err(err) if err.kind() == io::ErrorKind::NotFound => run("powershell.exe")?,
         Err(err) => return Err(err),
     };
@@ -134,7 +138,29 @@ mod tests {
         assert!(!is_enabled_in(&dir));
         set_enabled_in(&dir, &fake_exe, true).expect("应成功创建快捷方式");
         assert!(is_enabled_in(&dir));
-        assert!(shortcut_path(&dir).metadata().unwrap().len() > 0);
+        let lnk = shortcut_path(&dir);
+        assert!(lnk.metadata().unwrap().len() > 0);
+
+        #[cfg(windows)]
+        {
+            let lnk_str = escape_ps_single(&lnk.to_string_lossy());
+            let read_script = format!(
+                "$ws = New-Object -ComObject WScript.Shell; \
+                 Write-Output $ws.CreateShortcut('{lnk_str}').Arguments"
+            );
+            let out = match Command::new("pwsh.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &read_script])
+                .output()
+            {
+                Ok(out) if out.status.success() => out,
+                _ => Command::new("powershell.exe")
+                    .args(["-NoProfile", "-NonInteractive", "-Command", &read_script])
+                    .output()
+                    .expect("读取快捷方式参数"),
+            };
+            assert!(out.status.success());
+            assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), AUTOSTART_ARGS);
+        }
 
         set_enabled_in(&dir, &fake_exe, false).expect("应成功删除快捷方式");
         assert!(!is_enabled_in(&dir));

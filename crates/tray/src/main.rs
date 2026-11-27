@@ -280,6 +280,25 @@ fn main() {
     )
     .ok();
 
+    let minimized = env::args().any(|a| a == "--minimized");
+    if !minimized {
+        let panel_port = spec.panel_port;
+        let stop_flag = Arc::clone(&stop_poller);
+        thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            while std::time::Instant::now() < deadline && !stop_flag.load(Ordering::Relaxed) {
+                if matches!(
+                    http_client::get(panel_port, "/api/status", Duration::from_secs(2)),
+                    Ok(resp) if resp.status == 200
+                ) {
+                    open_panel_url(panel_port);
+                    return;
+                }
+                thread::sleep(Duration::from_millis(150));
+            }
+        });
+    }
+
     let headless_mode = env::var("NEXUS_TRAY_HEADLESS").ok();
     if matches!(headless_mode.as_deref(), Some("1") | Some("detached")) {
         let watch_stdin = headless_mode.as_deref() == Some("1");

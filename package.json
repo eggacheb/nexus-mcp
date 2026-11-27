@@ -1,6 +1,6 @@
 {
   "name": "nexus-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Minimal MCP server exposing local filesystem and shell tools to web AI clients",
@@ -18,6 +18,7 @@
     "package:stage": "npm run build && tsx scripts/package.ts --stage-only",
     "package": "npm run build && tsx scripts/package.ts",
     "package:smoke": "tsx scripts/smoke-package.ts",
+    "release": "node scripts/release.mjs",
     "check": "npm run build && npm run test && npm run test:rs && npm run smoke"
   },
   "dependencies": {
