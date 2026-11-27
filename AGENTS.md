@@ -43,7 +43,7 @@
 - 路径一律相对沙箱根解析，越界直接报错，不做静默裁剪；工具描述简洁直观，不带 `providerId`、`rpcMethod`、`safetyClassification` 等治理元数据。
 - 日志与 `stderr` 严守脱敏边界：绝不输出令牌、密码、文件/补丁正文或 `"Authorization"`（不区分大小写，`tests/http.test.ts` 有强断言）字样。
 - 先红后绿：新增能力或修 bug 先写失败测试亲眼确认变红，再写最小实现；改完 `src/` 或 Rust 后必须先构建再跑 vitest（HTTP/stdio 测试均拉起真实的 `dist/index.js`）。
-- `cargo test` 中真实 spawn 子进程的用例在模块内串行（照 `jobs_tests.rs` 的 `SPAWN_LOCK`）；vitest 固定走 `--pool=vmThreads`，跨 realm 异常只断言 `message` 内容，禁用 `.toBeInstanceOf(Error)`；凡在 vitest 用例中 `spawn` / `execFileSync` 子进程，必须显式设置 `>= 15_000` 超时（防止 17+ 文件并发抢 CPU 时撞默认 5s 超时）。
+- `cargo test` 中真实 spawn 子进程的用例在模块内串行（照 `jobs_tests.rs` 的 `SPAWN_LOCK`）；vitest 固定走 `--pool=vmThreads`，跨 realm 异常只断言 `message` 内容，禁用 `.toBeInstanceOf(Error)`；凡在 vitest 用例中 `spawn` / `execFile` 子进程，必须显式设置 `>= 15_000` 超时且优先用异步 `execFile`（避免 `vmThreads` 工作线程下同步 `execFileSync` 在高并发时偶发管道卡顿）。
 - 辅助脚本或托盘功能调用 `pwsh.exe` 回退 `powershell.exe` 时，必须同时处理 `NotFound` 与非零退出码（Git 钩子等精简环境下 `pwsh.exe` 可能启动失败）。
 - 票据完成后在票面 `## Comments` 逐条注明验收清单对应的测试用例。
 - 新增或调整底层算法前：先读 `docs/adr/0007-command-policy-reuse-opencode-wildcard.md` 与 `docs/research/{codex,opencode}-reusable-parts.md`；本机参考仓 `cankaoproject/` 严格只读、禁止在其中执行构建。

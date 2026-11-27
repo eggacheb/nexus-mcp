@@ -1,11 +1,13 @@
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import { projectRoot } from "./support/server.js";
 
+const execFileAsync = promisify(execFile);
 const RELEASE_SCRIPT = path.join(projectRoot, "scripts", "release.mjs");
 
 function createFakeRepo(version = "0.1.0"): { dir: string; cleanup(): void } {
@@ -69,15 +71,14 @@ process.exit(0);
 }
 
 describe("本地一键 Release 脚本（scripts/release.mjs）", () => {
-  it("拒绝非法语义化版本号且不修改仓库文件", () => {
+  it("拒绝非法语义化版本号且不修改仓库文件", async () => {
     const repo = createFakeRepo("0.1.0");
     try {
       let failed = false;
       try {
-        execFileSync(process.execPath, [RELEASE_SCRIPT, "not-a-version", "--skip-check"], {
+        await execFileAsync(process.execPath, [RELEASE_SCRIPT, "not-a-version", "--skip-check"], {
           env: { ...process.env, NEXUS_RELEASE_ROOT: repo.dir, NEXUS_GH_MISSING: "1" },
           encoding: "utf8",
-          stdio: ["ignore", "pipe", "pipe"],
           timeout: 15_000,
         });
       } catch (error) {
@@ -95,7 +96,7 @@ describe("本地一键 Release 脚本（scripts/release.mjs）", () => {
     }
   }, 20_000);
 
-  it("同步版本号到全部清单、生成精确 SHA256SUMS.txt，并默认以 --draft 调用 gh（传 --publish 去掉 --draft）", () => {
+  it("同步版本号到全部清单、生成精确 SHA256SUMS.txt，并默认以 --draft 调用 gh（传 --publish 去掉 --draft）", async () => {
     const repo = createFakeRepo("0.1.0");
     const ghLog = path.join(repo.dir, "gh-calls.log");
     const ghStub = writeGhStub(repo.dir, ghLog);
@@ -103,10 +104,9 @@ describe("本地一键 Release 脚本（scripts/release.mjs）", () => {
 
     try {
       // 1. 默认 Draft 发布 + 同步版本号 0.2.0
-      execFileSync(process.execPath, [RELEASE_SCRIPT, "0.2.0", "--skip-check"], {
+      await execFileAsync(process.execPath, [RELEASE_SCRIPT, "0.2.0", "--skip-check"], {
         env: { ...process.env, NEXUS_RELEASE_ROOT: repo.dir, NEXUS_GH_STUB: ghStub },
         encoding: "utf8",
-        stdio: ["ignore", "pipe", "pipe"],
         timeout: 15_000,
       });
 
@@ -136,10 +136,9 @@ describe("本地一键 Release 脚本（scripts/release.mjs）", () => {
 
       // 2. 传 --publish 去掉 --draft
       writeFileSync(ghLog, "", "utf8");
-      execFileSync(process.execPath, [RELEASE_SCRIPT, "--publish", "--skip-check"], {
+      await execFileAsync(process.execPath, [RELEASE_SCRIPT, "--publish", "--skip-check"], {
         env: { ...process.env, NEXUS_RELEASE_ROOT: repo.dir, NEXUS_GH_STUB: ghStub },
         encoding: "utf8",
-        stdio: ["ignore", "pipe", "pipe"],
         timeout: 15_000,
       });
       const pubCalls = readFileSync(ghLog, "utf8")
@@ -155,14 +154,13 @@ describe("本地一键 Release 脚本（scripts/release.mjs）", () => {
     }
   }, 20_000);
 
-  it("未安装 gh 时优雅降级：退出码 0 并打印本地产物与手动上传指引", () => {
+  it("未安装 gh 时优雅降级：退出码 0 并打印本地产物与手动上传指引", async () => {
     const repo = createFakeRepo("0.1.0");
     writeFakeArtifacts(repo.dir, "0.1.0");
     try {
-      const stdout = execFileSync(process.execPath, [RELEASE_SCRIPT, "--skip-check"], {
+      const { stdout } = await execFileAsync(process.execPath, [RELEASE_SCRIPT, "--skip-check"], {
         env: { ...process.env, NEXUS_RELEASE_ROOT: repo.dir, NEXUS_GH_MISSING: "1" },
         encoding: "utf8",
-        stdio: ["ignore", "pipe", "pipe"],
         timeout: 15_000,
       });
       expect(stdout).toContain("SHA256SUMS.txt");
