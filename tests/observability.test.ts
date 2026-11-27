@@ -484,4 +484,88 @@ describe("票 15.2 & 15.3：管控事件日志、只读接口零刷屏、面板 
     },
     30_000,
   );
+
+  it(
+    "运行指纹、热切换结果回显（/api/hotswap & /api/status）与 /api/logs 过滤增强",
+    async () => {
+      const server = await startServer({ token: "obs-fp-secret-token" });
+      try {
+        // 1. /health 与 /api/status 返回一致的 version / buildId / startedAt / pid
+        const healthRes = await fetch(`${server.mcpUrl.origin}/health`);
+        expect(healthRes.status).toBe(200);
+        const health = (await healthRes.json()) as {
+          ok: boolean;
+          version?: string;
+          buildId?: string;
+          startedAt?: string;
+          pid?: number;
+        };
+        expect(health.ok).toBe(true);
+        expect(health.version).toMatch(/^\d+\.\d+\.\d+/);
+        expect(health.buildId).toMatch(/^[0-9a-f]{8}$/);
+        expect(typeof health.startedAt).toBe("string");
+        expect(typeof health.pid).toBe("number");
+
+        const statusRes = await fetch(`${server.panelUrl}/api/status`);
+        expect(statusRes.status).toBe(200);
+        const status = (await statusRes.json()) as {
+          version: string;
+          buildId?: string;
+          startedAt?: string;
+          pid?: number;
+          lastHotswap?: unknown;
+        };
+        expect(status.buildId).toBe(health.buildId);
+        expect(status.startedAt).toBe(health.startedAt);
+        expect(status.pid).toBe(health.pid);
+        expect(status.lastHotswap).toBeNull();
+
+        // 2. /api/hotswap 文件不存在返回 null；写入 last-hotswap.json 后立即回显并脱敏
+        const hsEmpty = await fetch(`${server.panelUrl}/api/hotswap`);
+        expect(hsEmpty.status).toBe(200);
+        expect(((await hsEmpty.json()) as { lastHotswap: unknown }).lastHotswap).toBeNull();
+
+        const logsDir = path.join(path.dirname(server.configPath), "logs");
+        writeFileSync(
+          path.join(logsDir, "last-hotswap.json"),
+          JSON.stringify({
+            status: "ok",
+            mode: "in-place",
+            at: "2026-11-27T08:00:00.000Z",
+            detail: "pid=1234 token=obs-fp-secret-token",
+          }),
+          "utf8",
+        );
+        const hsRes = await fetch(`${server.panelUrl}/api/hotswap`);
+        expect(hsRes.status).toBe(200);
+        const hsBody = (await hsRes.json()) as {
+          lastHotswap: { status: string; mode: string; at: string; detail: string } | null;
+        };
+        expect(hsBody.lastHotswap?.status).toBe("ok");
+        expect(hsBody.lastHotswap?.mode).toBe("in-place");
+        expect(hsBody.lastHotswap?.detail).not.toContain("obs-fp-secret-token");
+
+        // 3. /api/logs 过滤：先制造一条 WARN（鉴权拒绝），再按 level=warn 与 q=auth.deny 过滤
+        await fetch(server.mcpUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: "Bearer wrong-tok" },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+        });
+
+        const warnLogsRes = await fetch(`${server.panelUrl}/api/logs?level=warn&q=auth.deny&limit=5`);
+        expect(warnLogsRes.status).toBe(200);
+        const warnLogs = (await warnLogsRes.json()) as { lines: string[] };
+        expect(warnLogs.lines.length).toBeGreaterThanOrEqual(1);
+        expect(warnLogs.lines.length).toBeLessThanOrEqual(5);
+        for (const line of warnLogs.lines) {
+          expect(line).toMatch(/\[(WARN|ERROR)\]/);
+          expect(line.toLowerCase()).toContain("auth.deny");
+          expect(line.toLowerCase()).not.toContain("authorization");
+        }
+      } finally {
+        await server.stop();
+      }
+    },
+    30_000,
+  );
 });

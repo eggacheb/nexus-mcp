@@ -14,6 +14,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  writeFileSync,
 } from "node:fs";
 import http from "node:http";
 import path from "node:path";
@@ -72,6 +73,18 @@ function sleep(ms) {
 function appendLog(logPath, message) {
   mkdirSync(path.dirname(logPath), { recursive: true });
   appendFileSync(logPath, `[${new Date().toISOString()}] ${message}\n`, "utf8");
+}
+
+function writeLastHotswap(logPath, status, mode, detail) {
+  const dir = path.dirname(logPath);
+  mkdirSync(dir, { recursive: true });
+  const payload = {
+    status,
+    mode,
+    at: new Date().toISOString(),
+    detail,
+  };
+  writeFileSync(path.join(dir, "last-hotswap.json"), JSON.stringify(payload, null, 2), "utf8");
 }
 
 function readMcpPort(targetDir) {
@@ -269,6 +282,7 @@ async function runWorker(opts) {
     const healthy = await waitForHealth(mcpPort, healthTimeoutMs);
     if (healthy) {
       appendLog(logPath, `worker.success port=${mcpPort}`);
+      writeLastHotswap(logPath, "ok", "detached-worker", `pid=${newPid} port=${mcpPort}`);
       return;
     }
     throw new Error(`新版本在 ${healthTimeoutMs}ms 内未通过 127.0.0.1:${mcpPort}/health 校验`);
@@ -287,6 +301,14 @@ async function runWorker(opts) {
       const restoredPid = spawnDetachedTray(targetDir);
       const recovered = await waitForHealth(mcpPort, healthTimeoutMs);
       appendLog(logPath, `worker.rollback_done pid=${restoredPid} recovered=${recovered}`);
+      writeLastHotswap(
+        logPath,
+        recovered ? "rolled_back" : "failed",
+        "detached-worker",
+        err.message,
+      );
+    } else {
+      writeLastHotswap(logPath, "failed", "detached-worker", err.message);
     }
   }
 }

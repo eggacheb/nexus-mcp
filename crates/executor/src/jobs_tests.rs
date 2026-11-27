@@ -51,6 +51,7 @@ fn output_request(job_id: &str, offset: Option<u64>, max_output_bytes: u64) -> J
         job_id: job_id.into(),
         offset,
         max_output_bytes,
+        wait_ms: None,
     }
 }
 
@@ -399,4 +400,52 @@ fn kill_malformed_job_id_is_a_clear_error() {
     let response = registry.kill(&kill_request("not-a-job"));
     assert_eq!(response["ok"], Value::Bool(false));
     assert!(response["error"].as_str().unwrap().contains("格式"));
+}
+
+#[test]
+fn wait_ms_returns_immediately_when_output_exists_and_wakes_on_exit() {
+    let _guard = spawn_lock();
+    let mut registry = JobRegistry::new();
+    // 1) 已有输出时传 wait_ms 也应立刻返回（不空等 200ms 防抖或 5000ms 上限）
+    let start1 = registry.start(&start_request("echo ready-now; sleep 10", 4096));
+    let id1 = start1["job_id"].as_str().unwrap().to_string();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let probe = registry.output(&output_request(&id1, Some(0), 4096));
+        if probe["output"].as_str().unwrap_or("").contains("ready-now") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let t0 = Instant::now();
+    let immediate = registry.output(&JobOutputRequest {
+        id: 10,
+        job_id: id1.clone(),
+        offset: Some(0),
+        max_output_bytes: 4096,
+        wait_ms: Some(5_000),
+    });
+    assert!(
+        t0.elapsed() < Duration::from_millis(150),
+        "已有新字节时不应进入防抖等待，实际耗时 {:?}",
+        t0.elapsed()
+    );
+    assert!(immediate["output"].as_str().unwrap().contains("ready-now"));
+    registry.kill(&kill_request(&id1));
+
+    // 2) 尚无输出时进入等待，任务提前退出立即唤醒
+    let start2 = registry.start(&start_request("sleep 0.25; echo wake-exit", 4096));
+    let id2 = start2["job_id"].as_str().unwrap().to_string();
+    let t1 = Instant::now();
+    let woke = registry.output(&JobOutputRequest {
+        id: 11,
+        job_id: id2,
+        offset: Some(0),
+        max_output_bytes: 4096,
+        wait_ms: Some(5_000),
+    });
+    assert_eq!(woke["status"], "exited");
+    assert_eq!(woke["exit_code"], 0);
+    assert!(woke["output"].as_str().unwrap().contains("wake-exit"));
+    assert!(t1.elapsed() < Duration::from_secs(3));
 }

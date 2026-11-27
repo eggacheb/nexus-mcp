@@ -26,6 +26,13 @@ const MAX_FINISHED_JOBS: usize = 50;
 /// 不能一直卡住退出状态），残留输出会在记录淘汰或服务退出时随管道关闭补齐
 const READER_GRACE_MS: u64 = 500;
 
+/// job_output 短等待上限（30 秒，安全低于云端连接器 HTTP 超时）
+const MAX_JOB_WAIT_MS: u64 = 30_000;
+/// 运行中出现新输出后的合并防抖窗口，避免把刷屏日志拆成几十次零碎返回
+const WAIT_DEBOUNCE_MS: u64 = 200;
+/// 短等待轮询步长
+const WAIT_POLL_MS: u64 = 20;
+
 fn default_job_max_output_bytes() -> u64 {
     DEFAULT_JOB_MAX_OUTPUT_BYTES
 }
@@ -51,6 +58,8 @@ pub struct JobOutputRequest {
     pub offset: Option<u64>,
     #[serde(default = "default_job_max_output_bytes")]
     pub max_output_bytes: u64,
+    #[serde(default)]
+    pub wait_ms: Option<u64>,
 }
 
 /// 终止不需要 force/graceful 开关：Windows 侧两侧保险都是硬杀，协议里没有软信号通道。
@@ -207,128 +216,16 @@ impl JobRegistry {
         })
     }
 
-    /// 读取任务输出：按字节偏移增量返回，重复推进不重复给同一段内容；
-    /// 请求落在已丢弃的中间段时给出省略标注并跳到尾部起点。
+    /// 读取任务输出（测试便捷入口；生产路径走 `handle_output` 在等待前释放注册表锁）。
+    #[cfg(test)]
     pub fn output(&mut self, request: &JobOutputRequest) -> Value {
         let id = Some(request.id);
         let job = match self.resolve_job(id, &request.job_id) {
             Ok(job) => job,
             Err(response) => return response,
         };
-
-        // 先读任务状态再拍输出快照：若已 Exited 则缓冲已最终落定，末尾残缺 UTF-8 序列不再挂起等待
-        let (is_running, status, exit_code) = {
-            let state = job.state.lock().expect("任务状态锁不应中毒");
-            match *state {
-                JobState::Running => (true, "running", None),
-                JobState::Exited { exit_code } => (false, "exited", Some(exit_code)),
-            }
-        };
-
-        // 快照缓冲：head 在前 tail 在后（omitted>0 时中间隔着丢弃段），拷贝一次
-        // 便于按原始字节坐标切片；上限 = max_output_bytes，快照本身不超缓冲上限
-        let max_bytes = request.max_output_bytes.max(1) as usize;
-        let total;
-        let head_len;
-        let tail_start;
-        let omitted;
-        let snapshot;
-        {
-            let mut buffer = job.buffer.lock().expect("输出缓冲锁不应中毒");
-            total = buffer.total_bytes();
-            head_len = buffer.head_bytes().len();
-            let tail_len = buffer.tail_bytes().len();
-            tail_start = total - tail_len;
-            omitted = buffer.omitted_bytes();
-            snapshot = buffer.to_bytes();
-        }
-
-        let offset = request.offset.unwrap_or(0).min(total as u64) as usize;
-        let output;
-        let next_offset;
-        if omitted > 0 && offset >= head_len && offset < tail_start {
-            // 请求落在已丢弃的中间段：标注省略量并跳到尾部起点
-            output = format_output_omission_marker(tail_start - offset);
-            next_offset = tail_start as u64;
-        } else {
-            // 原始字节坐标 → 快照内下标：头部一一对应；尾部整体前移
-            //（omitted==0 时 tail_start == head_len，公式退化为恒等映射）
-            let snapshot_start = if offset >= tail_start {
-                head_len + (offset - tail_start)
-            } else {
-                offset
-            };
-            let raw_end = if omitted > 0 && offset < head_len {
-                // 头部之外隔着丢弃段，最多读到丢弃段前
-                offset.saturating_add(max_bytes).min(head_len)
-            } else {
-                offset.saturating_add(max_bytes).min(total)
-            };
-            let snapshot_end = if raw_end > tail_start {
-                head_len + (raw_end - tail_start)
-            } else {
-                raw_end
-            };
-            let chunk = &snapshot[snapshot_start..snapshot_end];
-            // 开头对齐：尾部滚动切点跳过孤立续字节；调用方手传半字符 offset 时跳到该合法字符末尾；
-            // 真正的非 UTF-8 字节（如 0x80/GBK）不跳过，交给 decode_lossy_stream 转成 U+FFFD 并计入消费量
-            let skip = if omitted > 0 && offset == tail_start {
-                chunk.len() - aligned_tail(chunk).len()
-            } else {
-                utf8_straddle_skip(&snapshot[..snapshot_end], snapshot_start)
-            };
-            let aligned_start = snapshot_start + skip;
-            let aligned = &snapshot[aligned_start..snapshot_end];
-            let stream_limit = if omitted > 0 && offset < head_len {
-                head_len
-            } else {
-                snapshot.len()
-            };
-            let (mut decoded, mut consumed) = decode_lossy_stream(aligned, true);
-            if consumed < aligned.len() {
-                let tail_lead = aligned_start + consumed;
-                let lookahead_end = stream_limit.min(tail_lead + 4);
-                let next_valid_char = if snapshot_end < stream_limit {
-                    match std::str::from_utf8(&snapshot[tail_lead..lookahead_end]) {
-                        Ok(s) => s.chars().next(),
-                        Err(err) if err.valid_up_to() > 0 => {
-                            std::str::from_utf8(&snapshot[tail_lead..tail_lead + err.valid_up_to()])
-                                .ok()
-                                .and_then(|s| s.chars().next())
-                        }
-                        Err(_) => None,
-                    }
-                } else {
-                    None
-                };
-
-                if let Some(ch) = next_valid_char {
-                    // 快照内已存在完整合法的多字节字符：若 skip+consumed 已能推进偏移则留给下次读；
-                    // 若 max_output_bytes 小于单字符字节数（1~3），直接补齐该完整字符推进偏移，绝不打碎成 U+FFFD
-                    if skip + consumed == 0 {
-                        decoded.push(ch);
-                        consumed = ch.len_utf8();
-                    }
-                } else if !(is_running && raw_end == total) {
-                    // 非运行期实时末尾，且后续字节证明并非被切开的合法字符：按 lossy 消费到底防卡死
-                    let (lossy_text, lossy_consumed) = decode_lossy_stream(aligned, false);
-                    decoded = lossy_text;
-                    consumed = lossy_consumed;
-                }
-            }
-            output = decoded;
-            next_offset = (offset + skip + consumed) as u64;
-        }
-        json!({
-            "id": request.id, "ok": true,
-            "job_id": request.job_id,
-            "status": status,
-            "exit_code": exit_code,
-            "output": output,
-            "next_offset": next_offset,
-            "total_bytes": total,
-            "omitted_bytes": omitted,
-        })
+        wait_for_job_progress(&job, request);
+        snapshot_job_output(&job, request)
     }
 
     /// 终止单个后台任务：回执式——立即返回 killed 回执，不等进程退出。
@@ -430,6 +327,180 @@ static JOB_REGISTRY: OnceLock<Mutex<JobRegistry>> = OnceLock::new();
 
 pub fn registry() -> &'static Mutex<JobRegistry> {
     JOB_REGISTRY.get_or_init(|| Mutex::new(JobRegistry::new()))
+}
+
+/// 并发安全的 job_output 入口：仅在查找任务时短暂持有注册表锁，等待阶段释放锁，
+/// 避免带 `wait_ms` 的查询阻塞 `job_start` / `job_kill` / 无等待 `job_output`。
+pub fn handle_output(request: &JobOutputRequest) -> Value {
+    let job = {
+        let mut reg = registry().lock().expect("任务注册表锁不应中毒");
+        match reg.resolve_job(Some(request.id), &request.job_id) {
+            Ok(job) => job,
+            Err(response) => return response,
+        }
+    };
+    wait_for_job_progress(&job, request);
+    snapshot_job_output(&job, request)
+}
+
+/// 当 `wait_ms > 0` 且任务仍在运行、请求偏移处尚无新字节时短等待：
+/// 任务退出或 stdin 关闭立即返回；有新输出后经过约 200ms 合并防抖即返回。
+fn wait_for_job_progress(job: &Job, request: &JobOutputRequest) {
+    let wait_ms = request.wait_ms.unwrap_or(0).min(MAX_JOB_WAIT_MS);
+    if wait_ms == 0 {
+        return;
+    }
+    let requested_offset = request.offset.unwrap_or(0) as usize;
+    // 请求偏移处已有可读新字节时立刻返回，不进入防抖或等待循环
+    if job.buffer.lock().expect("输出缓冲锁不应中毒").total_bytes() > requested_offset {
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_millis(wait_ms);
+    let mut debounce_until: Option<Instant> = None;
+
+    loop {
+        if crate::STDIN_CLOSED.load(std::sync::atomic::Ordering::Acquire) {
+            break;
+        }
+        let exited = {
+            let state = job.state.lock().expect("任务状态锁不应中毒");
+            matches!(*state, JobState::Exited { .. })
+        };
+        if exited {
+            break;
+        }
+        let total_bytes = job.buffer.lock().expect("输出缓冲锁不应中毒").total_bytes();
+        let now = Instant::now();
+        if total_bytes > requested_offset {
+            let until = *debounce_until
+                .get_or_insert_with(|| (now + Duration::from_millis(WAIT_DEBOUNCE_MS)).min(deadline));
+            if now >= until {
+                break;
+            }
+        }
+        if now >= deadline {
+            break;
+        }
+        let target = debounce_until.map_or(deadline, |u| u.min(deadline));
+        let remain = target.saturating_duration_since(now);
+        thread::sleep(remain.min(Duration::from_millis(WAIT_POLL_MS)));
+    }
+}
+
+fn snapshot_job_output(job: &Job, request: &JobOutputRequest) -> Value {
+    // 先读任务状态再拍输出快照：若已 Exited 则缓冲已最终落定，末尾残缺 UTF-8 序列不再挂起等待
+    let (is_running, status, exit_code) = {
+        let state = job.state.lock().expect("任务状态锁不应中毒");
+        match *state {
+            JobState::Running => (true, "running", None),
+            JobState::Exited { exit_code } => (false, "exited", Some(exit_code)),
+        }
+    };
+
+    // 快照缓冲：head 在前 tail 在后（omitted>0 时中间隔着丢弃段），拷贝一次
+    // 便于按原始字节坐标切片；上限 = max_output_bytes，快照本身不超缓冲上限
+    let max_bytes = request.max_output_bytes.max(1) as usize;
+    let total;
+    let head_len;
+    let tail_start;
+    let omitted;
+    let snapshot;
+    {
+        let mut buffer = job.buffer.lock().expect("输出缓冲锁不应中毒");
+        total = buffer.total_bytes();
+        head_len = buffer.head_bytes().len();
+        let tail_len = buffer.tail_bytes().len();
+        tail_start = total - tail_len;
+        omitted = buffer.omitted_bytes();
+        snapshot = buffer.to_bytes();
+    }
+
+    let offset = request.offset.unwrap_or(0).min(total as u64) as usize;
+    let output;
+    let next_offset;
+    if omitted > 0 && offset >= head_len && offset < tail_start {
+        // 请求落在已丢弃的中间段：标注省略量并跳到尾部起点
+        output = format_output_omission_marker(tail_start - offset);
+        next_offset = tail_start as u64;
+    } else {
+        // 原始字节坐标 → 快照内下标：头部一一对应；尾部整体前移
+        //（omitted==0 时 tail_start == head_len，公式退化为恒等映射）
+        let snapshot_start = if offset >= tail_start {
+            head_len + (offset - tail_start)
+        } else {
+            offset
+        };
+        let raw_end = if omitted > 0 && offset < head_len {
+            // 头部之外隔着丢弃段，最多读到丢弃段前
+            offset.saturating_add(max_bytes).min(head_len)
+        } else {
+            offset.saturating_add(max_bytes).min(total)
+        };
+        let snapshot_end = if raw_end > tail_start {
+            head_len + (raw_end - tail_start)
+        } else {
+            raw_end
+        };
+        let chunk = &snapshot[snapshot_start..snapshot_end];
+        // 开头对齐：尾部滚动切点跳过孤立续字节；调用方手传半字符 offset 时跳到该合法字符末尾；
+        // 真正的非 UTF-8 字节（如 0x80/GBK）不跳过，交给 decode_lossy_stream 转成 U+FFFD 并计入消费量
+        let skip = if omitted > 0 && offset == tail_start {
+            chunk.len() - aligned_tail(chunk).len()
+        } else {
+            utf8_straddle_skip(&snapshot[..snapshot_end], snapshot_start)
+        };
+        let aligned_start = snapshot_start + skip;
+        let aligned = &snapshot[aligned_start..snapshot_end];
+        let stream_limit = if omitted > 0 && offset < head_len {
+            head_len
+        } else {
+            snapshot.len()
+        };
+        let (mut decoded, mut consumed) = decode_lossy_stream(aligned, true);
+        if consumed < aligned.len() {
+            let tail_lead = aligned_start + consumed;
+            let lookahead_end = stream_limit.min(tail_lead + 4);
+            let next_valid_char = if snapshot_end < stream_limit {
+                match std::str::from_utf8(&snapshot[tail_lead..lookahead_end]) {
+                    Ok(s) => s.chars().next(),
+                    Err(err) if err.valid_up_to() > 0 => {
+                        std::str::from_utf8(&snapshot[tail_lead..tail_lead + err.valid_up_to()])
+                            .ok()
+                            .and_then(|s| s.chars().next())
+                    }
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+
+            if let Some(ch) = next_valid_char {
+                // 快照内已存在完整合法的多字节字符：若 skip+consumed 已能推进偏移则留给下次读；
+                // 若 max_output_bytes 小于单字符字节数（1~3），直接补齐该完整字符推进偏移，绝不打碎成 U+FFFD
+                if skip + consumed == 0 {
+                    decoded.push(ch);
+                    consumed = ch.len_utf8();
+                }
+            } else if !(is_running && raw_end == total) {
+                // 非运行期实时末尾，且后续字节证明并非被切开的合法字符：按 lossy 消费到底防卡死
+                let (lossy_text, lossy_consumed) = decode_lossy_stream(aligned, false);
+                decoded = lossy_text;
+                consumed = lossy_consumed;
+            }
+        }
+        output = decoded;
+        next_offset = (offset + skip + consumed) as u64;
+    }
+    json!({
+        "id": request.id, "ok": true,
+        "job_id": request.job_id,
+        "status": status,
+        "exit_code": exit_code,
+        "output": output,
+        "next_offset": next_offset,
+        "total_bytes": total,
+        "omitted_bytes": omitted,
+    })
 }
 
 /// job_id 解析：接受 job_start 返回的 job-N，也容忍纯数字。

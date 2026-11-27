@@ -5,6 +5,7 @@
 
 mod command_policy;
 mod edit_match;
+mod file_lock;
 mod glob_search;
 mod grep_search;
 mod head_tail_buffer;
@@ -14,12 +15,13 @@ mod string;
 #[cfg(windows)]
 mod win_job;
 
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{BufRead, Read, Write, stdin, stdout};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -149,10 +151,7 @@ fn handle_request(line: &str) -> Value {
             Err(err) => error_response(id, format!("job_start 请求字段有误: {err}")),
         },
         Some("job_output") => match serde_json::from_value::<jobs::JobOutputRequest>(parsed) {
-            Ok(request) => jobs::registry()
-                .lock()
-                .expect("任务注册表锁不应中毒")
-                .output(&request),
+            Ok(request) => jobs::handle_output(&request),
             Err(err) => error_response(id, format!("job_output 请求字段有误: {err}")),
         },
         Some("job_kill") => match serde_json::from_value::<jobs::JobKillRequest>(parsed) {
@@ -654,6 +653,7 @@ fn run_write(request: &WriteRequest) -> Value {
                     if let Containment::Outside = classify(&root.canonical, &real) {
                         return error_response(id, escape_error(&request.path, &real, &root.canonical));
                     }
+                    let _guard = file_lock::acquire(&real);
                     write_bytes(request, target)
                 }
                 Err(_) => error_response(
@@ -676,35 +676,98 @@ fn run_write(request: &WriteRequest) -> Value {
                     if let Containment::Outside = classify(&root.canonical, &real) {
                         return error_response(id, escape_error(&request.path, &real, &root.canonical));
                     }
+                    let _guard = file_lock::acquire(&real);
                     write_bytes(request, target)
                 }
                 Err(err) => error_response(id, format!("路径解析失败: {} ({err})", request.path)),
             }
         }
         Err(_) => {
-            // 目标不存在：父目录必须真实存在，不自动创建；落点按解析结果校验
-            let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) else {
+            // 目标不存在：先沿祖先链找到最深已存在节点并验根（防中间符号链接越界），再自动创建沙箱内缺失父目录
+            let Some(parent) = normalized.parent().filter(|p| !p.as_os_str().is_empty()) else {
                 return error_response(id, format!("路径没有可写的文件名: {}", request.path));
             };
-            let parent_canonical = match fs::canonicalize(parent) {
+            let Some(name) = normalized.file_name() else {
+                return error_response(id, format!("路径没有可写的文件名: {}", request.path));
+            };
+            let mut missing_segments: Vec<std::ffi::OsString> = Vec::new();
+            let mut cursor = parent;
+            loop {
+                match fs::symlink_metadata(cursor) {
+                    Ok(_) => break,
+                    Err(_) => {
+                        let Some(seg) = cursor.file_name() else {
+                            return error_response(
+                                id,
+                                format!("父目录无法解析: {}", display_path(parent)),
+                            );
+                        };
+                        missing_segments.push(seg.to_os_string());
+                        let Some(next) = cursor.parent() else {
+                            return error_response(
+                                id,
+                                format!("父目录无法解析: {}", display_path(parent)),
+                            );
+                        };
+                        cursor = next;
+                    }
+                }
+            }
+            let ancestor_canonical = match fs::canonicalize(cursor) {
                 Ok(p) => p,
-                Err(_) => {
+                Err(err) => {
                     return error_response(
                         id,
-                        format!("父目录不存在，write 不会自动创建目录: {}", display_path(parent)),
+                        format!("父目录不可访问: {} ({err})", display_path(cursor)),
                     );
                 }
             };
-            let Some(name) = target.file_name() else {
-                return error_response(id, format!("路径没有可写的文件名: {}", request.path));
-            };
-            let candidate = parent_canonical.join(name);
+            if let Containment::Outside = classify(&root.canonical, &ancestor_canonical) {
+                return error_response(
+                    id,
+                    escape_error(&request.path, &ancestor_canonical, &root.canonical),
+                );
+            }
+            match fs::metadata(&ancestor_canonical) {
+                Ok(meta) if meta.is_dir() => {}
+                Ok(_) => {
+                    return error_response(
+                        id,
+                        format!(
+                            "父路径是已存在的文件而非目录，无法写入: {}",
+                            display_path(&ancestor_canonical)
+                        ),
+                    );
+                }
+                Err(err) => {
+                    return error_response(
+                        id,
+                        format!("父目录不可访问: {} ({err})", display_path(&ancestor_canonical)),
+                    );
+                }
+            }
+            let mut target_parent = ancestor_canonical;
+            for seg in missing_segments.into_iter().rev() {
+                target_parent.push(seg);
+            }
+            if !target_parent.exists() {
+                if let Err(err) = fs::create_dir_all(&target_parent) {
+                    return error_response(
+                        id,
+                        format!("创建父目录失败: {} ({err})", display_path(&target_parent)),
+                    );
+                }
+            }
+            let candidate = target_parent.join(name);
             match classify(&root.canonical, &candidate) {
                 Containment::Outside => {
                     error_response(id, escape_error(&request.path, &candidate, &root.canonical))
                 }
                 Containment::RootItself => root_not_writable_error(id, &root.canonical),
-                Containment::Inside => write_bytes(request, &candidate),
+                Containment::Inside => {
+                    let _guard = file_lock::acquire(&candidate);
+                    write_bytes(request, &candidate)
+                }
             }
         }
     }
@@ -738,6 +801,7 @@ fn run_edit(request: &EditRequest) -> Value {
         Ok(p) => p,
         Err(response) => return response,
     };
+    let _guard = file_lock::acquire(&canonical);
     let bytes = match fs::read(&canonical) {
         Ok(b) => b,
         Err(err) => return error_response(id, format!("读取文件失败: {} ({err})", request.path)),
@@ -899,41 +963,169 @@ fn render_output(buffer: &mut HeadTailBuffer) -> String {
     format!("{head}\n{}\n{tail}", format_output_omission_marker(omitted))
 }
 
-fn main() {
-    let (tx, rx) = mpsc::channel::<String>();
-    thread::spawn(move || {
-        let stdin = stdin();
-        for line in stdin.lock().lines() {
-            match line {
-                Ok(line) => {
-                    if tx.send(line).is_err() {
+/// 双车道各自默认最大并发工作线程数（ADR-0011）
+const DEFAULT_LANE_MAX_WORKERS: usize = 16;
+
+/// 判断请求是否归入 control 车道：ping、job_kill 以及无等待的 job_output，
+/// 独立于 ordinary 车道，确保慢请求打满槽位时不会饿死控制与健康指令。
+fn is_control_request(line: &str) -> bool {
+    let Ok(parsed) = serde_json::from_str::<Value>(line) else {
+        return true;
+    };
+    match parsed.get("op").and_then(Value::as_str) {
+        Some("ping") | Some("job_kill") => true,
+        Some("job_output") => parsed.get("wait_ms").and_then(Value::as_u64).unwrap_or(0) == 0,
+        _ => false,
+    }
+}
+
+struct LaneState {
+    queue: VecDeque<String>,
+    active_workers: usize,
+    idle_workers: usize,
+    closed: bool,
+}
+
+/// 纯标准库惰性线程池：按需拉起最多 `max_workers` 条工作线程，所有响应经 `out_tx` 顺序写回。
+struct LanePool {
+    shared: Arc<(Mutex<LaneState>, Condvar)>,
+    max_workers: usize,
+    out_tx: mpsc::Sender<Value>,
+    handles: Mutex<Vec<thread::JoinHandle<()>>>,
+}
+
+impl LanePool {
+    fn new(max_workers: usize, out_tx: mpsc::Sender<Value>) -> Self {
+        Self {
+            shared: Arc::new((
+                Mutex::new(LaneState {
+                    queue: VecDeque::new(),
+                    active_workers: 0,
+                    idle_workers: 0,
+                    closed: false,
+                }),
+                Condvar::new(),
+            )),
+            max_workers: max_workers.max(1),
+            out_tx,
+            handles: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn submit(&self, line: String) {
+        let should_spawn = {
+            let (lock, cvar) = &*self.shared;
+            let mut state = lock.lock().expect("车道锁不应中毒");
+            if state.closed {
+                return;
+            }
+            state.queue.push_back(line);
+            let spawn = state.idle_workers == 0 && state.active_workers < self.max_workers;
+            if spawn {
+                state.active_workers += 1;
+            }
+            cvar.notify_one();
+            spawn
+        };
+        if should_spawn {
+            let shared = Arc::clone(&self.shared);
+            let out_tx = self.out_tx.clone();
+            let handle = thread::spawn(move || {
+                let (lock, cvar) = &*shared;
+                loop {
+                    let task = {
+                        let mut state = lock.lock().expect("车道锁不应中毒");
+                        loop {
+                            if let Some(line) = state.queue.pop_front() {
+                                break Some(line);
+                            }
+                            if state.closed {
+                                state.active_workers = state.active_workers.saturating_sub(1);
+                                break None;
+                            }
+                            state.idle_workers += 1;
+                            state = cvar.wait(state).expect("车道条件变量不应中毒");
+                            state.idle_workers = state.idle_workers.saturating_sub(1);
+                        }
+                    };
+                    let Some(line) = task else {
+                        break;
+                    };
+                    let response = handle_request(&line);
+                    if STDIN_CLOSED.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if out_tx.send(response).is_err() {
                         break;
                     }
                 }
-                Err(_) => break,
+            });
+            if let Ok(mut handles) = self.handles.lock() {
+                handles.push(handle);
             }
         }
-        STDIN_CLOSED.store(true, Ordering::Release);
-    });
+    }
 
-    let stdout = stdout();
-    let mut out = stdout.lock();
-    while let Ok(line) = rx.recv() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
+    fn shutdown(&self) {
+        {
+            let (lock, cvar) = &*self.shared;
+            let mut state = lock.lock().expect("车道锁不应中毒");
+            state.closed = true;
+            state.queue.clear();
+            cvar.notify_all();
         }
-        let response = handle_request(trimmed);
-        if STDIN_CLOSED.load(Ordering::Acquire) {
-            break;
-        }
-        if writeln!(out, "{response}").and_then(|_| out.flush()).is_err() {
-            STDIN_CLOSED.store(true, Ordering::Release);
-            break;
+        if let Ok(mut handles) = self.handles.lock() {
+            for handle in handles.drain(..) {
+                let _ = handle.join();
+            }
         }
     }
-    // stdin EOF 或写响应失败意味着协议层已离开：终止所有还在跑的后台任务，
-    // 不留孤儿进程（Windows 侧另有 Job Object 兜底，见 win_job）
+}
+
+fn main() {
+    let (out_tx, out_rx) = mpsc::channel::<Value>();
+    let writer = thread::spawn(move || {
+        let stdout = stdout();
+        let mut out = stdout.lock();
+        while let Ok(response) = out_rx.recv() {
+            if STDIN_CLOSED.load(Ordering::Acquire) {
+                break;
+            }
+            if writeln!(out, "{response}").and_then(|_| out.flush()).is_err() {
+                STDIN_CLOSED.store(true, Ordering::Release);
+                break;
+            }
+        }
+    });
+
+    let control_lane = LanePool::new(DEFAULT_LANE_MAX_WORKERS, out_tx.clone());
+    let ordinary_lane = LanePool::new(DEFAULT_LANE_MAX_WORKERS, out_tx.clone());
+
+    let stdin = stdin();
+    for line in stdin.lock().lines() {
+        match line {
+            Ok(line) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if is_control_request(trimmed) {
+                    control_lane.submit(trimmed.to_string());
+                } else {
+                    ordinary_lane.submit(trimmed.to_string());
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    // stdin EOF 或写响应失败意味着协议层已离开：置位通知在途 bash 收尾并等待工作线程退出，
+    // 再统一树杀所有仍在跑的后台任务，不留孤儿进程（Windows 侧另有 Job Object 兜底，见 win_job）
+    STDIN_CLOSED.store(true, Ordering::Release);
+    control_lane.shutdown();
+    ordinary_lane.shutdown();
+    drop(out_tx);
+    let _ = writer.join();
     jobs::registry()
         .lock()
         .expect("任务注册表锁不应中毒")

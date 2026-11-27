@@ -202,6 +202,11 @@ describe("票 06: 本地一键热切换部署脚本（缝隙 3）", () => {
         return existsSync(logFile) && readFileSync(logFile, "utf8").includes("hotswap.success");
       }, 15_000);
 
+      const lastOkPath = path.join(targetDir, "logs", "last-hotswap.json");
+      expect(existsSync(lastOkPath)).toBe(true);
+      const lastOk = JSON.parse(readFileSync(lastOkPath, "utf8")) as { status: string; mode: string };
+      expect(lastOk.status).toBe("ok");
+
       // 3) 投喂崩溃托盘包（借用已构建的 crash-helper.exe 冒充坏 nexus-mcp.exe -> 哈希不同走 detached-worker 并触发回滚）
       const crashHelper = path.join(projectRoot, "crates", "target", "release", "crash-helper.exe");
       expect(existsSync(crashHelper)).toBe(true);
@@ -243,7 +248,12 @@ describe("票 06: 本地一键热切换部署脚本（缝隙 3）", () => {
 
       await waitFor(() => {
         return existsSync(res3.logPath) && readFileSync(res3.logPath, "utf8").includes("worker.rollback_done");
-      }, 15_000);
+      }, 25_000);
+
+      const lastRbPath = path.join(targetDir, "logs", "last-hotswap.json");
+      const lastRb = JSON.parse(readFileSync(lastRbPath, "utf8")) as { status: string; mode: string };
+      expect(lastRb.status).toBe("rolled_back");
+      expect(lastRb.mode).toBe("detached-worker");
 
       // 回滚后 /health 必须恢复 200
       await waitFor(async () => {

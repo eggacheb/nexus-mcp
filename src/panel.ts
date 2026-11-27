@@ -18,13 +18,29 @@ import {
 } from "./config.js";
 import { readBody, sendJson as sendJsonRaw } from "./httpHelpers.js";
 import { ICON_DATA_URI_SVG } from "./icon.js";
-import { logError, logInfo, logWarn, recentLogs, redactText, setLogLevel } from "./log.js";
+import type { LogLevel } from "./log.js";
+import {
+  logError,
+  logInfo,
+  logWarn,
+  parseLogLevel,
+  queryLogs,
+  redactText,
+  resolveLogDir,
+  setLogLevel,
+} from "./log.js";
 import type { McpService } from "./mcpService.js";
 import { QuickTunnelManager } from "./quickTunnel.js";
 import type { TailscaleInfo } from "./tailscale.js";
 import { detectTailscale, disableTailscaleFunnel, enableTailscaleFunnel } from "./tailscale.js";
-import type { ComponentStatus, TunnelStatus } from "./status.js";
-import { executorStatus, probePublicTunnel, tunnelStatus } from "./status.js";
+import type { ComponentStatus, LastHotswapInfo, TunnelStatus } from "./status.js";
+import {
+  executorStatus,
+  getRuntimeIdentity,
+  probePublicTunnel,
+  readLastHotswap,
+  tunnelStatus,
+} from "./status.js";
 import { TOOL_SUMMARY } from "./tools.js";
 import { TunnelManager, resolveTunnelOptions } from "./tunnel.js";
 import { VERSION } from "./version.js";
@@ -46,6 +62,14 @@ export interface PanelStatus {
   panelPort: number;
   /** 程序版本，页头直接显示；与安装包文件名、package.json 同源 */
   version: string;
+  /** 当前运行入口程序的短 SHA-256 指纹 */
+  buildId: string;
+  /** 协议层启动时间（ISO-8601） */
+  startedAt: string;
+  /** 协议层进程 PID */
+  pid: number;
+  /** 最近一次热切换的结构化结果（来自日志目录 last-hotswap.json） */
+  lastHotswap: LastHotswapInfo | null;
 }
 
 export interface PanelHandle {
@@ -928,6 +952,7 @@ export async function startPanel(
       lastTailscale = await detectTailscale(service.port());
       lastTailscaleAt = Date.now();
     }
+    const identity = getRuntimeIdentity();
     return {
       service: {
         state: running ? "running" : "stopped",
@@ -940,7 +965,11 @@ export async function startPanel(
       tunnel: await tunnelStatus(config, currentTunnel, quickTunnel, mode === "tailscale" ? lastTailscale : undefined),
       root: config.root,
       panelPort,
-      version: VERSION,
+      version: identity.version,
+      buildId: identity.buildId,
+      startedAt: identity.startedAt,
+      pid: identity.pid,
+      lastHotswap: readLastHotswap(resolveLogDir(), config.token),
     };
   }
 
@@ -1016,9 +1045,37 @@ export async function startPanel(
       return;
     }
 
+    if (req.method === "GET" && url.pathname === "/api/hotswap") {
+      sendJson(res, 200, { lastHotswap: readLastHotswap(resolveLogDir(), config.token) });
+      return;
+    }
+
     if (req.method === "GET" && url.pathname === "/api/logs") {
       const token = config.token;
-      sendJson(res, 200, { lines: recentLogs().map((line) => redactText(line, token)) });
+      const levelRaw = url.searchParams.get("level")?.trim();
+      let level: LogLevel | undefined;
+      if (levelRaw) {
+        const parsed = parseLogLevel(levelRaw);
+        if (!parsed) {
+          sendJson(res, 400, { error: `不支持的 level 参数：${levelRaw}` });
+          return;
+        }
+        level = parsed;
+      }
+      const limitRaw = url.searchParams.get("limit")?.trim();
+      let limit: number | undefined;
+      if (limitRaw) {
+        const parsed = Number(limitRaw);
+        if (!Number.isInteger(parsed) || parsed < 1) {
+          sendJson(res, 400, { error: `limit 必须是正整数，收到：${limitRaw}` });
+          return;
+        }
+        limit = parsed;
+      }
+      const q = url.searchParams.get("q") ?? undefined;
+      sendJson(res, 200, {
+        lines: queryLogs({ level, limit, q }).map((line) => redactText(line, token)),
+      });
       return;
     }
 

@@ -10,6 +10,7 @@ import { configFilePath } from "./config.js";
 import { closeExecutor } from "./executor.js";
 import { readBody, sendJson } from "./httpHelpers.js";
 import { handleIconRequest } from "./icon.js";
+import { getRuntimeIdentity } from "./status.js";
 import { logDebug, logError, logInfo, logWarn, redactText } from "./log.js";
 import { OAuthProvider, safeEqual } from "./oauth.js";
 import { createServer } from "./server.js";
@@ -418,9 +419,9 @@ export function createMcpService(config: AppConfig): McpService {
       return;
     }
 
-    // 健康检查在鉴权之前：只暴露服务存活，不带任何敏感信息
+    // 健康检查在鉴权之前：暴露服务存活与非敏感运行指纹，不带任何凭据
     if (requestUrl.pathname === HEALTH_PATH) {
-      sendJson(res, 200, { ok: true, service: "nexus-mcp" });
+      sendJson(res, 200, { ok: true, service: "nexus-mcp", ...getRuntimeIdentity() });
       return;
     }
 

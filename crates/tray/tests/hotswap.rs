@@ -223,6 +223,11 @@ fn in_place_hotswap_upgrades_and_bad_binary_rolls_back_preserving_user_data() {
         thread::sleep(Duration::from_millis(50));
     }
     assert_eq!(fs::read(dir.join("nexus-executor.exe")).unwrap(), b"exec-v2");
+    let hs_ok: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.join("logs").join("last-hotswap.json")).unwrap())
+            .unwrap();
+    assert_eq!(hs_ok["status"], "ok");
+    assert_eq!(hs_ok["mode"], "in-place");
     // 确认换核期间关停旧核传的是 includeTunnel: false（保隧道不断）
     let sd = fs::read_to_string(&shutdown_log).unwrap();
     assert!(sd.contains("\"includeTunnel\":false"));
@@ -257,6 +262,11 @@ fn in_place_hotswap_upgrades_and_bad_binary_rolls_back_preserving_user_data() {
         b"exec-v2",
         "执行器也应一并回滚为 v2"
     );
+    let hs_rb: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.join("logs").join("last-hotswap.json")).unwrap())
+            .unwrap();
+    assert_eq!(hs_rb["status"], "rolled_back");
+    assert_eq!(hs_rb["mode"], "in-place");
 
     // 用户数据全程字节级不变
     assert_eq!(fs::read_to_string(dir.join("config.json")).unwrap(), config_content);

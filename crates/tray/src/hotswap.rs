@@ -85,6 +85,34 @@ fn append_log(log_path: &Path, line: &str) {
     }
 }
 
+#[derive(Serialize)]
+struct LastHotswapRecord<'a> {
+    status: &'a str,
+    mode: &'a str,
+    at: String,
+    detail: &'a str,
+}
+
+fn write_last_hotswap(log_path: &Path, status: &str, detail: &str) {
+    let Some(parent) = log_path.parent() else {
+        return;
+    };
+    let _ = fs::create_dir_all(parent);
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let record = LastHotswapRecord {
+        status,
+        mode: "in-place",
+        at: ts.to_string(),
+        detail,
+    };
+    if let Ok(json) = serde_json::to_string_pretty(&record) {
+        let _ = fs::write(parent.join("last-hotswap.json"), json);
+    }
+}
+
 fn backup_file(target: &Path) -> io::Result<Option<PathBuf>> {
     if !target.exists() {
         return Ok(None);
@@ -183,10 +211,41 @@ pub fn perform_hotswap(
     }
 
     // 2) 备份旧文件为 .prev（绝不触碰 config.json 与 oauth-store.json）
-    let prev_server = backup_file(&target_server)
-        .map_err(|e| format!("备份旧协议层失败: {e}"))?;
+    let restore_and_record = |guard: &mut Option<ManagedServer>,
+                              prev_server: &Option<PathBuf>,
+                              prev_executor: &Option<PathBuf>,
+                              reason: &str| {
+        if let Some(p) = prev_server {
+            let _ = restore_file(p, &target_server);
+        }
+        if let Some(p) = prev_executor {
+            let _ = restore_file(p, &target_executor);
+        }
+        let recovered = ManagedServer::spawn(spec).ok();
+        let status = if recovered.is_some() { "rolled_back" } else { "failed" };
+        if let Some(restored) = recovered {
+            *guard = Some(restored);
+        }
+        write_last_hotswap(log_path, status, reason);
+    };
+
+    let prev_server = match backup_file(&target_server) {
+        Ok(p) => p,
+        Err(e) => {
+            let reason = format!("备份旧协议层失败: {e}");
+            write_last_hotswap(log_path, "failed", &reason);
+            return Err(reason);
+        }
+    };
     let prev_executor = if new_executor_src.is_some() {
-        backup_file(&target_executor).map_err(|e| format!("备份旧执行器失败: {e}"))?
+        match backup_file(&target_executor) {
+            Ok(p) => p,
+            Err(e) => {
+                let reason = format!("备份旧执行器失败: {e}");
+                write_last_hotswap(log_path, "failed", &reason);
+                return Err(reason);
+            }
+        }
     } else {
         None
     };
@@ -202,16 +261,9 @@ pub fn perform_hotswap(
 
     if let Err(err) = replace_result {
         append_log(log_path, &format!("hotswap.copy_failed err={err}，开始回滚"));
-        if let Some(p) = &prev_server {
-            let _ = restore_file(p, &target_server);
-        }
-        if let Some(p) = &prev_executor {
-            let _ = restore_file(p, &target_executor);
-        }
-        if let Ok(restored) = ManagedServer::spawn(spec) {
-            *guard = Some(restored);
-        }
-        return Err(format!("替换产物失败并已回滚: {err}"));
+        let reason = format!("替换产物失败并已回滚: {err}");
+        restore_and_record(&mut guard, &prev_server, &prev_executor, &reason);
+        return Err(reason);
     }
 
     // 4) 拉起新协议层并执行 10 秒 /health 校验
@@ -220,25 +272,16 @@ pub fn perform_hotswap(
         Err(err) => {
             let reason = format!("拉起新协议层失败: {err}");
             append_log(log_path, &format!("hotswap.spawn_failed {reason}，开始回滚"));
-            if let Some(p) = &prev_server {
-                let _ = restore_file(p, &target_server);
-            }
-            if let Some(p) = &prev_executor {
-                let _ = restore_file(p, &target_executor);
-            }
-            if let Ok(restored) = ManagedServer::spawn(spec) {
-                *guard = Some(restored);
-            }
+            restore_and_record(&mut guard, &prev_server, &prev_executor, &reason);
             return Err(reason);
         }
     };
 
     match wait_for_health(&mut new_child, spec.mcp_port, health_timeout) {
         Ok(()) => {
-            append_log(
-                log_path,
-                &format!("hotswap.success pid={} port={}", new_child.pid(), spec.mcp_port),
-            );
+            let detail = format!("pid={} port={}", new_child.pid(), spec.mcp_port);
+            append_log(log_path, &format!("hotswap.success {detail}"));
+            write_last_hotswap(log_path, "ok", &detail);
             *guard = Some(new_child);
             Ok(())
         }
@@ -265,10 +308,16 @@ pub fn perform_hotswap(
                             recovered.is_ok()
                         ),
                     );
+                    write_last_hotswap(
+                        log_path,
+                        if recovered.is_ok() { "rolled_back" } else { "failed" },
+                        &reason,
+                    );
                     *guard = Some(restored);
                 }
                 Err(err) => {
                     append_log(log_path, &format!("hotswap.rollback_spawn_failed err={err}"));
+                    write_last_hotswap(log_path, "failed", &format!("{reason}; 回滚启动失败: {err}"));
                 }
             }
             Err(reason)

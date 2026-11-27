@@ -104,8 +104,8 @@ describe("本地控制面板", () => {
     for (const tool of TOOL_SUMMARY) {
       expect(html).toContain(`<b>${tool.name}</b>`);
     }
-    expect(html).not.toContain("写文件，自动建目录");
-    expect(html).toContain("不自动建目录");
+    expect(html).not.toContain("不自动建目录");
+    expect(html).toContain("自动建父目录");
 
     const { client, transport } = await connectClient(server.mcpUrl);
     const listed = await client.listTools();

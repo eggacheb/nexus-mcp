@@ -191,40 +191,31 @@ interface Pending {
   timer: NodeJS.Timeout;
 }
 
-/** 执行器协议客户端：单行 JSON over stdio，请求带自增 id，同一时间只发一个请求 */
+/** 执行器协议客户端：单行 JSON over stdio，按自增 id 多路复用并发请求 */
 export class ExecutorClient {
   private child: ChildProcess | null = null;
   private lineBuffer = "";
   private stderrTail = "";
   private pending = new Map<number, Pending>();
   private nextId = 1;
-  private queue: Promise<unknown> = Promise.resolve();
 
-  /** 串行发送：所有请求排队，避免协议层与执行器的响应错位 */
-  request<T>(payload: Record<string, unknown>): Promise<T> {
-    const run = (): Promise<T> => this.dispatch<T>(payload);
-    const result = this.queue.then(run, run);
-    this.queue = result.then(
-      () => undefined,
-      () => undefined,
-    );
-    return result;
-  }
-
-  private dispatch<T>(payload: Record<string, unknown>): Promise<T> {
+  /** 按自增 id 直接派发，响应由 pending 表按 id 路由，避免慢请求阻塞其他工具 */
+  request<T>(
+    payload: Record<string, unknown>,
+    options?: { deadlineMs?: number },
+  ): Promise<T> {
     const child = this.ensureProcess();
     const id = this.nextId++;
     const op = typeof payload.op === "string" ? payload.op : "unknown";
     const startedAt = Date.now();
     const timeoutMs =
       typeof payload.timeout_ms === "number" ? payload.timeout_ms : 120_000;
-    const deadlineMs = timeoutMs + 15_000;
+    const deadlineMs = options?.deadlineMs ?? timeoutMs + 15_000;
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         logError("ipc.timeout", { id, op, timeout_ms: deadlineMs });
-        void this.close();
-        reject(new Error(`执行器在 ${deadlineMs}ms 内没有响应请求 ${id}，已终止执行器进程`));
+        reject(new Error(`执行器在 ${deadlineMs}ms 内没有响应请求 ${id}`));
       }, deadlineMs);
       this.pending.set(id, {
         op,

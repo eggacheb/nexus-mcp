@@ -57,7 +57,7 @@ export interface RegisterToolsOptions {
  */
 export const TOOL_SUMMARY: ReadonlyArray<{ name: string; summary: string }> = [
   { name: "read", summary: "读文件，支持行范围" },
-  { name: "write", summary: "覆盖写文件，不自动建目录" },
+  { name: "write", summary: "覆盖写文件，自动建父目录" },
   { name: "edit", summary: "按上下文替换文件片段" },
   { name: "bash", summary: "在沙箱里跑命令" },
   { name: "glob", summary: "按通配符找文件" },
@@ -203,7 +203,7 @@ export function registerTools(
     "write",
     {
       title: "Write file",
-      description: "把内容整体写入文件，覆盖原文件。需要局部修改请用 edit。",
+      description: "把内容整体写入文件，覆盖原文件（沙箱内缺失的父目录会自动创建）。需要局部修改请用 edit。",
       inputSchema: {
         path: z.string().describe("文件路径，绝对路径或相对根目录"),
         content: z.string().describe("完整文件内容"),
@@ -460,25 +460,39 @@ export function registerTools(
     "job_output",
     {
       title: "Read job output",
-      description: "读取后台任务的增量输出与退出状态。任务结束后保留结果供反复查看。",
+      description:
+        "读取后台任务的增量输出与退出状态。任务结束后保留结果供反复查看；传 wait_ms 可短等待任务退出或新输出。",
       annotations: READ_ONLY_ANNOTATIONS,
       inputSchema: {
         job_id: z.string().describe("job_start 返回的 id"),
         offset: z.number().int().min(0).optional().describe("从第几个字节开始读"),
+        wait_ms: z
+          .number()
+          .int()
+          .min(0)
+          .max(30_000)
+          .optional()
+          .describe("可选短等待毫秒数（0-30000，默认 0 立即返回；任务退出或有新输出时提前返回）"),
       },
     },
-    async ({ job_id, offset }, extra) => {
+    async ({ job_id, offset, wait_ms }, extra) => {
+      const effectiveWait = wait_ms ?? 0;
       const trace = beginTool("job_output", extra, {
         job_id,
         offset: offset ?? 0,
+        wait_ms: effectiveWait > 0 ? effectiveWait : undefined,
       });
       try {
-        const response = await getExecutor().request<JobOutputResponse>({
-          op: "job_output",
-          job_id,
-          offset: offset ?? 0,
-          max_output_bytes: config.maxOutputBytes,
-        });
+        const response = await getExecutor().request<JobOutputResponse>(
+          {
+            op: "job_output",
+            job_id,
+            offset: offset ?? 0,
+            wait_ms: effectiveWait,
+            max_output_bytes: config.maxOutputBytes,
+          },
+          { deadlineMs: Math.max(120_000, effectiveWait + 15_000) },
+        );
         if (!response.ok) return trace.fail(response.error);
         const head = [`status: ${response.status}`];
         if (response.exit_code !== null) head.push(`exit_code: ${response.exit_code}`);

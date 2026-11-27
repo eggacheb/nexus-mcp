@@ -516,14 +516,52 @@ fn write_op_creates_overwrites_and_preserves_line_endings_exactly() {
 }
 
 #[test]
-fn write_op_missing_parent_is_readable_error_without_creating_dirs() {
+fn write_op_auto_creates_missing_parent_dirs_within_sandbox() {
     let root = temp_root("write-parent");
     let target = root.join("no-such-dir").join("deep").join("child.txt");
+    let response = handle_request(&write_request_line(&root, &target, "nested-ok"));
+    assert_eq!(response["ok"], json!(true), "响应: {response}");
+    assert_eq!(response["bytes_written"], json!("nested-ok".len()));
+    assert_eq!(fs::read_to_string(&target).unwrap(), "nested-ok");
+    cleanup(&root);
+}
+
+#[test]
+fn write_op_rejects_parent_component_that_is_existing_file() {
+    let root = temp_root("write-parent-file");
+    let blocker = root.join("blocker.txt");
+    fs::write(&blocker, "keep-me").unwrap();
+    let target = blocker.join("sub").join("child.txt");
     let response = handle_request(&write_request_line(&root, &target, "x"));
     assert_eq!(response["ok"], json!(false));
-    assert!(response["error"].as_str().unwrap().contains("目录"));
-    assert!(!root.join("no-such-dir").exists());
+    let error = response["error"].as_str().unwrap();
+    assert!(error.contains("文件") || error.contains("目录"), "实际: {error}");
+    assert_eq!(fs::read_to_string(&blocker).unwrap(), "keep-me");
     cleanup(&root);
+}
+
+#[test]
+fn write_op_rejects_nested_missing_dir_under_escape_symlink() {
+    let root = temp_root("write-link-nested");
+    let outside = temp_root("write-link-nested-out");
+    let Some((_, write_path)) = make_escape_paths(&root, &outside) else {
+        eprintln!("跳过：造不出逃逸链接（无特权且 junction 失败）");
+        cleanup(&root);
+        cleanup(&outside);
+        return;
+    };
+    let parent_link = write_path.parent().unwrap();
+    // 只有当逃逸入口是目录链接（如 junction）时才构造嵌套缺失子目录
+    if parent_link != root {
+        let nested = parent_link.join("should-not-create").join("deep.txt");
+        let response = handle_request(&write_request_line(&root, &nested, "x"));
+        assert_eq!(response["ok"], json!(false));
+        let error = response["error"].as_str().unwrap();
+        assert!(error.contains("越界"), "实际: {error}");
+        assert!(!outside.join("should-not-create").exists());
+    }
+    cleanup(&root);
+    cleanup(&outside);
 }
 
 #[test]
@@ -718,4 +756,59 @@ fn edit_op_preserves_crlf_and_mixed_endings() {
     assert_eq!(response["ok"], json!(false));
     assert!(response["error"].as_str().unwrap().contains("缩进"));
     cleanup(&root);
+}
+
+// ---------- 多路并发、双车道与按文件写锁测试 ----------
+
+#[test]
+fn concurrent_edits_same_file_do_not_lose_updates() {
+    let root = temp_root("concurrent-edit-lock");
+    let file = root.join("shared.txt");
+    let initial = (0..12)
+        .map(|i| format!("slot-{i}: before"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(&file, &initial).unwrap();
+
+    let handles: Vec<_> = (0..12)
+        .map(|i| {
+            let root = root.clone();
+            let file = file.clone();
+            thread::spawn(move || {
+                handle_request(&edit_request_line(
+                    &root,
+                    &file,
+                    &format!("slot-{i}: before"),
+                    &format!("slot-{i}: after"),
+                    false,
+                ))
+            })
+        })
+        .collect();
+
+    for (i, h) in handles.into_iter().enumerate() {
+        let resp = h.join().unwrap();
+        assert_eq!(resp["ok"], json!(true), "第 {i} 个并发 edit 失败: {resp}");
+    }
+    let final_text = fs::read_to_string(&file).unwrap();
+    for i in 0..12 {
+        assert!(
+            final_text.contains(&format!("slot-{i}: after")),
+            "并发编辑丢失第 {i} 行改动:\n{final_text}"
+        );
+    }
+    assert_eq!(file_lock::table().len(), 0, "锁释放后条目应自动清理");
+    cleanup(&root);
+}
+
+#[test]
+fn lane_classification_routes_control_ops_separately_from_ordinary() {
+    assert!(is_control_request(r#"{"id":1,"op":"ping"}"#));
+    assert!(is_control_request(r#"{"id":2,"op":"job_kill","job_id":"job-1"}"#));
+    assert!(is_control_request(r#"{"id":3,"op":"job_output","job_id":"job-1"}"#));
+    assert!(is_control_request(r#"{"id":4,"op":"job_output","job_id":"job-1","wait_ms":0}"#));
+    assert!(!is_control_request(r#"{"id":5,"op":"job_output","job_id":"job-1","wait_ms":5000}"#));
+    assert!(!is_control_request(r#"{"id":6,"op":"bash","command":"echo hi"}"#));
+    assert!(!is_control_request(r#"{"id":7,"op":"read","path":"a.txt"}"#));
 }

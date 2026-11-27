@@ -243,16 +243,33 @@ describe("read/write 工具", () => {
   );
 
   it(
-    "写入的父目录不存在时返回可读错误，不自动创建",
+    "写入的父目录不存在时自动创建沙箱内缺失目录并成功落盘",
     { timeout: 15_000 },
     async () => {
       const result = await callWrite(session.client, {
-        path: "no-such-dir/deep/child.txt",
+        path: "auto-dir/deep/child.txt",
+        content: "nested-content",
+      });
+      expectOk(result);
+      expect(readFileSync(path.join(root, "auto-dir", "deep", "child.txt"), "utf8")).toBe(
+        "nested-content",
+      );
+    },
+  );
+
+  it(
+    "父路径上某一段是已存在的普通文件时拒绝写入且不破坏原文件",
+    { timeout: 15_000 },
+    async () => {
+      const blocker = path.join(root, "parent-is-file.txt");
+      writeFileSync(blocker, "original", "utf8");
+      const result = await callWrite(session.client, {
+        path: "parent-is-file.txt/nested/child.txt",
         content: "x",
       });
       expect(result.isError).toBe(true);
-      expect(textOf(result)).toContain("目录");
-      expect(existsSync(path.join(root, "no-such-dir"))).toBe(false);
+      expect(textOf(result)).toMatch(/文件|目录/);
+      expect(readFileSync(blocker, "utf8")).toBe("original");
     },
   );
 
@@ -285,6 +302,18 @@ describe("read/write 工具", () => {
         const writeEscape = await callWrite(session.client, { path: escaped.writePath, content: "x" });
         expect(writeEscape.isError).toBe(true);
         expect(textOf(writeEscape)).toContain(path.basename(escaped.writePath));
+
+        // 逃逸目录链接下的深层缺失目录也不能在根外被自动创建
+        const escapeParent = path.posix.dirname(escaped.writePath.replace(/\\/g, "/"));
+        if (escapeParent && escapeParent !== ".") {
+          const nestedEscape = await callWrite(session.client, {
+            path: `${escapeParent}/should-not-create/deep.txt`,
+            content: "x",
+          });
+          expect(nestedEscape.isError).toBe(true);
+          expect(textOf(nestedEscape)).toContain("越界");
+          expect(existsSync(path.join(outside, "should-not-create"))).toBe(false);
+        }
       } else {
         t.skip();
       }

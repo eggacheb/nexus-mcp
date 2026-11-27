@@ -1,10 +1,73 @@
+import { createHash } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
 import http from "node:http";
+import path from "node:path";
 import { effectiveTunnelMode } from "./config.js";
 import type { AppConfig, TunnelMode } from "./config.js";
 import { probeExecutorHandshake } from "./executor.js";
+import { redactText } from "./log.js";
+import { appRoot, isPackaged } from "./paths.js";
 import type { QuickTunnelInfo, QuickTunnelManager } from "./quickTunnel.js";
 import type { TailscaleInfo } from "./tailscale.js";
 import type { TunnelManager, TunnelProcessInfo } from "./tunnel.js";
+import { VERSION } from "./version.js";
+
+export interface RuntimeIdentity {
+  version: string;
+  buildId: string;
+  startedAt: string;
+  pid: number;
+}
+
+export interface LastHotswapInfo {
+  status: "ok" | "rolled_back" | "failed" | "unknown";
+  mode: string;
+  at: string;
+  detail: string;
+}
+
+function computeBuildId(): string {
+  try {
+    const target = isPackaged ? process.execPath : path.join(appRoot, "dist", "index.js");
+    if (!existsSync(target)) return "unknown";
+    return createHash("sha256").update(readFileSync(target)).digest("hex").slice(0, 8);
+  } catch {
+    return "unknown";
+  }
+}
+
+/** 协议层启动时计算一次运行身份指纹与启动时间，供 /health 与 /api/status 共用 */
+const RUNTIME_IDENTITY: RuntimeIdentity = {
+  version: VERSION,
+  buildId: computeBuildId(),
+  startedAt: new Date().toISOString(),
+  pid: process.pid,
+};
+
+export function getRuntimeIdentity(): RuntimeIdentity {
+  return RUNTIME_IDENTITY;
+}
+
+/** 只读解析服务日志目录下的 last-hotswap.json，缺失或损坏返回 null，detail 始终脱敏 */
+export function readLastHotswap(logDir: string, secret?: string): LastHotswapInfo | null {
+  const filePath = path.join(logDir, "last-hotswap.json");
+  if (!existsSync(filePath)) return null;
+  try {
+    const raw = JSON.parse(readFileSync(filePath, "utf8")) as Record<string, unknown>;
+    if (!raw || typeof raw !== "object") return null;
+    const statusRaw = typeof raw.status === "string" ? raw.status : "unknown";
+    const status: LastHotswapInfo["status"] =
+      statusRaw === "ok" || statusRaw === "rolled_back" || statusRaw === "failed"
+        ? statusRaw
+        : "unknown";
+    const mode = typeof raw.mode === "string" ? raw.mode : "unknown";
+    const at = typeof raw.at === "string" ? raw.at : "";
+    const detail = typeof raw.detail === "string" ? redactText(raw.detail, secret) : "";
+    return { status, mode, at, detail };
+  } catch {
+    return null;
+  }
+}
 
 /** connecting = 进程在跑但还没连上 Cloudflare 边缘（黄灯，不是故障） */
 export type ComponentState = "up" | "down" | "connecting" | "unavailable" | "unconfigured";

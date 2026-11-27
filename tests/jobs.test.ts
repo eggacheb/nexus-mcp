@@ -622,4 +622,80 @@ describe("job_kill 工具", () => {
       expect(bodyOf(textOf(replay))).toContain("before-kill");
     },
   );
+
+  it(
+    "job_output 支持 wait_ms：任务提前退出立刻返回，新输出提前唤醒，且等待期间不阻塞并发 job_kill",
+    { timeout: 40_000 },
+    async () => {
+      // 1) 任务 0.4s 后输出并退出：单次 job_output(wait_ms=5000) 应一次拿到退出态与完整输出，且远快于 5000ms
+      const quickStart = await callTool(session.client, "job_start", {
+        command: "sleep 0.4; echo done-fast",
+      });
+      expectOk(quickStart);
+      const quickId = jobIdOf(textOf(quickStart));
+      const t0 = Date.now();
+      const quickOut = await callTool(session.client, "job_output", {
+        job_id: quickId,
+        wait_ms: 5000,
+      });
+      const elapsedQuick = Date.now() - t0;
+      expectOk(quickOut);
+      expect(statusOf(textOf(quickOut))).toBe("exited");
+      expect(exitCodeOf(textOf(quickOut))).toBe(0);
+      expect(bodyOf(textOf(quickOut))).toContain("done-fast");
+      expect(elapsedQuick).toBeLessThan(3500);
+
+      // 2) 长任务在 wait_ms=10000 阻塞等待期间，并发 job_kill 立即生效并唤醒等待中的 job_output
+      const longStart = await callTool(session.client, "job_start", {
+        command: "sleep 30",
+      });
+      expectOk(longStart);
+      const longId = jobIdOf(textOf(longStart));
+      const waitStarted = Date.now();
+      const waitPromise = callTool(session.client, "job_output", {
+        job_id: longId,
+        wait_ms: 10_000,
+      });
+      await new Promise((r) => setTimeout(r, 200));
+      const killRes = await callTool(session.client, "job_kill", { job_id: longId });
+      expectOk(killRes);
+      expect(killedOf(textOf(killRes))).toBe(true);
+
+      const waitRes = await waitPromise;
+      const waitElapsed = Date.now() - waitStarted;
+      expectOk(waitRes);
+      expect(statusOf(textOf(waitRes))).toBe("exited");
+      expect(waitElapsed).toBeLessThan(4000);
+
+      // 3) 运行中出现新输出经防抖提前唤醒 + 超时无新输出正常返回 running
+      const streamStart = await callTool(session.client, "job_start", {
+        command: "sleep 0.3; echo mid-chunk; sleep 10",
+      });
+      expectOk(streamStart);
+      const streamId = jobIdOf(textOf(streamStart));
+      try {
+        const s0 = Date.now();
+        const mid = await callTool(session.client, "job_output", {
+          job_id: streamId,
+          offset: 0,
+          wait_ms: 5000,
+        });
+        expectOk(mid);
+        expect(statusOf(textOf(mid))).toBe("running");
+        expect(bodyOf(textOf(mid))).toContain("mid-chunk");
+        expect(Date.now() - s0).toBeLessThan(3000);
+
+        const nextOff = nextOffsetOf(textOf(mid));
+        const idle = await callTool(session.client, "job_output", {
+          job_id: streamId,
+          offset: nextOff,
+          wait_ms: 300,
+        });
+        expectOk(idle);
+        expect(statusOf(textOf(idle))).toBe("running");
+      } finally {
+        await callTool(session.client, "job_kill", { job_id: streamId });
+      }
+    },
+  );
 });

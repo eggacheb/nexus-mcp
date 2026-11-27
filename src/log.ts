@@ -28,8 +28,8 @@ const LEVEL_TAG: Record<LogLevel, string> = {
   error: "ERROR",
 };
 
-/** 进程内环形缓冲容量；面板默认取最近 100 行 */
-const CAPACITY = 200;
+/** 进程内环形缓冲容量；支持 /api/logs 查询最近 1000 行，面板默认取最近 200 行 */
+const CAPACITY = 1000;
 /** 单日志文件默认 10 MB 切分滚动 */
 const DEFAULT_MAX_FILE_BYTES = 10 * 1024 * 1024;
 /** 日志目录最多保留的文件数 */
@@ -287,7 +287,55 @@ export function log(message: string): void {
   logEvent("info", "service", undefined, message);
 }
 
-/** 面板只取最近 100 行 */
+export interface LogQueryOptions {
+  level?: LogLevel;
+  limit?: number;
+  q?: string;
+}
+
+const LINE_LEVEL_PATTERN = /\s\[(DEBUG|INFO|WARN|ERROR)\]\s/;
+
+function lineLevelRank(line: string): number | null {
+  const raw = LINE_LEVEL_PATTERN.exec(line)?.[1];
+  if (!raw) return null;
+  const tag = raw.toLowerCase() as LogLevel;
+  return LEVEL_RANK[tag] ?? null;
+}
+
+/** 面板默认取最近 100 行（兼容旧调用） */
 export function recentLogs(count = 100): string[] {
   return lines.slice(-count);
+}
+
+export function parseLogLevel(raw: string): LogLevel | null {
+  const normalized = raw.trim().toLowerCase();
+  if (
+    normalized === "debug" ||
+    normalized === "info" ||
+    normalized === "warn" ||
+    normalized === "error"
+  ) {
+    return normalized;
+  }
+  return null;
+}
+
+/** 按最低等级、关键字与条数上限查询内存服务日志环（默认返回末尾 200 行） */
+export function queryLogs(options?: LogQueryOptions): string[] {
+  const minRank = options?.level ? LEVEL_RANK[options.level] : null;
+  const needle = options?.q?.trim().toLowerCase() || "";
+  const limit = Math.max(1, Math.min(CAPACITY, options?.limit ?? 200));
+
+  let filtered = lines;
+  if (minRank !== null || needle) {
+    filtered = lines.filter((line) => {
+      if (minRank !== null) {
+        const rank = lineLevelRank(line);
+        if (rank === null || rank < minRank) return false;
+      }
+      if (needle && !line.toLowerCase().includes(needle)) return false;
+      return true;
+    });
+  }
+  return filtered.slice(-limit);
 }

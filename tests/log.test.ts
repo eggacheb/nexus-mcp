@@ -518,4 +518,32 @@ describe("端到端服务日志与工具调用全链路摘要", () => {
     },
     20_000,
   );
+
+  it("内存服务日志环容量扩大至 1000 行，queryLogs 支持 level/limit/q 过滤且默认 200 行", () => {
+    logMod.configureLogger({
+      level: "debug",
+      logDir: null,
+      writeStderr: () => {},
+      resetRing: true,
+    });
+    for (let i = 1; i <= 350; i += 1) {
+      logMod.logEvent("info", "bulk.tick", { i });
+    }
+    logMod.logEvent("warn", "bulk.alert", { tag: "NeedleCase" });
+    logMod.logEvent("error", "bulk.fatal", { tag: "other" });
+
+    // 默认返回末尾 200 行
+    expect(logMod.queryLogs()).toHaveLength(200);
+    // 扩大容量后可查询超过 200 行
+    expect(logMod.queryLogs({ limit: 500 })).toHaveLength(352);
+    // level=warn 仅返回 warn 与 error
+    const warns = logMod.queryLogs({ level: "warn" });
+    expect(warns).toHaveLength(2);
+    expect(warns[0]).toContain("[WARN] [bulk.alert]");
+    expect(warns[1]).toContain("[ERROR] [bulk.fatal]");
+    // q 不区分大小写过滤
+    const matched = logMod.queryLogs({ level: "warn", q: "needlecase", limit: 10 });
+    expect(matched).toHaveLength(1);
+    expect(matched[0]).toContain("NeedleCase");
+  });
 });
