@@ -186,6 +186,7 @@ const PAGE = `<!doctype html>
   <header>
     <h1>nexus-mcp</h1>
     <span class="tag" id="app-version">v${VERSION}</span>
+    <span class="tag" id="hotswap-tag" hidden></span>
     <span class="tag">本地控制面板 · 停 MCP 服务不影响这块页面</span>
   </header>
 
@@ -370,6 +371,20 @@ const PAGE = `<!doctype html>
     setLight("light-executor", s.executor);
     setLight("light-service", s.service);
     setLight("light-tunnel", s.tunnel);
+
+    var verTag = document.getElementById("app-version");
+    if (verTag && s.version) {
+      verTag.textContent = s.buildId ? "v" + s.version + " · " + s.buildId : "v" + s.version;
+    }
+    var hsTag = document.getElementById("hotswap-tag");
+    if (hsTag) {
+      if (s.lastHotswap && s.lastHotswap.status) {
+        hsTag.textContent = "上次热切换: " + s.lastHotswap.status + " (" + (s.lastHotswap.mode || "-") + ")";
+        hsTag.hidden = false;
+      } else {
+        hsTag.hidden = true;
+      }
+    }
 
     document.getElementById("mcp-hint").textContent =
       s.service.label + " · 本地 http://127.0.0.1:" + s.service.port + "/mcp · 会话 " +

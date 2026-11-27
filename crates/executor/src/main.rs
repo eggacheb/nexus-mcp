@@ -73,7 +73,7 @@ struct ReadRequest {
     id: u64,
     path: String,
     root: String,
-    offset: Option<u64>,
+    offset: Option<i64>,
     limit: Option<u64>,
     #[serde(default = "default_read_max_output_bytes")]
     max_output_bytes: u64,
@@ -447,6 +447,10 @@ enum SandboxEntryKind {
         wrong_kind_prefix: &'static str,
         canonicalize_prefix: &'static str,
     },
+    FileOrDirectory {
+        missing_prefix: &'static str,
+        canonicalize_prefix: &'static str,
+    },
 }
 
 /// 已存在路径的统一沙箱双道校验（词法越界检查 + metadata 类型核对 + canonicalize 真实路径验根）。
@@ -470,7 +474,8 @@ fn resolve_existing_within_sandbox(
         Err(_) => {
             let prefix = match expected {
                 SandboxEntryKind::File => "文件不存在",
-                SandboxEntryKind::Directory { missing_prefix, .. } => missing_prefix,
+                SandboxEntryKind::Directory { missing_prefix, .. }
+                | SandboxEntryKind::FileOrDirectory { missing_prefix, .. } => missing_prefix,
             };
             return Err(error_response(id, format!("{prefix}: {input}")));
         }
@@ -492,6 +497,9 @@ fn resolve_existing_within_sandbox(
             }
             canonicalize_prefix
         }
+        SandboxEntryKind::FileOrDirectory {
+            canonicalize_prefix, ..
+        } => canonicalize_prefix,
     };
     let canonical = match fs::canonicalize(&target) {
         Ok(path) => path,
@@ -508,9 +516,8 @@ fn resolve_existing_within_sandbox(
     Ok(canonical)
 }
 
-/// glob/grep 共用：解析搜索起点（根目录或根内子目录），返回
+/// glob 专用：解析搜索起点目录（根目录或根内子目录），返回
 /// (canonical 根目录, canonical 起点目录)。起点不存在或指向根外时给出可读错误。
-/// 与 read/write 不同，起点允许是目录本身；但越界判定与文件操作同一套规矩。
 fn resolve_search_dir(
     root_str: &str,
     path_str: Option<&str>,
@@ -525,12 +532,44 @@ fn resolve_search_dir(
         input,
         SandboxEntryKind::Directory {
             missing_prefix: "搜索起点不存在或不是目录",
-            wrong_kind_prefix: "搜索起点是文件不是目录，glob/grep 需要目录起点",
+            wrong_kind_prefix: "搜索起点是文件不是目录，glob 需要目录起点",
             canonicalize_prefix: "路径解析失败",
         },
         id,
     )?;
     Ok((root.canonical, canonical))
+}
+
+pub(crate) enum GrepTarget {
+    Dir(PathBuf),
+    File(PathBuf),
+}
+
+/// grep 专用：搜索起点既可以是目录，也可以是沙箱根内的单个普通文件。
+fn resolve_grep_target(
+    root_str: &str,
+    path_str: Option<&str>,
+    id: Option<u64>,
+) -> Result<(PathBuf, GrepTarget), Value> {
+    let root = resolve_root(root_str, id)?;
+    let Some(input) = path_str.map(str::trim).filter(|input| !input.is_empty()) else {
+        return Ok((root.canonical.clone(), GrepTarget::Dir(root.canonical)));
+    };
+    let canonical = resolve_existing_within_sandbox(
+        &root,
+        input,
+        SandboxEntryKind::FileOrDirectory {
+            missing_prefix: "搜索起点不存在",
+            canonicalize_prefix: "路径解析失败",
+        },
+        id,
+    )?;
+    let target = if fs::metadata(&canonical).map(|m| m.is_file()).unwrap_or(false) {
+        GrepTarget::File(canonical)
+    } else {
+        GrepTarget::Dir(canonical)
+    };
+    Ok((root.canonical, target))
 }
 
 /// 结果路径的展示前缀：搜索起点相对沙箱根的路径（正斜杠）；起点就是根时为空串。
@@ -569,7 +608,15 @@ fn run_read(request: &ReadRequest) -> Value {
 
     let lines: Vec<&str> = text.lines().collect();
     let total = lines.len() as u64;
-    let offset = request.offset.unwrap_or(1).max(1);
+    let raw_offset = request.offset.unwrap_or(1);
+    if raw_offset == 0 {
+        return error_response(id, "offset 不能为 0（正数从 1 开始，负数表示从文件末尾倒数）");
+    }
+    let offset: u64 = if raw_offset < 0 {
+        total.saturating_sub(raw_offset.unsigned_abs()) + 1
+    } else {
+        raw_offset as u64
+    };
     let limit = request.limit.unwrap_or(MAX_READ_LINES).clamp(1, MAX_READ_LINES);
     if offset > total {
         return json!({

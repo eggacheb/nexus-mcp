@@ -196,7 +196,7 @@ function isPidAlive(pid) {
 
 async function stopRunningTray(targetDir, logPath) {
   const ctrl = readControlInfo(targetDir);
-  if (!ctrl) return;
+  if (!ctrl || !isPidAlive(ctrl.pid)) return;
   try {
     await requestLoopback(
       ctrl.port,
@@ -258,23 +258,25 @@ async function runWorker(opts) {
   await stopRunningTray(targetDir, logPath);
   await sleep(250);
 
-  // 备份旧三件套（严格不碰 config.json / oauth-store.json）
+  // 仅备份并替换内容确有变化的文件（跳过哈希一致的大二进制，严格不碰 config.json / oauth-store.json）
+  const toReplace = [];
   const backedUp = [];
   for (const name of files) {
+    const src = path.join(stageDir, name);
+    if (!existsSync(src)) continue;
     const dst = path.join(targetDir, name);
-    const prev = path.join(targetDir, `${name}.prev`);
+    if (sha256File(src) === sha256File(dst)) continue;
+    toReplace.push({ src, dst, name });
     if (existsSync(dst)) {
+      const prev = path.join(targetDir, `${name}.prev`);
       await copyWithRetry(dst, prev);
       backedUp.push({ dst, prev, name });
     }
   }
 
   try {
-    for (const name of files) {
-      const src = path.join(stageDir, name);
-      if (existsSync(src)) {
-        await copyWithRetry(src, path.join(targetDir, name));
-      }
+    for (const item of toReplace) {
+      await copyWithRetry(item.src, item.dst);
     }
     const newPid = spawnDetachedTray(targetDir);
     appendLog(logPath, `worker.spawned_new pid=${newPid} port=${mcpPort}`);
@@ -299,7 +301,8 @@ async function runWorker(opts) {
     }
     if (existsSync(path.join(targetDir, TRAY_EXE))) {
       const restoredPid = spawnDetachedTray(targetDir);
-      const recovered = await waitForHealth(mcpPort, healthTimeoutMs);
+      const recoverTimeoutMs = Math.max(healthTimeoutMs, 10_000);
+      const recovered = await waitForHealth(mcpPort, recoverTimeoutMs);
       appendLog(logPath, `worker.rollback_done pid=${restoredPid} recovered=${recovered}`);
       writeLastHotswap(
         logPath,

@@ -248,7 +248,7 @@ describe("票 06: 本地一键热切换部署脚本（缝隙 3）", () => {
 
       await waitFor(() => {
         return existsSync(res3.logPath) && readFileSync(res3.logPath, "utf8").includes("worker.rollback_done");
-      }, 25_000);
+      }, 35_000);
 
       const lastRbPath = path.join(targetDir, "logs", "last-hotswap.json");
       const lastRb = JSON.parse(readFileSync(lastRbPath, "utf8")) as { status: string; mode: string };

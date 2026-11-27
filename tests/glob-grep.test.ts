@@ -213,6 +213,43 @@ describe("glob/grep 工具", () => {
   );
 
   it(
+    "grep 的 path 支持直接传单文件路径，并返回相对沙箱根路径",
+    { timeout: 30_000 },
+    async () => {
+      const result = await callGrep(session.client, {
+        pattern: "hello",
+        path: "src/app.ts",
+      });
+      expectOk(result);
+      const text = textOf(result);
+      expect(text).toContain("src/app.ts:");
+      expect(text).not.toContain("docs/readme.md");
+
+      const insensitive = await callGrep(session.client, {
+        pattern: "hello mixed",
+        path: "src/app.ts",
+        ignore_case: true,
+      });
+      expectOk(insensitive);
+      expect(textOf(insensitive)).toContain("src/app.ts:4: Hello Mixed Case");
+
+      const missing = await callGrep(session.client, {
+        pattern: "hello",
+        path: "src/does-not-exist.ts",
+      });
+      expect(missing.isError).toBe(true);
+      expect(textOf(missing)).toContain("不存在");
+
+      const escaped = await callGrep(session.client, {
+        pattern: "hello",
+        path: "../outside.txt",
+      });
+      expect(escaped.isError).toBe(true);
+      expect(textOf(escaped)).toContain("越界");
+    },
+  );
+
+  it(
     "grep 的 glob 参数限定文件范围",
     { timeout: 30_000 },
     async () => {

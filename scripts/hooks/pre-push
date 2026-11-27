@@ -6,17 +6,20 @@
 unset MSYS_NO_PATHCONV
 
 cd "$(git rev-parse --show-toplevel)" || exit 1
-GIT_DIR="$(git rev-parse --git-dir)"
-STAMP_FILE="$GIT_DIR/last-check-ok"
-HEAD_SHA="$(git rev-parse HEAD)"
+git_dir="$(git rev-parse --git-dir)"
+stamp_file="$git_dir/last-check-ok"
+head_sha="$(git rev-parse HEAD)"
 
-if [ -z "$(git status --porcelain)" ] && [ -f "$STAMP_FILE" ]; then
-  STAMP_SHA="$(tr -d '\r\n' < "$STAMP_FILE")"
-  if [ "$STAMP_SHA" = "$HEAD_SHA" ]; then
-    echo "pre-push: HEAD $HEAD_SHA 已通过全量 npm run check，跳过重复执行"
+if [ -z "$(git status --porcelain)" ] && [ -f "$stamp_file" ]; then
+  stamp_sha="$(tr -d '\r\n' < "$stamp_file")"
+  if [ "$stamp_sha" = "$head_sha" ]; then
+    echo "pre-push: HEAD $head_sha 已通过全量 npm run check，跳过重复执行"
     exit 0
   fi
 fi
 
+# 清理 git 钩子可能导出的仓库变量，防止子测试中的临时 git 仓库误读主仓 .git
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+
 echo "pre-push: npm run check"
-npm run check
+npm run check </dev/null

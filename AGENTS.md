@@ -20,12 +20,12 @@
 - 最小三件套打包：`npm run package:stage`（产出 `build/package/` 下的 `nexus-mcp.exe` + `nexus-server.exe` + `nexus-executor.exe`，跳过 NSIS）
 - 本地一键发布：`npm run release [-- <semver>] [--publish]`（同步版本号 → `check` → `package` + `package:smoke` → `release/SHA256SUMS.txt` → 本机 `gh release create`，默认 Draft，不触碰 GitHub Actions）
 - 本机一键热切换：`node scripts/deploy-local.mjs`（最小打包 → 临时端口 `package:smoke` → 托盘内换核或脱离切换，保隧道不断、10 秒 `/health` 失败自动回滚，零改动 `config.json` / `oauth-store.json`；刚跑完 `package` + `package:smoke` 未改源码时加 `--reuse-stage` 跳过重复构建与冒烟，约 15 秒完成）
-- 拉取服务日志：`GET http://127.0.0.1:8788/api/logs`（面板自带接口，返回 JSON `{ lines }`，含最近 200 行已脱敏的服务日志，排查运行期问题可直接请求）
+- 运行指纹与自检：`GET http://127.0.0.1:8787/health` / `GET http://127.0.0.1:8788/api/status` 返回 `{ version, buildId, startedAt, pid }`；`GET http://127.0.0.1:8788/api/hotswap` 返回最近一次热切换脱敏结果（`logs/last-hotswap.json`）；`GET http://127.0.0.1:8788/api/logs` 支持 `?level=&limit=&q=` 过滤最近 1000 行服务日志（默认返回末尾 200 行）
 - 测试：`npm run test`（vitest，跨组件验收一律走 MCP 客户端入口）；Rust 侧单独跑 `npm run test:rs`
 - 自检：`npm run smoke`（起服务、列出工具、调一次 `read`）
 - 本地 CI：`npm run check`（`build` + `test:vitest` + `test:rs` + `smoke`，全绿且工作区干净时写入 `.git/last-check-ok`）
 - 提交钩子：`git config core.hooksPath scripts/hooks`（克隆后执行一次）。`pre-commit` 拦构建产物与常见测试陷阱 + 快速检查（`typecheck` + `cargo check`）；`pre-push` 跑全量 `npm run check`（工作区干净且 `HEAD` 命中 `.git/last-check-ok` 时自动跳过重复执行），别用 `--no-verify` 绕过。
-- **通过本服务自举执行时**：Git Bash 设了 `MSYS_NO_PATHCONV=1`，调 pnpm 下的 npm 脚本统一写 `npm.cmd`（如 `npm.cmd run build`、`npm.cmd run check`），单文件测试跑 `./node_modules/.bin/vitest run --pool=vmThreads <file>`；长命令走 `job_start` / `job_output`（参考耗时：`check` ~55s、`package` ~60s、`deploy-local` ~55s、`deploy-local --reuse-stage` ~15s）。
+- **通过本服务自举执行时**：Git Bash 设了 `MSYS_NO_PATHCONV=1`，调 pnpm 下的 npm 脚本统一写 `npm.cmd`（如 `npm.cmd run build`、`npm.cmd run check`），单文件测试跑 `./node_modules/.bin/vitest run --pool=vmThreads <file>`；长命令走 `job_start` / `job_output`（可传 `wait_ms` 最长 30000 减少空转轮询；参考耗时：`check` ~55s、`package` ~60s、`deploy-local` ~55s、`deploy-local --reuse-stage` ~15s）；`write` 会自动创建沙箱内缺失父目录，`grep` 支持单文件路径，`read` 支持负 `offset` 尾读。
 
 ## 不能碰
 

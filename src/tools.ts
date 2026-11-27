@@ -150,7 +150,12 @@ export function registerTools(
       annotations: READ_ONLY_ANNOTATIONS,
       inputSchema: {
         path: z.string().describe("文件路径，绝对路径或相对根目录"),
-        offset: z.number().int().min(1).optional().describe("起始行号，从 1 开始"),
+        offset: z
+          .number()
+          .int()
+          .refine((n) => n !== 0, "offset 不能为 0")
+          .optional()
+          .describe("起始行号（正数从 1 开始；负数从文件末尾倒数，如 -50 读最后 50 行）"),
         limit: z.number().int().min(1).max(2000).optional().describe("最多读取多少行"),
       },
     },
@@ -374,7 +379,7 @@ export function registerTools(
       annotations: READ_ONLY_ANNOTATIONS,
       inputSchema: {
         pattern: z.string().describe("正则表达式"),
-        path: z.string().optional().describe("搜索起点，默认根目录"),
+        path: z.string().optional().describe("搜索起点（目录或单文件），默认根目录"),
         glob: z.string().optional().describe("限定文件范围，例如 *.ts"),
         ignore_case: z.boolean().optional().describe("是否忽略大小写"),
       },

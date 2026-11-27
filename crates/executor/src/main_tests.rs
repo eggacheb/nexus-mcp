@@ -812,3 +812,83 @@ fn lane_classification_routes_control_ops_separately_from_ordinary() {
     assert!(!is_control_request(r#"{"id":6,"op":"bash","command":"echo hi"}"#));
     assert!(!is_control_request(r#"{"id":7,"op":"read","path":"a.txt"}"#));
 }
+
+#[test]
+fn read_op_negative_offset_reads_tail_and_rejects_zero() {
+    let root = temp_root("read-neg");
+    let file = root.join("lines.txt");
+    let content = (1..=10)
+        .map(|i| format!("line-{i}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(&file, &content).unwrap();
+
+    let tail = handle_request(
+        &json!({
+            "id": 1, "op": "read",
+            "path": file.to_string_lossy(),
+            "root": root.to_string_lossy(),
+            "offset": -3
+        })
+        .to_string(),
+    );
+    assert_eq!(tail["ok"], json!(true));
+    assert_eq!(tail["start_line"], json!(8));
+    assert_eq!(tail["end_line"], json!(10));
+    assert!(tail["content"].as_str().unwrap().contains("line-8"));
+    assert!(tail["content"].as_str().unwrap().contains("line-10"));
+
+    let clamped = handle_request(
+        &json!({
+            "id": 2, "op": "read",
+            "path": file.to_string_lossy(),
+            "root": root.to_string_lossy(),
+            "offset": -99,
+            "limit": 2
+        })
+        .to_string(),
+    );
+    assert_eq!(clamped["ok"], json!(true));
+    assert_eq!(clamped["start_line"], json!(1));
+    assert_eq!(clamped["end_line"], json!(2));
+
+    let zero = handle_request(
+        &json!({
+            "id": 3, "op": "read",
+            "path": file.to_string_lossy(),
+            "root": root.to_string_lossy(),
+            "offset": 0
+        })
+        .to_string(),
+    );
+    assert_eq!(zero["ok"], json!(false));
+    assert!(zero["error"].as_str().unwrap().contains("0"));
+    cleanup(&root);
+}
+
+#[test]
+fn grep_op_accepts_single_file_within_sandbox() {
+    let root = temp_root("grep-file");
+    let sub = root.join("src");
+    fs::create_dir_all(&sub).unwrap();
+    let target = sub.join("only.ts");
+    fs::write(&target, "alpha\nconst needle = 42;\nomega\n").unwrap();
+    fs::write(sub.join("other.ts"), "const needle = 99;\n").unwrap();
+
+    let resp = handle_request(
+        &json!({
+            "id": 1, "op": "grep",
+            "root": root.to_string_lossy(),
+            "path": target.to_string_lossy(),
+            "pattern": "needle"
+        })
+        .to_string(),
+    );
+    assert_eq!(resp["ok"], json!(true), "响应: {resp}");
+    let matches = resp["matches"].as_array().unwrap();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0]["path"], json!("src/only.ts"));
+    assert_eq!(matches[0]["line"], json!(2));
+    cleanup(&root);
+}

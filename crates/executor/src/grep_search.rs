@@ -14,7 +14,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::ripgrep::resolve_rg;
-use super::{default_max_results, display_rel_prefix, error_response, resolve_search_dir};
+use super::{GrepTarget, default_max_results, display_rel_prefix, error_response, resolve_grep_target};
 
 /// 单行内容的字符数上限，对齐 opencode 的 MAX_LINE_CHARS
 const MAX_LINE_CHARS: usize = 2_000;
@@ -39,11 +39,25 @@ pub fn run_grep(request: &GrepRequest) -> Value {
         return error_response(id, "pattern 不能为空");
     }
     let max_results = request.max_results.clamp(1, 1000);
-    let (root_canonical, search_dir) =
-        match resolve_search_dir(&request.root, request.path.as_deref(), id) {
+    let (root_canonical, target) =
+        match resolve_grep_target(&request.root, request.path.as_deref(), id) {
             Ok(pair) => pair,
             Err(response) => return response,
         };
+    let (search_dir, target_arg) = match target {
+        GrepTarget::File(file_path) => {
+            let parent = file_path
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| root_canonical.clone());
+            let name = file_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| ".".into());
+            (parent, name)
+        }
+        GrepTarget::Dir(dir_path) => (dir_path, ".".into()),
+    };
     let rg = match resolve_rg() {
         Ok(path) => path,
         Err(message) => return error_response(id, message),
@@ -64,7 +78,7 @@ pub fn run_grep(request: &GrepRequest) -> Value {
     args.push("--glob=!**/.git/**".into());
     args.push("--".into());
     args.push(request.pattern.clone());
-    args.push(".".into());
+    args.push(target_arg);
 
     let mut child = match Command::new(&rg)
         .args(&args)

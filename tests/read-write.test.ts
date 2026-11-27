@@ -145,6 +145,31 @@ describe("read/write 工具", () => {
   );
 
   it(
+    "read 支持负 offset 尾读，保留真实行号并钳制超大负偏移，拒绝 offset=0",
+    { timeout: 15_000 },
+    async () => {
+      const file = path.join(root, "tail-neg.txt");
+      const lines = Array.from({ length: 10 }, (_, i) => `row-${i + 1}`);
+      writeFileSync(file, lines.join("\n") + "\n", "utf8");
+
+      const last3 = await callRead(session.client, { path: "tail-neg.txt", offset: -3 });
+      expectOk(last3);
+      expect(textOf(last3)).toMatch(/8\trow-8/);
+      expect(textOf(last3)).toMatch(/10\trow-10/);
+      expect(textOf(last3)).not.toContain("row-7");
+
+      const clamp = await callRead(session.client, { path: "tail-neg.txt", offset: -50, limit: 2 });
+      expectOk(clamp);
+      expect(textOf(clamp)).toMatch(/1\trow-1/);
+      expect(textOf(clamp)).toMatch(/2\trow-2/);
+      expect(textOf(clamp)).toContain("offset=3");
+
+      const zero = await callRead(session.client, { path: "tail-neg.txt", offset: 0 });
+      expect(zero.isError).toBe(true);
+    },
+  );
+
+  it(
     "offset 超出文件末尾时返回已有部分而不是报错",
     { timeout: 15_000 },
     async () => {

@@ -19,6 +19,10 @@ interface StatusBody {
   tunnel: { state: string; label: string; detail?: string; url?: string };
   root: string;
   version: string;
+  buildId: string;
+  startedAt: string;
+  pid: number;
+  lastHotswap: { status: string; mode: string; at: string; detail?: string } | null;
 }
 
 async function getStatus(server: RunningServer): Promise<StatusBody> {
@@ -146,10 +150,12 @@ describe("本地控制面板", () => {
   it("版本号可见：页头直接印出，状态接口同源", async () => {
     const status = await getStatus(server);
     expect(status.version).toBe(VERSION);
+    expect(status.buildId).toMatch(/^[0-9a-f]{8}$/);
 
-    // 版本号由服务端直接写进 HTML，不依赖页面脚本渲染
+    // 版本号由服务端直接写进 HTML，页头包含热切状态占位元素
     const html = await (await fetch(server.panelUrl)).text();
     expect(html).toContain('id="app-version"');
+    expect(html).toContain('id="hotswap-tag"');
     expect(html).toContain(`v${VERSION}`);
   });
 
