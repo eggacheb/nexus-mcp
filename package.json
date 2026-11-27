@@ -12,14 +12,15 @@
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.tests.json",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
-    "test": "npm run build:executor && vitest run --pool=vmThreads",
+    "test:vitest": "vitest run --pool=vmThreads",
+    "test": "npm run build:executor && npm run test:vitest",
     "test:rs": "cargo test --manifest-path crates/Cargo.toml",
     "smoke": "tsx scripts/smoke.ts",
     "package:stage": "npm run build && tsx scripts/package.ts --stage-only",
     "package": "npm run build && tsx scripts/package.ts",
     "package:smoke": "tsx scripts/smoke-package.ts",
     "release": "node scripts/release.mjs",
-    "check": "npm run build && npm run test && npm run test:rs && npm run smoke"
+    "check": "npm run build && npm run test:vitest && npm run test:rs && npm run smoke && node scripts/record-check-ok.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",

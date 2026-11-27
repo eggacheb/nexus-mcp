@@ -1,9 +1,22 @@
 #!/bin/sh
-# 票 08 复盘：推送前跑全量检查（build + vitest + cargo test + smoke，约 3-5 分钟）。
+# 推送前跑全量检查（build + vitest + cargo test + smoke，约 50-60 秒）。
 # 环境坏了（比如 Node 升级弄坏 vitest 默认池）最早在这里暴露，别用 --no-verify 绕过。
+# 若当前工作区干净且 HEAD 与刚通过的 npm run check 印记一致，跳过重复执行。
 
 unset MSYS_NO_PATHCONV
 
 cd "$(git rev-parse --show-toplevel)" || exit 1
+GIT_DIR="$(git rev-parse --git-dir)"
+STAMP_FILE="$GIT_DIR/last-check-ok"
+HEAD_SHA="$(git rev-parse HEAD)"
+
+if [ -z "$(git status --porcelain)" ] && [ -f "$STAMP_FILE" ]; then
+  STAMP_SHA="$(tr -d '\r\n' < "$STAMP_FILE")"
+  if [ "$STAMP_SHA" = "$HEAD_SHA" ]; then
+    echo "pre-push: HEAD $HEAD_SHA 已通过全量 npm run check，跳过重复执行"
+    exit 0
+  fi
+fi
+
 echo "pre-push: npm run check"
 npm run check

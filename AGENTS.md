@@ -19,20 +19,20 @@
 - 编译：`npm run build`（先 `cargo build --release` 构建执行器与托盘宿主，再 `tsc`）
 - 最小三件套打包：`npm run package:stage`（产出 `build/package/` 下的 `nexus-mcp.exe` + `nexus-server.exe` + `nexus-executor.exe`，跳过 NSIS）
 - 本地一键发布：`npm run release [-- <semver>] [--publish]`（同步版本号 → `check` → `package` + `package:smoke` → `release/SHA256SUMS.txt` → 本机 `gh release create`，默认 Draft，不触碰 GitHub Actions）
-- 本机一键热切换：`node scripts/deploy-local.mjs`（最小打包 → 临时端口 `package:smoke` → 按 `nexus-mcp.exe` 哈希走托盘内无缝换核或脱离进程树切换，保隧道不断、10 秒 `/health` 失败自动回滚，零改动 `config.json` 与 `oauth-store.json`）
+- 本机一键热切换：`node scripts/deploy-local.mjs`（最小打包 → 临时端口 `package:smoke` → 托盘内换核或脱离切换，保隧道不断、10 秒 `/health` 失败自动回滚，零改动 `config.json` / `oauth-store.json`；刚跑完 `package` + `package:smoke` 未改源码时加 `--reuse-stage` 跳过重复构建与冒烟，约 15 秒完成）
 - 拉取服务日志：`GET http://127.0.0.1:8788/api/logs`（面板自带接口，返回 JSON `{ lines }`，含最近 200 行已脱敏的服务日志，排查运行期问题可直接请求）
 - 测试：`npm run test`（vitest，跨组件验收一律走 MCP 客户端入口）；Rust 侧单独跑 `npm run test:rs`
 - 自检：`npm run smoke`（起服务、列出工具、调一次 `read`）
-- 本地 CI：`npm run check`（build + vitest + cargo test + smoke，提交推送前必须全部通过）
-- 提交钩子：`git config core.hooksPath scripts/hooks`（克隆后执行一次）。`pre-commit` 拦构建产物与常见测试陷阱 + 快速检查（`typecheck` + `cargo check`）；`pre-push` 跑全量 `npm run check`，别用 `--no-verify` 绕过。
-- **通过本服务自举执行时**：Git Bash 设了 `MSYS_NO_PATHCONV=1`，调 pnpm 下的 npm 脚本统一写 `npm.cmd`（如 `npm.cmd run build`、`npm.cmd run check`），单文件测试跑 `./node_modules/.bin/vitest run --pool=vmThreads <file>`；构建、全量测试与 `cargo` 等长命令一律走 `job_start` / `job_output`。
+- 本地 CI：`npm run check`（`build` + `test:vitest` + `test:rs` + `smoke`，全绿且工作区干净时写入 `.git/last-check-ok`）
+- 提交钩子：`git config core.hooksPath scripts/hooks`（克隆后执行一次）。`pre-commit` 拦构建产物与常见测试陷阱 + 快速检查（`typecheck` + `cargo check`）；`pre-push` 跑全量 `npm run check`（工作区干净且 `HEAD` 命中 `.git/last-check-ok` 时自动跳过重复执行），别用 `--no-verify` 绕过。
+- **通过本服务自举执行时**：Git Bash 设了 `MSYS_NO_PATHCONV=1`，调 pnpm 下的 npm 脚本统一写 `npm.cmd`（如 `npm.cmd run build`、`npm.cmd run check`），单文件测试跑 `./node_modules/.bin/vitest run --pool=vmThreads <file>`；长命令走 `job_start` / `job_output`（参考耗时：`check` ~55s、`package` ~60s、`deploy-local` ~55s、`deploy-local --reuse-stage` ~15s）。
 
 ## 不能碰
 
 - **不要启用 GitHub Actions**。CI 全部在本地跑，推送 workflow 文件有账号风险。
 - **不要读取或打印仓库根的 `config.json`**（含本机部署令牌与私有路径）；未经明确同意不执行 `git commit` / `git push` 或修改 git 配置。
 - **`bash` 工具默认走 Git Bash**（`C:\Program Files\Git\bin\bash.exe`）。PowerShell 只在配置显式指定时使用，且必须是 PowerShell 7，不碰 5.1。
-- **本机自举连接保护**：若宿主机正运行 `npm run dev`（占用 `8787` / `8788`）承载当前 MCP 会话，严禁杀 `8787`/`8788` 进程；`cargo build --release` 若因旧执行器占用报 `os error 5`，将 `crates/target/release/nexus-executor.exe` 原地 `mv` 为 `nexus-executor.running.exe` 即可解锁重编。用户刚重启本服务后的首轮先发单条只读调用完成新会话握手，再并发扇出。
+- **本机自举连接保护**：宿主机通过独立安装目录（`%LOCALAPPDATA%\Programs\nexus-mcp\`）的托盘宿主承载当前 MCP 会话，严禁手动杀 `8787`/`8788` 进程，更新一律走 `node scripts/deploy-local.mjs`；`cargo build --release` 若因旧执行器占用报 `os error 5`，将 `crates/target/release/nexus-executor.exe` 原地 `mv` 为 `nexus-executor.running.exe` 即可解锁重编。
 
 ## 约定
 
@@ -43,7 +43,8 @@
 - 路径一律相对沙箱根解析，越界直接报错，不做静默裁剪；工具描述简洁直观，不带 `providerId`、`rpcMethod`、`safetyClassification` 等治理元数据。
 - 日志与 `stderr` 严守脱敏边界：绝不输出令牌、密码、文件/补丁正文或 `"Authorization"`（不区分大小写，`tests/http.test.ts` 有强断言）字样。
 - 先红后绿：新增能力或修 bug 先写失败测试亲眼确认变红，再写最小实现；改完 `src/` 或 Rust 后必须先构建再跑 vitest（HTTP/stdio 测试均拉起真实的 `dist/index.js`）。
-- `cargo test` 中真实 spawn 子进程的用例在模块内串行（照 `jobs_tests.rs` 的 `SPAWN_LOCK`）；vitest 固定走 `--pool=vmThreads`，跨 realm 异常只断言 `message` 内容，禁用 `.toBeInstanceOf(Error)`。
+- `cargo test` 中真实 spawn 子进程的用例在模块内串行（照 `jobs_tests.rs` 的 `SPAWN_LOCK`）；vitest 固定走 `--pool=vmThreads`，跨 realm 异常只断言 `message` 内容，禁用 `.toBeInstanceOf(Error)`；凡在 vitest 用例中 `spawn` / `execFileSync` 子进程，必须显式设置 `>= 15_000` 超时（防止 17+ 文件并发抢 CPU 时撞默认 5s 超时）。
+- 辅助脚本或托盘功能调用 `pwsh.exe` 回退 `powershell.exe` 时，必须同时处理 `NotFound` 与非零退出码（Git 钩子等精简环境下 `pwsh.exe` 可能启动失败）。
 - 票据完成后在票面 `## Comments` 逐条注明验收清单对应的测试用例。
 - 新增或调整底层算法前：先读 `docs/adr/0007-command-policy-reuse-opencode-wildcard.md` 与 `docs/research/{codex,opencode}-reusable-parts.md`；本机参考仓 `cankaoproject/` 严格只读、禁止在其中执行构建。
 

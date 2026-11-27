@@ -43,7 +43,10 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === "--worker") opts.worker = true;
-    else if (arg === "--skip-build") opts.skipBuild = true;
+    else if (arg === "--reuse-stage") {
+      opts.skipBuild = true;
+      opts.skipSmoke = true;
+    } else if (arg === "--skip-build") opts.skipBuild = true;
     else if (arg === "--skip-smoke") opts.skipSmoke = true;
     else if (arg === "--target" && argv[i + 1]) opts.targetDir = path.resolve(argv[++i]);
     else if (arg === "--stage-dir" && argv[i + 1]) opts.stageDir = path.resolve(argv[++i]);
