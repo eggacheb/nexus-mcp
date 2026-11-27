@@ -199,6 +199,8 @@ fn build_shell_command(
         }
         other => return Err(format!("不支持的 shell kind: {other}")),
     }
+    // 面向模型消费的非 TTY 管道默认关闭 ANSI 彩色转义，减少输出噪声
+    command.env("NO_COLOR", "1");
     command.current_dir(cwd);
     Ok(command)
 }

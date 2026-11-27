@@ -52,6 +52,7 @@ fn output_request(job_id: &str, offset: Option<u64>, max_output_bytes: u64) -> J
         offset,
         max_output_bytes,
         wait_ms: None,
+        wait_for_exit: false,
     }
 }
 
@@ -424,6 +425,7 @@ fn wait_ms_returns_immediately_when_output_exists_and_wakes_on_exit() {
         offset: Some(0),
         max_output_bytes: 4096,
         wait_ms: Some(5_000),
+        wait_for_exit: false,
     });
     assert!(
         t0.elapsed() < Duration::from_millis(150),
@@ -443,9 +445,26 @@ fn wait_ms_returns_immediately_when_output_exists_and_wakes_on_exit() {
         offset: Some(0),
         max_output_bytes: 4096,
         wait_ms: Some(5_000),
+        wait_for_exit: false,
     });
     assert_eq!(woke["status"], "exited");
     assert_eq!(woke["exit_code"], 0);
     assert!(woke["output"].as_str().unwrap().contains("wake-exit"));
     assert!(t1.elapsed() < Duration::from_secs(3));
+
+    // 3) wait_for_exit=true 不被中途输出提前打断，等到任务退出后一次返回全量输出
+    let start3 = registry.start(&start_request("echo part-1; sleep 0.5; echo part-2", 4096));
+    let id3 = start3["job_id"].as_str().unwrap().to_string();
+    let waited = registry.output(&JobOutputRequest {
+        id: 12,
+        job_id: id3,
+        offset: Some(0),
+        max_output_bytes: 4096,
+        wait_ms: Some(5_000),
+        wait_for_exit: true,
+    });
+    assert_eq!(waited["status"], "exited");
+    assert_eq!(waited["exit_code"], 0);
+    let out3 = waited["output"].as_str().unwrap();
+    assert!(out3.contains("part-1") && out3.contains("part-2"));
 }

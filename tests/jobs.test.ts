@@ -696,6 +696,24 @@ describe("job_kill 工具", () => {
       } finally {
         await callTool(session.client, "job_kill", { job_id: streamId });
       }
+
+      // 4) wait_for_exit=true 合并中途分片，一次等到退出并校验 NO_COLOR=1 生效
+      const batchStart = await callTool(session.client, "job_start", {
+        command: "echo step-a=$NO_COLOR; sleep 0.45; echo step-b",
+      });
+      expectOk(batchStart);
+      const batchId = jobIdOf(textOf(batchStart));
+      const batchOut = await callTool(session.client, "job_output", {
+        job_id: batchId,
+        offset: 0,
+        wait_ms: 5000,
+        wait_for_exit: true,
+      });
+      expectOk(batchOut);
+      expect(statusOf(textOf(batchOut))).toBe("exited");
+      expect(exitCodeOf(textOf(batchOut))).toBe(0);
+      expect(bodyOf(textOf(batchOut))).toContain("step-a=1");
+      expect(bodyOf(textOf(batchOut))).toContain("step-b");
     },
   );
 });

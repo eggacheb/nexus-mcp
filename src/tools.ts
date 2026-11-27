@@ -478,14 +478,19 @@ export function registerTools(
           .max(30_000)
           .optional()
           .describe("可选短等待毫秒数（0-30000，默认 0 立即返回；任务退出或有新输出时提前返回）"),
+        wait_for_exit: z
+          .boolean()
+          .optional()
+          .describe("为 true 时等待任务退出或 wait_ms 到期才返回，不被中途零碎输出提前唤醒（默认 false）"),
       },
     },
-    async ({ job_id, offset, wait_ms }, extra) => {
+    async ({ job_id, offset, wait_ms, wait_for_exit }, extra) => {
       const effectiveWait = wait_ms ?? 0;
       const trace = beginTool("job_output", extra, {
         job_id,
         offset: offset ?? 0,
         wait_ms: effectiveWait > 0 ? effectiveWait : undefined,
+        wait_for_exit: wait_for_exit || undefined,
       });
       try {
         const response = await getExecutor().request<JobOutputResponse>(
@@ -494,6 +499,7 @@ export function registerTools(
             job_id,
             offset: offset ?? 0,
             wait_ms: effectiveWait,
+            wait_for_exit: wait_for_exit ?? false,
             max_output_bytes: config.maxOutputBytes,
           },
           { deadlineMs: Math.max(120_000, effectiveWait + 15_000) },

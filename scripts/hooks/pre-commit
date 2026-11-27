@@ -49,8 +49,8 @@ if [ -n "$cross_realm" ]; then
   exit 1
 fi
 
-# 票 08 复盘：提交前快速检查（约 10 秒），全量检查在 pre-push
+# 票 08 复盘：提交前快速检查（约 5 秒），全量检查在 pre-push
 cd "$(git rev-parse --show-toplevel)" || exit 1
-echo "pre-commit: stdio-config check + typecheck + cargo check"
+echo "pre-commit: stdio-config check + typecheck + lint:rs"
 npm run typecheck || exit 1
-cargo check --manifest-path crates/executor/Cargo.toml || exit 1
+npm run lint:rs || exit 1

@@ -60,6 +60,8 @@ pub struct JobOutputRequest {
     pub max_output_bytes: u64,
     #[serde(default)]
     pub wait_ms: Option<u64>,
+    #[serde(default)]
+    pub wait_for_exit: bool,
 }
 
 /// 终止不需要 force/graceful 开关：Windows 侧两侧保险都是硬杀，协议里没有软信号通道。
@@ -343,16 +345,19 @@ pub fn handle_output(request: &JobOutputRequest) -> Value {
     snapshot_job_output(&job, request)
 }
 
-/// 当 `wait_ms > 0` 且任务仍在运行、请求偏移处尚无新字节时短等待：
-/// 任务退出或 stdin 关闭立即返回；有新输出后经过约 200ms 合并防抖即返回。
+/// 当 `wait_ms > 0` 且任务仍在运行时短等待：
+/// - 默认（`wait_for_exit = false`）：请求偏移处已有新字节立刻返回；否则等待新输出（约 200ms 合并防抖）或退出；
+/// - `wait_for_exit = true`：忽略中途零碎输出，一直等到任务退出、stdin 关闭或 `wait_ms` 到期再返回。
 fn wait_for_job_progress(job: &Job, request: &JobOutputRequest) {
     let wait_ms = request.wait_ms.unwrap_or(0).min(MAX_JOB_WAIT_MS);
     if wait_ms == 0 {
         return;
     }
     let requested_offset = request.offset.unwrap_or(0) as usize;
-    // 请求偏移处已有可读新字节时立刻返回，不进入防抖或等待循环
-    if job.buffer.lock().expect("输出缓冲锁不应中毒").total_bytes() > requested_offset {
+    // 非 wait_for_exit 模式下，请求偏移处已有可读新字节时立刻返回，不进入防抖或等待循环
+    if !request.wait_for_exit
+        && job.buffer.lock().expect("输出缓冲锁不应中毒").total_bytes() > requested_offset
+    {
         return;
     }
     let deadline = Instant::now() + Duration::from_millis(wait_ms);
@@ -369,13 +374,16 @@ fn wait_for_job_progress(job: &Job, request: &JobOutputRequest) {
         if exited {
             break;
         }
-        let total_bytes = job.buffer.lock().expect("输出缓冲锁不应中毒").total_bytes();
         let now = Instant::now();
-        if total_bytes > requested_offset {
-            let until = *debounce_until
-                .get_or_insert_with(|| (now + Duration::from_millis(WAIT_DEBOUNCE_MS)).min(deadline));
-            if now >= until {
-                break;
+        if !request.wait_for_exit {
+            let total_bytes = job.buffer.lock().expect("输出缓冲锁不应中毒").total_bytes();
+            if total_bytes > requested_offset {
+                let until = *debounce_until.get_or_insert_with(|| {
+                    (now + Duration::from_millis(WAIT_DEBOUNCE_MS)).min(deadline)
+                });
+                if now >= until {
+                    break;
+                }
             }
         }
         if now >= deadline {
