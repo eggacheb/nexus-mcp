@@ -58,6 +58,9 @@ let currentMaxFiles = DEFAULT_MAX_FILES;
 let currentGetSecret: () => string = () => "";
 let currentNow: () => Date = () => new Date();
 let currentWriteStderr: (line: string) => void = (line) => console.error(line);
+/** 缓存当前活跃日志文件路径与字节数，避免每条日志都做 mkdirSync + existsSync + statSync */
+let trackedLogPath: string | null = null;
+let trackedLogSize = 0;
 
 /**
  * 解析服务日志目录，严格按优先级：
@@ -87,7 +90,11 @@ export function resolveLogDir(options?: {
 /** 配置日志器（启动、配置重载或测试注入时调用） */
 export function configureLogger(options: LoggerOptions): void {
   if (options.level !== undefined) currentLevel = options.level;
-  if (options.logDir !== undefined) currentLogDir = options.logDir;
+  if (options.logDir !== undefined) {
+    currentLogDir = options.logDir;
+    trackedLogPath = null;
+    trackedLogSize = 0;
+  }
   if (options.maxFileBytes !== undefined) currentMaxFileBytes = options.maxFileBytes;
   if (options.maxFiles !== undefined) currentMaxFiles = options.maxFiles;
   if (options.getSecret !== undefined) currentGetSecret = options.getSecret;
@@ -220,23 +227,38 @@ function writeLineToDisk(dir: string, date: Date, line: string): void {
   const payloadBytes = Buffer.byteLength(payload, "utf8");
 
   try {
-    mkdirSync(dir, { recursive: true });
     let shouldPrune = false;
-    if (existsSync(activePath)) {
-      const currentSize = statSync(activePath).size;
-      if (currentSize > 0 && currentSize + payloadBytes > currentMaxFileBytes) {
-        const rotated = nextRotatedPath(dir, dateKey);
-        renameSync(activePath, rotated);
+    if (trackedLogPath !== activePath) {
+      mkdirSync(dir, { recursive: true });
+      if (existsSync(activePath)) {
+        trackedLogSize = statSync(activePath).size;
+      } else {
+        trackedLogSize = 0;
         shouldPrune = true;
       }
-    } else {
+      trackedLogPath = activePath;
+    }
+    if (trackedLogSize > 0 && trackedLogSize + payloadBytes > currentMaxFileBytes) {
+      const rotated = nextRotatedPath(dir, dateKey);
+      renameSync(activePath, rotated);
+      trackedLogSize = 0;
       shouldPrune = true;
     }
-    appendFileSync(activePath, payload, "utf8");
+    try {
+      appendFileSync(activePath, payload, "utf8");
+    } catch {
+      // 目录或文件被外部移除时重建一次再补写
+      mkdirSync(dir, { recursive: true });
+      appendFileSync(activePath, payload, "utf8");
+      trackedLogSize = 0;
+    }
+    trackedLogSize += payloadBytes;
     if (shouldPrune) {
       pruneLogFiles(dir, currentMaxFiles, activeName);
     }
   } catch {
+    trackedLogPath = null;
+    trackedLogSize = 0;
     // 写盘失败静默降级，保证服务继续运行
   }
 }

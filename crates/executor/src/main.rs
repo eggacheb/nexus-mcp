@@ -234,12 +234,19 @@ fn run_bash(request: &BashRequest) -> Value {
         Err(message) => return error_response(Some(request.id), message),
     };
 
-    let mut child = match command
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    let (mut child, job_object) = match win_job::JobObject::spawn_managed(command) {
+        Ok(pair) => pair,
+        Err(err) => {
+            return error_response(Some(request.id), format!("启动 {} 失败: {err}", request.shell.program));
+        }
+    };
+    #[cfg(not(windows))]
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(err) => {
             return error_response(Some(request.id), format!("启动 {} 失败: {err}", request.shell.program));
@@ -259,7 +266,13 @@ fn run_bash(request: &BashRequest) -> Value {
             Ok(None) => {
                 if STDIN_CLOSED.load(Ordering::Acquire) || Instant::now() >= deadline {
                     timed_out = true;
-                    kill_process_tree(&mut child);
+                    #[cfg(windows)]
+                    let terminated = job_object.as_ref().is_some_and(|job| job.terminate());
+                    #[cfg(not(windows))]
+                    let terminated = false;
+                    if !terminated {
+                        kill_process_tree(&mut child);
+                    }
                     break;
                 }
                 thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));

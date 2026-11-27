@@ -96,12 +96,14 @@ struct Job {
 }
 
 impl Job {
-    /// 杀掉整棵进程树：Windows 先 TerminateJobObject（覆盖已入 job 的后代），
-    /// 再走 taskkill /T /F + kill 兜底（与 bash 超时同一套 kill_process_tree）。
+    /// 杀掉整棵进程树：Windows 优先走 TerminateJobObject（原子终止已入 job 的整棵树，毫秒级）；
+    /// 仅当 job 未建立或 TerminateJobObject 失败时才退回 taskkill /T /F + kill 兜底。
     fn terminate_tree(&self) {
         #[cfg(windows)]
-        if let Some(job_object) = &self.job_object {
-            job_object.terminate();
+        if let Some(job_object) = &self.job_object
+            && job_object.terminate()
+        {
+            return;
         }
         let Ok(mut child) = self.child.lock() else {
             return;

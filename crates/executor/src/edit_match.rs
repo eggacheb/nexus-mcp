@@ -9,6 +9,7 @@
 //! 决策记录（05 号票 Comments）：第三级保持 opencode 原样的 trimEnd——只容忍
 //! 行尾空白，行首缩进必须一致；缩进对不上时靠 missHint 让模型看清真实缩进后重试。
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 
 /// 一次匹配在原文中的字节区间（恒为字符边界）。
@@ -107,12 +108,22 @@ pub fn find_line_occurrences(content: &str, search: &str) -> Vec<Match> {
         return Vec::new();
     }
     let trailing_newline = search.ends_with('\n');
-    let mut expected: Vec<&str> = search.split('\n').collect();
+    let mut expected: Vec<String> = search
+        .split('\n')
+        .map(|s| normalize_for_match(s.trim_end()))
+        .collect();
     if trailing_newline {
         expected.pop();
     }
     let lines = source_lines(content);
-    let same = |a: &str, b: &str| normalize_for_match(a.trim_end()) == normalize_for_match(b.trim_end());
+    let same = |line: &str, want: &str| {
+        let trimmed = line.trim_end();
+        if trimmed.is_ascii() {
+            trimmed == want
+        } else {
+            normalize_for_match(trimmed) == want
+        }
+    };
     let mut candidates = Vec::new();
     for index in 0..lines.len() {
         if index + expected.len() > lines.len() {
@@ -158,6 +169,10 @@ pub fn find_line_occurrences(content: &str, search: &str) -> Vec<Match> {
 pub fn find_normalized_occurrences(content: &str, search: &str) -> Vec<Match> {
     if search.is_empty() {
         return Vec::new();
+    }
+    // 纯 ASCII 文本下 normalize_char 是恒等函数，直接走 O(n) 字节搜索，避免在大文件上分配 Vec<(usize, char)>
+    if content.is_ascii() && search.is_ascii() {
+        return find_occurrences(content, search);
     }
     let search_norm: Vec<char> = search.chars().map(normalize_char).collect();
     let content_chars: Vec<(usize, char)> = content.char_indices().collect();
@@ -325,17 +340,20 @@ pub fn with_region_endings(region: &str, replacement: &str, fallback: &str) -> S
 /// 在 LF 视图上完成三级降级匹配，再把命中区间映射回原文字节偏移：
 /// CRLF 与混合行尾既不妨碍匹配，也不会泄漏进未触碰的区域。
 pub fn match_view(source: &str, old_string: &str) -> Vec<Match> {
-    let view = source.replace(CRLF, "\n");
-    // removed[k] = 第 k 个 \r\n 在 LF 视图里缩掉的字节数；视图偏移加上
-    // 严格小于它的 removed 个数，就映射回原文偏移
-    let removed: Vec<usize> = source
-        .match_indices(CRLF)
-        .enumerate()
-        .map(|(k, (index, _))| index - k)
-        .collect();
-    let search = old_string.replace(CRLF, "\n");
+    let has_crlf = source.contains(CRLF);
+    let view: Cow<'_, str> = if has_crlf {
+        Cow::Owned(source.replace(CRLF, "\n"))
+    } else {
+        Cow::Borrowed(source)
+    };
+    let search: Cow<'_, str> = if old_string.contains(CRLF) {
+        Cow::Owned(old_string.replace(CRLF, "\n"))
+    } else {
+        Cow::Borrowed(old_string)
+    };
     let exact = find_occurrences(&view, &search);
-    let unicode = if exact.is_empty() {
+    // 纯 ASCII 下精确匹配已失败时，Unicode 归一化不可能产生新命中，跳过整文件扫描
+    let unicode = if exact.is_empty() && !(view.is_ascii() && search.is_ascii()) {
         find_normalized_occurrences(&view, &search)
     } else {
         Vec::new()
@@ -352,6 +370,16 @@ pub fn match_view(source: &str, old_string: &str) -> Vec<Match> {
     } else {
         trailing
     };
+    if !has_crlf || chosen.is_empty() {
+        return chosen;
+    }
+    // removed[k] = 第 k 个 \r\n 在 LF 视图里缩掉的字节数；视图偏移加上
+    // 严格小于它的 removed 个数，就映射回原文偏移
+    let removed: Vec<usize> = source
+        .match_indices(CRLF)
+        .enumerate()
+        .map(|(k, (index, _))| index - k)
+        .collect();
     chosen
         .into_iter()
         .map(|m| Match {
