@@ -435,10 +435,17 @@ fn run_edit(request: &EditRequest) -> Value {
         return error_response(id, message);
     }
     if replacements > 1 && !request.replace_all {
+        let shown: Vec<String> = matches
+            .iter()
+            .take(10)
+            .map(|m| line_number_at(&source, m.start).to_string())
+            .collect();
+        let suffix = if replacements > 10 { " 等" } else { "" };
         return error_response(
             id,
             format!(
-                "old_string 匹配到 {replacements} 处，要求唯一。请补充上下文让它只匹配一处，或把 replace_all 设为 true 替换全部。"
+                "old_string 匹配到 {replacements} 处（第 {} 行{suffix}），要求唯一。请补充上下文让它只匹配一处，或把 replace_all 设为 true 替换全部。",
+                shown.join("、")
             ),
         );
     }

@@ -706,6 +706,7 @@ fn edit_op_reports_count_for_ambiguous_match_and_keeps_file() {
     assert_eq!(response["ok"], json!(false));
     let error = response["error"].as_str().unwrap();
     assert!(error.contains("匹配到 3 处"), "实际: {error}");
+    assert!(error.contains("第 1、2、3 行"), "实际: {error}");
     assert_eq!(fs::read(&file).unwrap(), b"x\nx\nx\n");
 
     // replace_all 放行并报数量
