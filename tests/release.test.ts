@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 import { projectRoot } from "./support/server.js";
 
@@ -166,6 +167,48 @@ describe("本地一键 Release 脚本（scripts/release.mjs）", () => {
       expect(stdout).toContain("SHA256SUMS.txt");
       expect(stdout).toContain("nexus-mcp_0.1.0_x64-setup.exe");
       expect(stdout).toContain("gh release create");
+    } finally {
+      repo.cleanup();
+    }
+  }, 20_000);
+
+  it("工作区干净且 .git/last-check-ok 命中当前 HEAD 时判定检查印记有效，改动后自动失效", async () => {
+    const repo = createFakeRepo("0.2.0");
+    try {
+      const gitEnv = {
+        ...process.env,
+        GIT_AUTHOR_NAME: "test",
+        GIT_AUTHOR_EMAIL: "test@example.com",
+        GIT_COMMITTER_NAME: "test",
+        GIT_COMMITTER_EMAIL: "test@example.com",
+      };
+      await execFileAsync("git", ["init"], { cwd: repo.dir, env: gitEnv, timeout: 15_000 });
+      await execFileAsync("git", ["add", "-A"], { cwd: repo.dir, env: gitEnv, timeout: 15_000 });
+      await execFileAsync("git", ["commit", "-m", "init"], { cwd: repo.dir, env: gitEnv, timeout: 15_000 });
+      const { stdout: headOut } = await execFileAsync("git", ["rev-parse", "HEAD"], {
+        cwd: repo.dir,
+        env: gitEnv,
+        timeout: 15_000,
+      });
+      const head = headOut.trim();
+
+      const mod = (await import(pathToFileURL(RELEASE_SCRIPT).href)) as {
+        isCheckStampFresh?: (root: string) => { fresh: boolean; head?: string };
+      };
+      expect(typeof mod.isCheckStampFresh).toBe("function");
+
+      // 无印记文件 -> false
+      expect(mod.isCheckStampFresh!(repo.dir).fresh).toBe(false);
+
+      // 写入匹配 HEAD 的印记 -> true
+      writeFileSync(path.join(repo.dir, ".git", "last-check-ok"), `${head}\n`, "utf8");
+      const hit = mod.isCheckStampFresh!(repo.dir);
+      expect(hit.fresh).toBe(true);
+      expect(hit.head).toBe(head);
+
+      // 工作区变脏 -> false
+      writeFileSync(path.join(repo.dir, "dirty.txt"), "dirty", "utf8");
+      expect(mod.isCheckStampFresh!(repo.dir).fresh).toBe(false);
     } finally {
       repo.cleanup();
     }

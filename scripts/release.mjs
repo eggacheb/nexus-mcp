@@ -30,11 +30,14 @@ function parseArgs(argv) {
   let targetVersion = "";
   let publish = false;
   let skipCheck = false;
+  let forceCheck = false;
   for (const arg of argv) {
     if (arg === "--publish") {
       publish = true;
     } else if (arg === "--skip-check") {
       skipCheck = true;
+    } else if (arg === "--force-check") {
+      forceCheck = true;
     } else if (arg.startsWith("-")) {
       fail(`未知参数：${arg}`);
     } else if (!targetVersion) {
@@ -43,7 +46,51 @@ function parseArgs(argv) {
       fail(`多余的位置参数：${arg}`);
     }
   }
-  return { targetVersion, publish, skipCheck };
+  return { targetVersion, publish, skipCheck, forceCheck };
+}
+
+/** 工作区干净且 .git/last-check-ok 与当前 HEAD 一致时返回 fresh=true，免重复跑 55s 全量检查 */
+export function isCheckStampFresh(root) {
+  try {
+    const cleanEnv = { ...process.env };
+    delete cleanEnv.GIT_DIR;
+    delete cleanEnv.GIT_WORK_TREE;
+    delete cleanEnv.GIT_INDEX_FILE;
+    const status = execFileSync("git", ["status", "--porcelain"], {
+      cwd: root,
+      env: cleanEnv,
+      encoding: "utf8",
+      stdio: "pipe",
+    }).trim();
+    if (status) return { fresh: false };
+    const gitDirRaw = execFileSync("git", ["rev-parse", "--git-dir"], {
+      cwd: root,
+      env: cleanEnv,
+      encoding: "utf8",
+      stdio: "pipe",
+    }).trim();
+    const gitDir = path.isAbsolute(gitDirRaw) ? gitDirRaw : path.resolve(root, gitDirRaw);
+    const stampPath = path.join(gitDir, "last-check-ok");
+    if (!existsSync(stampPath)) return { fresh: false };
+    const stamp = readFileSync(stampPath, "utf8").trim();
+    const head = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: root,
+      env: cleanEnv,
+      encoding: "utf8",
+      stdio: "pipe",
+    }).trim();
+    return stamp && stamp === head ? { fresh: true, head } : { fresh: false, head };
+  } catch {
+    return { fresh: false };
+  }
+}
+
+function hasBuiltArtifacts(root) {
+  return (
+    existsSync(path.join(root, "dist", "index.js")) &&
+    existsSync(path.join(root, "crates", "target", "release", "nexus-executor.exe")) &&
+    existsSync(path.join(root, "crates", "target", "release", "nexus-mcp.exe"))
+  );
 }
 
 function syncVersion(root, nextVersion) {
@@ -117,7 +164,7 @@ function main() {
     ? path.resolve(process.env.NEXUS_RELEASE_ROOT.trim())
     : path.resolve(scriptDir, "..");
 
-  const { targetVersion, publish, skipCheck } = parseArgs(process.argv.slice(2));
+  const { targetVersion, publish, skipCheck, forceCheck } = parseArgs(process.argv.slice(2));
 
   if (targetVersion) {
     step(`同步版本号到 ${targetVersion}`);
@@ -133,11 +180,25 @@ function main() {
   }
 
   if (!skipCheck) {
-    step("执行全量本地检查（npm run check）");
-    execSync("npm run check", { cwd: root, stdio: "inherit" });
+    const stamp = !forceCheck && !targetVersion ? isCheckStampFresh(root) : { fresh: false };
+    if (stamp.fresh && hasBuiltArtifacts(root)) {
+      step(`HEAD ${stamp.head} 已通过全量 npm run check 且构建产物齐全，跳过重复检查`);
+    } else {
+      step("执行全量本地检查（npm run check）");
+      execSync("npm run check", { cwd: root, stdio: "inherit" });
+    }
 
-    step("打包 NSIS 安装包与绿色 zip（npm run package）");
-    execSync("npm run package", { cwd: root, stdio: "inherit" });
+    // npm run check 已完成 build，直接跑 scripts/package.ts 跳过重复 cargo/tsc 构建
+    step("打包 NSIS 安装包与绿色 zip（scripts/package.ts）");
+    const tsxCli = path.join(root, "node_modules", "tsx", "dist", "cli.mjs");
+    if (existsSync(tsxCli)) {
+      execFileSync(process.execPath, [tsxCli, path.join(root, "scripts", "package.ts")], {
+        cwd: root,
+        stdio: "inherit",
+      });
+    } else {
+      execSync("npm run package", { cwd: root, stdio: "inherit" });
+    }
 
     step("验证打包产物冒烟（npm run package:smoke）");
     execSync("npm run package:smoke", { cwd: root, stdio: "inherit" });
@@ -206,4 +267,6 @@ function main() {
   console.log(`\n完成：${tag}（${publish ? "已发布" : "Draft 草稿，请在 GitHub 网页核对后点击 Publish"}）`);
 }
 
-main();
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main();
+}

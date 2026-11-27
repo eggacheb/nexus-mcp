@@ -128,6 +128,8 @@ export interface JobOutputSuccess {
   total_bytes: number;
   /** 缓冲内已丢弃、无法再读到的字节数 */
   omitted_bytes: number;
+  /** 任务已运行毫秒数（退出后冻结为总耗时） */
+  elapsed_ms?: number;
 }
 
 export interface JobKillSuccess {

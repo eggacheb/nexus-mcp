@@ -457,7 +457,7 @@ fn wait_ms_returns_immediately_when_output_exists_and_wakes_on_exit() {
     let id3 = start3["job_id"].as_str().unwrap().to_string();
     let waited = registry.output(&JobOutputRequest {
         id: 12,
-        job_id: id3,
+        job_id: id3.clone(),
         offset: Some(0),
         max_output_bytes: 4096,
         wait_ms: Some(5_000),
@@ -467,4 +467,15 @@ fn wait_ms_returns_immediately_when_output_exists_and_wakes_on_exit() {
     assert_eq!(waited["exit_code"], 0);
     let out3 = waited["output"].as_str().unwrap();
     assert!(out3.contains("part-1") && out3.contains("part-2"));
+    let elapsed3 = waited["elapsed_ms"]
+        .as_u64()
+        .expect("job_output 应返回 elapsed_ms");
+    assert!(elapsed3 >= 400, "sleep 0.5 后 elapsed_ms 应 >= 400，实际 {elapsed3}");
+    thread::sleep(Duration::from_millis(60));
+    let reread = registry.output(&output_request(&id3, Some(0), 4096));
+    assert_eq!(
+        reread["elapsed_ms"].as_u64(),
+        Some(elapsed3),
+        "退出后 elapsed_ms 应冻结，不随时间继续增长"
+    );
 }

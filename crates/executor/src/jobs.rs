@@ -75,11 +75,12 @@ pub struct JobKillRequest {
 #[derive(Clone, Copy)]
 enum JobState {
     Running,
-    Exited { exit_code: i32 },
+    Exited { exit_code: i32, elapsed_ms: u64 },
 }
 
 /// 任务记录。Arc 共享：注册表管生死，监控线程写状态，output() 读缓冲。
 struct Job {
+    started_at: Instant,
     buffer: Arc<Mutex<HeadTailBuffer>>,
     /// Child 放在锁里：监控线程轮询 try_wait，注册表退出清理时借用来杀树
     child: Mutex<Child>,
@@ -199,6 +200,7 @@ impl JobRegistry {
         crate::drain_stream(stderr_stream, Arc::clone(&buffer), Some(stderr_tx));
 
         let job = Arc::new(Job {
+            started_at: Instant::now(),
             buffer,
             child: Mutex::new(child),
             reader_done: Mutex::new(vec![stdout_rx, stderr_rx]),
@@ -241,7 +243,7 @@ impl JobRegistry {
             Err(response) => return response,
         };
         let state = *job.state.lock().expect("任务状态锁不应中毒");
-        if let JobState::Exited { exit_code } = state {
+        if let JobState::Exited { exit_code, .. } = state {
             return json!({
                 "id": request.id, "ok": true,
                 "job_id": request.job_id,
@@ -397,11 +399,16 @@ fn wait_for_job_progress(job: &Job, request: &JobOutputRequest) {
 
 fn snapshot_job_output(job: &Job, request: &JobOutputRequest) -> Value {
     // 先读任务状态再拍输出快照：若已 Exited 则缓冲已最终落定，末尾残缺 UTF-8 序列不再挂起等待
-    let (is_running, status, exit_code) = {
+    let (is_running, status, exit_code, elapsed_ms) = {
         let state = job.state.lock().expect("任务状态锁不应中毒");
         match *state {
-            JobState::Running => (true, "running", None),
-            JobState::Exited { exit_code } => (false, "exited", Some(exit_code)),
+            JobState::Running => (
+                true,
+                "running",
+                None,
+                job.started_at.elapsed().as_millis() as u64,
+            ),
+            JobState::Exited { exit_code, elapsed_ms } => (false, "exited", Some(exit_code), elapsed_ms),
         }
     };
 
@@ -504,6 +511,7 @@ fn snapshot_job_output(job: &Job, request: &JobOutputRequest) -> Value {
         "job_id": request.job_id,
         "status": status,
         "exit_code": exit_code,
+        "elapsed_ms": elapsed_ms,
         "output": output,
         "next_offset": next_offset,
         "total_bytes": total,
@@ -551,8 +559,9 @@ fn monitor(job: Arc<Job>) {
         }
     }
 
+    let elapsed_ms = job.started_at.elapsed().as_millis() as u64;
     if let Ok(mut state) = job.state.lock() {
-        *state = JobState::Exited { exit_code };
+        *state = JobState::Exited { exit_code, elapsed_ms };
     }
 }
 

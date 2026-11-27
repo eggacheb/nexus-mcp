@@ -519,6 +519,13 @@ export function registerTools(
         if (!response.ok) return trace.fail(response.error);
         const head = [`status: ${response.status}`];
         if (response.exit_code !== null) head.push(`exit_code: ${response.exit_code}`);
+        if (typeof response.elapsed_ms === "number") {
+          const elapsed =
+            response.elapsed_ms < 1000
+              ? `${response.elapsed_ms}ms`
+              : `${(response.elapsed_ms / 1000).toFixed(1)}s`;
+          head.push(`elapsed: ${elapsed}`);
+        }
         let body = response.output;
         if (body === "" && response.status === "running") body = "（暂无新输出）";
         let text = `${head.join("\n")}\n\n${body}`;

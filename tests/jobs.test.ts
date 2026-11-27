@@ -712,6 +712,7 @@ describe("job_kill 工具", () => {
       expectOk(batchOut);
       expect(statusOf(textOf(batchOut))).toBe("exited");
       expect(exitCodeOf(textOf(batchOut))).toBe(0);
+      expect(textOf(batchOut)).toMatch(/^elapsed: \d+(?:\.\d)?(?:ms|s)$/m);
       expect(bodyOf(textOf(batchOut))).toContain("step-a=1");
       expect(bodyOf(textOf(batchOut))).toContain("step-b");
     },
