@@ -195,32 +195,30 @@ fn verify_and_extract(bin_dir: &Path, archive: &Path, asset: &PlatformAsset) -> 
     let extract_dir = bin_dir.join(format!("ripgrep-extract-{stamp}"));
     fs::create_dir_all(&extract_dir).map_err(|err| format!("创建解压目录失败: {err}"))?;
 
-    let extract_result: Result<(), String> = (|| {
-        if asset.archive_ext == "zip" {
-            // Windows zip 必须用 System32 自带的 bsdtar：PATH 上的 GNU tar 读不了
-            // zip。bsdtar 按 ANSI 代码页解码参数，所以在解压目录里只传 `..\<ASCII 文件名>`
-            // 相对路径，绝对路径中的中文用户名不会到它手上。
-            let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
-            let archive_arg = format!(
-                r"..\{}",
-                archive.file_name().expect("下载包有文件名").to_string_lossy()
-            );
-            run_tar(
-                &Path::new(&system_root).join("System32").join("tar.exe"),
-                &["-xf", archive_arg.as_str()],
-                &extract_dir,
-            )
-        } else {
-            // Unix tar.gz：PATH 上的 tar 直接解，路径按 UTF-8 locale 处理
-            let archive_arg = archive.to_string_lossy().into_owned();
-            let dir_arg = extract_dir.to_string_lossy().into_owned();
-            run_tar(
-                Path::new("tar"),
-                &["-xzf", archive_arg.as_str(), "-C", dir_arg.as_str()],
-                &extract_dir,
-            )
-        }
-    })();
+    let extract_result: Result<(), String> = if asset.archive_ext == "zip" {
+        // Windows zip 必须用 System32 自带的 bsdtar：PATH 上的 GNU tar 读不了
+        // zip。bsdtar 按 ANSI 代码页解码参数，所以在解压目录里只传 `..\<ASCII 文件名>`
+        // 相对路径，绝对路径中的中文用户名不会到它手上。
+        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        let archive_arg = format!(
+            r"..\{}",
+            archive.file_name().expect("下载包有文件名").to_string_lossy()
+        );
+        run_tar(
+            &Path::new(&system_root).join("System32").join("tar.exe"),
+            &["-xf", archive_arg.as_str()],
+            &extract_dir,
+        )
+    } else {
+        // Unix tar.gz：PATH 上的 tar 直接解，路径按 UTF-8 locale 处理
+        let archive_arg = archive.to_string_lossy().into_owned();
+        let dir_arg = extract_dir.to_string_lossy().into_owned();
+        run_tar(
+            Path::new("tar"),
+            &["-xzf", archive_arg.as_str(), "-C", dir_arg.as_str()],
+            &extract_dir,
+        )
+    };
 
     let extracted = extract_dir
         .join(format!("ripgrep-{RG_VERSION}-{}", asset.triple))

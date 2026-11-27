@@ -7,8 +7,8 @@
 
 ## 目录
 
-- `src/` — TypeScript 协议层：MCP 协议、工具定义、HTTP 传输、面板、配置与服务日志、执行器客户端（`executor.ts`）
-- `crates/executor/` — Rust 执行层：唯一接触沙箱磁盘与子进程的部分，stdio 单行 JSON 协议（rg 缺失时自动下载 pinned 版本到全局缓存，测试钩子见 `crates/executor/src/ripgrep.rs` 头注释）
+- `src/` — TypeScript 协议层：MCP 协议、工具定义、HTTP 传输、面板（路由 `panel.ts` + 前端模板 `panelPage.ts`）、配置与服务日志、执行器客户端（`executor.ts`）
+- `crates/executor/` — Rust 执行层：唯一接触沙箱磁盘与子进程的部分，stdio 单行 JSON 协议（沙箱路径边界集中在 `sandbox.rs`；rg 缺失时自动下载 pinned 版本到全局缓存，测试钩子见 `crates/executor/src/ripgrep.rs` 头注释）
 - `scripts/` — 打包、自检与本地 CI 钩子
 
 ## 命令
@@ -23,7 +23,7 @@
 - 运行指纹与自检：`GET http://127.0.0.1:8787/health` / `GET http://127.0.0.1:8788/api/status` 返回 `{ version, buildId, startedAt, pid }`；`GET http://127.0.0.1:8788/api/hotswap` 返回最近一次热切换脱敏结果（`logs/last-hotswap.json`）；`GET http://127.0.0.1:8788/api/logs` 支持 `?level=&limit=&q=` 过滤最近 1000 行服务日志（默认返回末尾 200 行）
 - 测试：`npm run test`（vitest，跨组件验收一律走 MCP 客户端入口）；Rust 侧单独跑 `npm run test:rs`
 - 自检：`npm run smoke`（起服务、列出工具、调一次 `read`）
-- 本地 CI：`npm run check`（`build` + `test:vitest` + `test:rs` + `smoke`，全绿且工作区干净时写入 `.git/last-check-ok`）
+- 本地 CI：`npm run check`（`build` + `lint:rs` + `test:vitest` + `test:rs` + `smoke`，全绿且工作区干净时写入 `.git/last-check-ok`）
 - 提交钩子：`git config core.hooksPath scripts/hooks`（克隆后执行一次）。`pre-commit` 拦构建产物与常见测试陷阱 + 快速检查（`typecheck` + `cargo check`）；`pre-push` 跑全量 `npm run check`（工作区干净且 `HEAD` 命中 `.git/last-check-ok` 时自动跳过重复执行），别用 `--no-verify` 绕过。
 - **通过本服务自举执行时**：Git Bash 设了 `MSYS_NO_PATHCONV=1`，调 pnpm 下的 npm 脚本统一写 `npm.cmd`（如 `npm.cmd run build`、`npm.cmd run check`），单文件测试跑 `./node_modules/.bin/vitest run --pool=vmThreads <file>`；长命令走 `job_start` / `job_output`（可传 `wait_ms` 最长 30000 减少空转轮询；参考耗时：`check` ~55s、`package` ~60s、`deploy-local` ~55s、`deploy-local --reuse-stage` ~15s）；`write` 会自动创建沙箱内缺失父目录，`grep` 支持单文件路径，`read` 支持负 `offset` 尾读。
 

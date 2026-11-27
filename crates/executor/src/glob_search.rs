@@ -15,10 +15,8 @@ use ignore::WalkBuilder;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{
-    Containment, classify, default_max_results, display_rel_prefix, error_response,
-    resolve_search_dir,
-};
+use super::sandbox::{Containment, classify, display_rel_prefix, resolve_search_dir};
+use super::{default_max_results, error_response};
 
 #[derive(Deserialize)]
 pub struct GlobRequest {
@@ -104,11 +102,11 @@ pub fn run_glob(request: &GlobRequest) -> Value {
         };
         if newest.len() < max_results as usize {
             newest.push(Reverse((mtime, display)));
-        } else if let Some(Reverse((oldest, _))) = newest.peek() {
-            if mtime > *oldest {
-                newest.pop();
-                newest.push(Reverse((mtime, display)));
-            }
+        } else if let Some(Reverse((oldest, _))) = newest.peek()
+            && mtime > *oldest
+        {
+            newest.pop();
+            newest.push(Reverse((mtime, display)));
         }
     }
 

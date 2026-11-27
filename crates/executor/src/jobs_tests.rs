@@ -318,7 +318,7 @@ fn kill_all_running_terminates_jobs() {
         let response = registry.output(&output_request(&job_id, None, 4096));
         if response["status"] == "exited" {
             // taskkill /F 的退出码非 0，关键是任务死了、状态可查
-            assert_eq!(response["exit_code"].as_i64().unwrap() != 0, true);
+            assert!(response["exit_code"].as_i64().unwrap() != 0);
             break;
         }
         assert!(Instant::now() < deadline, "kill_all 后任务没有退出");

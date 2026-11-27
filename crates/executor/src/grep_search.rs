@@ -14,7 +14,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::ripgrep::resolve_rg;
-use super::{GrepTarget, default_max_results, display_rel_prefix, error_response, resolve_grep_target};
+use super::sandbox::{GrepTarget, display_rel_prefix, resolve_grep_target};
+use super::{default_max_results, error_response};
 
 /// 单行内容的字符数上限，对齐 opencode 的 MAX_LINE_CHARS
 const MAX_LINE_CHARS: usize = 2_000;
@@ -123,10 +124,10 @@ pub fn run_grep(request: &GrepRequest) -> Value {
             let _ = child.kill();
             break;
         }
-        if let Some(data) = event.get("data") {
-            if let Some(row) = parse_match_row(data, &prefix) {
-                matches.push(row);
-            }
+        if let Some(data) = event.get("data")
+            && let Some(row) = parse_match_row(data, &prefix)
+        {
+            matches.push(row);
         }
     }
     let stderr_text = stderr_handle.join().unwrap_or_default();

@@ -27,7 +27,7 @@ impl FileLockTable {
     }
 
     fn normalize_key(path: &Path) -> String {
-        let display = crate::display_path(path);
+        let display = crate::sandbox::display_path(path);
         #[cfg(windows)]
         {
             display.to_lowercase()

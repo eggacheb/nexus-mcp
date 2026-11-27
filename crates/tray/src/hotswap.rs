@@ -93,6 +93,28 @@ struct LastHotswapRecord<'a> {
     detail: &'a str,
 }
 
+fn format_utc_iso8601(unix_secs: u64) -> String {
+    let days = (unix_secs / 86_400) as i64;
+    let secs_of_day = unix_secs % 86_400;
+    let hour = secs_of_day / 3_600;
+    let minute = (secs_of_day % 3_600) / 60;
+    let second = secs_of_day % 60;
+
+    // Howard Hinnant civil_from_days: 1970-01-01 -> (1970, 1, 1)
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = y + if month <= 2 { 1 } else { 0 };
+
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
 fn write_last_hotswap(log_path: &Path, status: &str, detail: &str) {
     let Some(parent) = log_path.parent() else {
         return;
@@ -105,7 +127,7 @@ fn write_last_hotswap(log_path: &Path, status: &str, detail: &str) {
     let record = LastHotswapRecord {
         status,
         mode: "in-place",
-        at: ts.to_string(),
+        at: format_utc_iso8601(ts),
         detail,
     };
     if let Ok(json) = serde_json::to_string_pretty(&record) {
@@ -165,17 +187,31 @@ fn wait_for_health(child: &mut ManagedServer, mcp_port: u16, timeout: Duration) 
     ))
 }
 
-/// 执行托盘内无缝换核（停旧核保隧道 -> 备份 .prev -> 替换 -> 拉新 -> /health 校验 -> 失败回滚）。
+/// 托盘内热切换的输入计划（将路径、超时与日志位置收拢为单一参数对象）。
+pub struct HotswapPlan<'a> {
+    pub runtime_dir: &'a Path,
+    pub new_server_src: &'a Path,
+    pub new_executor_src: Option<&'a Path>,
+    pub shutdown_timeout: Duration,
+    pub health_timeout: Duration,
+    pub log_path: &'a Path,
+}
+
+/// 执行托盘内热切换（停旧核保隧道 -> 备份 .prev -> 替换 -> 拉新 -> /health 校验 -> 失败回滚）。
 pub fn perform_hotswap(
     server_slot: &Arc<Mutex<Option<ManagedServer>>>,
     spec: &ServerLaunchSpec,
-    runtime_dir: &Path,
-    new_server_src: &Path,
-    new_executor_src: Option<&Path>,
-    shutdown_timeout: Duration,
-    health_timeout: Duration,
-    log_path: &Path,
+    plan: &HotswapPlan<'_>,
 ) -> Result<(), String> {
+    let HotswapPlan {
+        runtime_dir,
+        new_server_src,
+        new_executor_src,
+        shutdown_timeout,
+        health_timeout,
+        log_path,
+    } = *plan;
+
     append_log(
         log_path,
         &format!(
@@ -221,12 +257,30 @@ pub fn perform_hotswap(
         if let Some(p) = prev_executor {
             let _ = restore_file(p, &target_executor);
         }
-        let recovered = ManagedServer::spawn(spec).ok();
-        let status = if recovered.is_some() { "rolled_back" } else { "failed" };
-        if let Some(restored) = recovered {
-            *guard = Some(restored);
+        match ManagedServer::spawn(spec) {
+            Ok(mut restored) => {
+                let recover_timeout = health_timeout.max(Duration::from_secs(10));
+                let recovered = wait_for_health(&mut restored, spec.mcp_port, recover_timeout);
+                append_log(
+                    log_path,
+                    &format!(
+                        "hotswap.rollback_done pid={} recovered={}",
+                        restored.pid(),
+                        recovered.is_ok()
+                    ),
+                );
+                write_last_hotswap(
+                    log_path,
+                    if recovered.is_ok() { "rolled_back" } else { "failed" },
+                    reason,
+                );
+                *guard = Some(restored);
+            }
+            Err(err) => {
+                append_log(log_path, &format!("hotswap.rollback_spawn_failed err={err}"));
+                write_last_hotswap(log_path, "failed", &format!("{reason}; 回滚启动失败: {err}"));
+            }
         }
-        write_last_hotswap(log_path, status, reason);
     };
 
     let prev_server = match backup_file(&target_server) {
@@ -251,13 +305,12 @@ pub fn perform_hotswap(
     };
 
     // 3) 写入新产物
-    let replace_result: io::Result<()> = (|| {
-        copy_with_retry(new_server_src, &target_server)?;
-        if let Some(exec_src) = new_executor_src {
-            copy_with_retry(exec_src, &target_executor)?;
-        }
-        Ok(())
-    })();
+    let replace_result: io::Result<()> = copy_with_retry(new_server_src, &target_server).and_then(
+        |()| match new_executor_src {
+            Some(exec_src) => copy_with_retry(exec_src, &target_executor),
+            None => Ok(()),
+        },
+    );
 
     if let Err(err) = replace_result {
         append_log(log_path, &format!("hotswap.copy_failed err={err}，开始回滚"));
@@ -291,35 +344,7 @@ pub fn perform_hotswap(
                 &format!("hotswap.health_failed reason={reason}，开始自动回滚"),
             );
             let _ = new_child.shutdown(false, Duration::from_secs(2));
-            if let Some(p) = &prev_server {
-                let _ = restore_file(p, &target_server);
-            }
-            if let Some(p) = &prev_executor {
-                let _ = restore_file(p, &target_executor);
-            }
-            match ManagedServer::spawn(spec) {
-                Ok(mut restored) => {
-                    let recovered = wait_for_health(&mut restored, spec.mcp_port, health_timeout);
-                    append_log(
-                        log_path,
-                        &format!(
-                            "hotswap.rollback_done pid={} recovered={}",
-                            restored.pid(),
-                            recovered.is_ok()
-                        ),
-                    );
-                    write_last_hotswap(
-                        log_path,
-                        if recovered.is_ok() { "rolled_back" } else { "failed" },
-                        &reason,
-                    );
-                    *guard = Some(restored);
-                }
-                Err(err) => {
-                    append_log(log_path, &format!("hotswap.rollback_spawn_failed err={err}"));
-                    write_last_hotswap(log_path, "failed", &format!("{reason}; 回滚启动失败: {err}"));
-                }
-            }
+            restore_and_record(&mut guard, &prev_server, &prev_executor, &reason);
             Err(reason)
         }
     }
@@ -501,16 +526,15 @@ pub fn start_control_server(
                         let busy_c = Arc::clone(&busy);
                         thread::spawn(move || {
                             thread::sleep(delay);
-                            let _ = perform_hotswap(
-                                &slot,
-                                &spec_c,
-                                &dir_c,
-                                &new_server,
-                                new_exec.as_deref(),
+                            let plan = HotswapPlan {
+                                runtime_dir: &dir_c,
+                                new_server_src: &new_server,
+                                new_executor_src: new_exec.as_deref(),
                                 shutdown_timeout,
                                 health_timeout,
-                                &log_c,
-                            );
+                                log_path: &log_c,
+                            };
+                            let _ = perform_hotswap(&slot, &spec_c, &plan);
                             busy_c.store(false, Ordering::SeqCst);
                         });
                     } else if method == "POST" && path == "/spawn-worker" {
@@ -590,4 +614,20 @@ pub fn start_control_server(
         control_file,
         info,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_utc_iso8601;
+
+    #[test]
+    fn format_utc_iso8601_handles_epoch_leap_year_and_regular_dates() {
+        assert_eq!(format_utc_iso8601(0), "1970-01-01T00:00:00Z");
+        // 2024-01-01T00:00:00Z = 1704067200（覆盖 month <= 2 分支）
+        assert_eq!(format_utc_iso8601(1_704_067_200), "2024-01-01T00:00:00Z");
+        // 2024-02-29T12:34:56Z = 1709210096
+        assert_eq!(format_utc_iso8601(1_709_210_096), "2024-02-29T12:34:56Z");
+        // 2026-11-27T09:30:21Z = 1795771821
+        assert_eq!(format_utc_iso8601(1_795_771_821), "2026-11-27T09:30:21Z");
+    }
 }
