@@ -350,4 +350,20 @@ describe("glob/grep 工具", () => {
       expect(text).not.toContain("\uFFFD");
     },
   );
+
+  it(
+    "grep 支持 context 参数返回匹配行前后上下文（path:line- 格式）",
+    { timeout: 15_000 },
+    async () => {
+      const result = await callGrep(session.client, {
+        path: "docs/readme.md",
+        pattern: "hello markdown",
+        context: 1,
+      });
+      expectOk(result);
+      const text = textOf(result);
+      expect(text).toContain("docs/readme.md:1- ");
+      expect(text).toContain("docs/readme.md:2: hello markdown");
+    },
+  );
 });

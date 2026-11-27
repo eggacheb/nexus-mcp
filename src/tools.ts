@@ -382,13 +382,21 @@ export function registerTools(
         path: z.string().optional().describe("搜索起点（目录或单文件），默认根目录"),
         glob: z.string().optional().describe("限定文件范围，例如 *.ts"),
         ignore_case: z.boolean().optional().describe("是否忽略大小写"),
+        context: z
+          .number()
+          .int()
+          .min(0)
+          .max(5)
+          .optional()
+          .describe("可选上下文行数（0-5，默认 0；上下文行用 path:line- 格式展示）"),
       },
     },
-    async ({ pattern, path: searchPath, glob, ignore_case }, extra) => {
+    async ({ pattern, path: searchPath, glob, ignore_case, context }, extra) => {
       const trace = beginTool("grep", extra, {
         path: safeDisplayDir(config.root, searchPath, config.token),
         pattern: summarizeText(pattern, MAX_PATTERN_LOG_CHARS, config.token),
         glob: glob ? summarizeText(glob, 40, config.token) : undefined,
+        context: context && context > 0 ? context : undefined,
       });
       try {
         const dir = resolveOptionalDir(config.root, searchPath);
@@ -399,6 +407,7 @@ export function registerTools(
           pattern,
           glob,
           ignore_case: ignore_case ?? false,
+          context: context ?? 0,
           max_results: MAX_SEARCH_RESULTS,
           timeout_ms: GREP_TIMEOUT_MS,
         });
@@ -409,12 +418,15 @@ export function registerTools(
             { matches: 0 },
           );
         }
-        let body = response.matches.map((m) => `${m.path}:${m.line}: ${m.text}`).join("\n");
+        const matchCount = response.matches.filter((m) => !m.is_context).length;
+        let body = response.matches
+          .map((m) => `${m.path}:${m.line}${m.is_context ? "-" : ":"} ${m.text}`)
+          .join("\n");
         if (response.truncated) {
-          body += `\n\n已显示前 ${response.matches.length} 条匹配，还有更多未显示；用 glob 参数限定文件类型、指定 path 缩小搜索范围，或换更精确的 pattern。`;
+          body += `\n\n已显示前 ${matchCount} 条匹配，还有更多未显示；用 glob 参数限定文件类型、指定 path 缩小搜索范围，或换更精确的 pattern。`;
         }
         return trace.ok(body, {
-          matches: response.matches.length,
+          matches: matchCount,
           truncated: response.truncated ? true : undefined,
         });
       } catch (err) {

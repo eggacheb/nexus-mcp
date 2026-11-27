@@ -29,6 +29,8 @@ pub struct GrepRequest {
     glob: Option<String>,
     #[serde(default)]
     ignore_case: bool,
+    #[serde(default)]
+    context: u64,
     #[serde(default = "default_max_results")]
     max_results: u64,
 }
@@ -40,6 +42,7 @@ pub fn run_grep(request: &GrepRequest) -> Value {
         return error_response(id, "pattern 不能为空");
     }
     let max_results = request.max_results.clamp(1, 1000);
+    let context = request.context.min(5);
     let (root_canonical, target) =
         match resolve_grep_target(&request.root, request.path.as_deref(), id) {
             Ok(pair) => pair,
@@ -73,6 +76,9 @@ pub fn run_grep(request: &GrepRequest) -> Value {
     if request.ignore_case {
         args.push("--ignore-case".into());
     }
+    if context > 0 {
+        args.push(format!("--context={context}"));
+    }
     if let Some(glob) = request.glob.as_deref().map(str::trim).filter(|glob| !glob.is_empty()) {
         args.push(format!("--glob={glob}"));
     }
@@ -103,6 +109,7 @@ pub fn run_grep(request: &GrepRequest) -> Value {
 
     let prefix = display_rel_prefix(&root_canonical, &search_dir);
     let mut matches: Vec<Value> = Vec::new();
+    let mut match_count: u64 = 0;
     let mut truncated = false;
     let mut reader = BufReader::new(stdout);
     let mut raw: Vec<u8> = Vec::new();
@@ -116,16 +123,22 @@ pub fn run_grep(request: &GrepRequest) -> Value {
         let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
             continue;
         };
-        if event.get("type").and_then(Value::as_str) != Some("match") {
-            continue;
-        }
-        if matches.len() >= max_results as usize {
-            truncated = true;
-            let _ = child.kill();
-            break;
+        let event_type = event.get("type").and_then(Value::as_str);
+        let is_context = match event_type {
+            Some("match") => false,
+            Some("context") if context > 0 => true,
+            _ => continue,
+        };
+        if !is_context {
+            if match_count >= max_results {
+                truncated = true;
+                let _ = child.kill();
+                break;
+            }
+            match_count += 1;
         }
         if let Some(data) = event.get("data")
-            && let Some(row) = parse_match_row(data, &prefix)
+            && let Some(row) = parse_match_row(data, &prefix, is_context)
         {
             matches.push(row);
         }
@@ -168,9 +181,9 @@ fn decode_payload(value: &Value) -> Option<String> {
     Some(String::from_utf8_lossy(&decoded).into_owned())
 }
 
-/// match 事件 → { path, line, text }。路径统一成相对沙箱根、正斜杠，
+/// match/context 事件 → { path, line, text, is_context? }。路径统一成相对沙箱根、正斜杠，
 /// rg 以 `.` 为搜索路径时输出带 `./`（Windows 下 `.\`）前缀，一并剥掉。
-fn parse_match_row(data: &Value, prefix: &str) -> Option<Value> {
+fn parse_match_row(data: &Value, prefix: &str, is_context: bool) -> Option<Value> {
     let raw_path = decode_payload(data.get("path")?)?;
     let line_number = data.get("line_number")?.as_u64()?;
     let raw_line = decode_payload(data.get("lines")?)?;
@@ -180,11 +193,20 @@ fn parse_match_row(data: &Value, prefix: &str) -> Option<Value> {
         .unwrap_or(&raw_path)
         .replace('\\', "/");
     let display = if prefix.is_empty() { rel } else { format!("{prefix}/{rel}") };
-    Some(json!({
-        "path": display,
-        "line": line_number,
-        "text": clamp_line(&raw_line),
-    }))
+    if is_context {
+        Some(json!({
+            "path": display,
+            "line": line_number,
+            "text": clamp_line(&raw_line),
+            "is_context": true,
+        }))
+    } else {
+        Some(json!({
+            "path": display,
+            "line": line_number,
+            "text": clamp_line(&raw_line),
+        }))
+    }
 }
 
 /// rg 给的行带行尾换行，剥掉后按字符数截断（截断点必在字符边界上）。

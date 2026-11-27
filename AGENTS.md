@@ -25,7 +25,7 @@
 - 自检：`npm run smoke`（起服务、列出工具、调一次 `read`）
 - 本地 CI：`npm run check`（`build` + `lint:rs` + `test:vitest` + `test:rs` + `smoke`，全绿且工作区干净时写入 `.git/last-check-ok`）
 - 提交钩子：`git config core.hooksPath scripts/hooks`（克隆后执行一次）。`pre-commit` 拦构建产物与常见测试陷阱 + 快速检查（`typecheck` + `lint:rs`）；`pre-push` 跑全量 `npm run check`（工作区干净且 `HEAD` 命中 `.git/last-check-ok` 时自动跳过重复执行），别用 `--no-verify` 绕过。
-- **通过本服务自举执行时**：Git Bash 设了 `MSYS_NO_PATHCONV=1` 与 `NO_COLOR=1`，调 pnpm 下的 npm 脚本统一写 `npm.cmd`（如 `npm.cmd run build`、`npm.cmd run check`），单文件测试跑 `./node_modules/.bin/vitest run --pool=vmThreads <file>`；长命令走 `job_start` / `job_output`（`wait_ms` 最长 30000，构建/测试类命令加 `wait_for_exit: true` 避免被零碎日志频繁唤醒；参考耗时：`check` ~55s、`package` ~60s、`deploy-local` ~55s、`deploy-local --reuse-stage` ~15s）；`write` 会自动创建沙箱内缺失父目录，`grep` 支持单文件路径，`read` 支持负 `offset` 尾读。
+- **通过本服务自举执行时**：Git Bash 设了 `MSYS_NO_PATHCONV=1` 与 `NO_COLOR=1`，调 pnpm 下的 npm 脚本统一写 `npm.cmd`（如 `npm.cmd run build`、`npm.cmd run check`），单文件测试跑 `./node_modules/.bin/vitest run --pool=vmThreads <file>`；长命令走 `job_start` / `job_output`（`wait_ms` 最长 30000，构建/测试类命令加 `wait_for_exit: true` 避免被零碎日志频繁唤醒；参考耗时：`check` ~55s、`package` ~60s、`deploy-local` ~55s、`deploy-local --reuse-stage` ~15s）；`write` 会自动创建沙箱内缺失父目录，`grep` 支持单文件路径与 `context`（0-5 行上下文），`read` 支持负 `offset` 尾读。
 
 ## 不能碰
 

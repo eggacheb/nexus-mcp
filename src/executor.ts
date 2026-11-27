@@ -88,6 +88,8 @@ export interface GrepMatch {
   line: number;
   /** 匹配行内容（超长行已截断） */
   text: string;
+  /** 上下文行标记（context > 0 时出现） */
+  is_context?: boolean;
 }
 
 export interface GrepSuccess {
